@@ -15,13 +15,33 @@ impl DiscordOutbound {
 
     /// Send a text message to a channel.
     pub async fn send_to_channel(&self, channel_id: u64, content: &str) -> Result<()> {
-        // TODO: Phase 4.7 implementation
+        let channel = serenity::all::ChannelId::new(channel_id);
+        channel
+            .say(&self.http, content)
+            .await
+            .map_err(|e| threshold_core::ThresholdError::Discord(e.to_string()))?;
+
+        tracing::debug!(channel_id = channel_id, "Sent message to channel");
         Ok(())
     }
 
     /// Send a DM to a user.
     pub async fn send_dm(&self, user_id: u64, content: &str) -> Result<()> {
-        // TODO: Phase 4.7 implementation
+        let user = serenity::all::UserId::new(user_id);
+
+        // Create DM channel
+        let dm_channel = user
+            .create_dm_channel(&self.http)
+            .await
+            .map_err(|e| threshold_core::ThresholdError::Discord(e.to_string()))?;
+
+        // Send message
+        dm_channel
+            .say(&self.http, content)
+            .await
+            .map_err(|e| threshold_core::ThresholdError::Discord(e.to_string()))?;
+
+        tracing::debug!(user_id = user_id, "Sent DM to user");
         Ok(())
     }
 
@@ -32,8 +52,21 @@ impl DiscordOutbound {
         name: &str,
         topic: &str,
     ) -> Result<u64> {
-        // TODO: Phase 4.7 implementation
-        Ok(0)
+        let guild = serenity::all::GuildId::new(guild_id);
+
+        let channel = guild
+            .create_channel(&self.http, serenity::all::CreateChannel::new(name).topic(topic))
+            .await
+            .map_err(|e| threshold_core::ThresholdError::Discord(e.to_string()))?;
+
+        tracing::info!(
+            guild_id = guild_id,
+            channel_id = channel.id.get(),
+            name = name,
+            "Created channel"
+        );
+
+        Ok(channel.id.get())
     }
 
     /// Send a message with file attachments.
@@ -43,7 +76,47 @@ impl DiscordOutbound {
         content: &str,
         attachments: Vec<(String, Vec<u8>)>,
     ) -> Result<()> {
-        // TODO: Phase 4.7 implementation
+        let channel = serenity::all::ChannelId::new(channel_id);
+
+        // Create attachment objects
+        let files: Vec<serenity::all::CreateAttachment> = attachments
+            .into_iter()
+            .map(|(filename, data)| serenity::all::CreateAttachment::bytes(data, filename))
+            .collect();
+
+        let attachment_count = files.len();
+
+        // Send message with attachments
+        channel
+            .send_message(
+                &self.http,
+                serenity::all::CreateMessage::new()
+                    .content(content)
+                    .files(files),
+            )
+            .await
+            .map_err(|e| threshold_core::ThresholdError::Discord(e.to_string()))?;
+
+        tracing::debug!(
+            channel_id = channel_id,
+            attachment_count = attachment_count,
+            "Sent message with attachments"
+        );
+
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outbound_construction() {
+        // Just verify we can construct the type
+        // Actual Discord API calls require real bot token
+        let http = Arc::new(serenity::all::Http::new("fake_token"));
+        let outbound = DiscordOutbound::new(http);
+        assert!(std::mem::size_of_val(&outbound) > 0);
     }
 }
