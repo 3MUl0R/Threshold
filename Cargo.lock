@@ -1997,6 +1997,7 @@ name = "threshold-discord"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "lazy_static",
  "poise",
  "serenity",
  "threshold-conversation",
@@ -2004,6 +2005,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
