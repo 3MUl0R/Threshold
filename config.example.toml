@@ -81,8 +81,11 @@ tools = "full"
 
 [tools]
 # Global permission mode for tools
-# Options: "allow_all", "deny_all", "prompt" (default: "prompt")
-permission_mode = "prompt"
+# Options: "full-auto", "approve-destructive", "approve-all"
+# - full-auto: Allow all tool calls without prompting
+# - approve-destructive: Prompt only for destructive operations
+# - approve-all: Prompt for all tool calls
+permission_mode = "approve-all"
 
 # Browser tool configuration
 [tools.browser]

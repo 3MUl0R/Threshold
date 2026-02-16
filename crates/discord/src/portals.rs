@@ -71,13 +71,22 @@ mod tests {
     #[tokio::test]
     async fn resolve_creates_new_portal_for_new_channel() {
         let config = test_config();
-        let claude = Arc::new(ClaudeClient::new(&config.cli.claude).unwrap());
+        let claude = Arc::new(
+            ClaudeClient::new(
+                config.cli.claude.command.clone().unwrap_or_else(|| "claude".to_string()),
+                config.data_dir().unwrap().join("cli-sessions"),
+                config.cli.claude.skip_permissions.unwrap_or(false),
+            )
+            .await
+            .unwrap(),
+        );
         let engine = ConversationEngine::new(&config, claude).await.unwrap();
 
         let portal_id = resolve_or_create_portal(&engine, 123, 456).await;
 
         // Verify portal exists
-        let portals = engine.portals().read().await;
+        let portals_arc = engine.portals();
+        let portals = portals_arc.read().await;
         let portal = portals.get(&portal_id).unwrap();
         assert_eq!(portal.id, portal_id);
     }
@@ -85,7 +94,15 @@ mod tests {
     #[tokio::test]
     async fn resolve_reuses_existing_portal() {
         let config = test_config();
-        let claude = Arc::new(ClaudeClient::new(&config.cli.claude).unwrap());
+        let claude = Arc::new(
+            ClaudeClient::new(
+                config.cli.claude.command.clone().unwrap_or_else(|| "claude".to_string()),
+                config.data_dir().unwrap().join("cli-sessions"),
+                config.cli.claude.skip_permissions.unwrap_or(false),
+            )
+            .await
+            .unwrap(),
+        );
         let engine = ConversationEngine::new(&config, claude).await.unwrap();
 
         let portal_id1 = resolve_or_create_portal(&engine, 123, 456).await;
