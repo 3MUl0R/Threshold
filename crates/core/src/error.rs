@@ -65,6 +65,22 @@ pub enum ThresholdError {
 
     #[error("External service error: {0}")]
     External(String),
+
+    // Scheduler-specific errors (Milestone 7)
+    #[error("Scheduler is shutting down")]
+    SchedulerShutdown,
+
+    #[error("I/O error at {path}: {message}")]
+    IoError { path: String, message: String },
+
+    #[error("Serialization error: {message}")]
+    SerializationError { message: String },
+
+    #[error("Not found: {message}")]
+    NotFound { message: String },
+
+    #[error("Invalid input: {message}")]
+    InvalidInput { message: String },
 }
 
 pub type Result<T> = std::result::Result<T, ThresholdError>;
@@ -129,5 +145,46 @@ mod tests {
             Err(ThresholdError::Config("bad".into()))
         }
         assert!(returns_err().is_err());
+    }
+
+    #[test]
+    fn scheduler_shutdown_error_displays_message() {
+        let err = ThresholdError::SchedulerShutdown;
+        assert_eq!(err.to_string(), "Scheduler is shutting down");
+    }
+
+    #[test]
+    fn io_error_displays_path_and_message() {
+        let err = ThresholdError::IoError {
+            path: "/tmp/schedules.json".into(),
+            message: "Failed to write file".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("/tmp/schedules.json"));
+        assert!(msg.contains("Failed to write file"));
+    }
+
+    #[test]
+    fn serialization_error_displays_message() {
+        let err = ThresholdError::SerializationError {
+            message: "Invalid JSON structure".into(),
+        };
+        assert!(err.to_string().contains("Invalid JSON structure"));
+    }
+
+    #[test]
+    fn not_found_error_displays_message() {
+        let err = ThresholdError::NotFound {
+            message: "Task not found".into(),
+        };
+        assert!(err.to_string().contains("Task not found"));
+    }
+
+    #[test]
+    fn invalid_input_error_displays_message() {
+        let err = ThresholdError::InvalidInput {
+            message: "Invalid cron expression".into(),
+        };
+        assert!(err.to_string().contains("Invalid cron expression"));
     }
 }

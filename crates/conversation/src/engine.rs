@@ -560,6 +560,27 @@ impl ConversationEngine {
         )
         .await?;
 
+        // Broadcast AssistantMessage event so portal listeners receive it
+        // This is critical for heartbeat/cron messages to reach portals (Milestone 7)
+        match self.event_tx.send(ConversationEvent::AssistantMessage {
+            conversation_id: *conversation_id,
+            content: response.text.clone(),
+            artifacts: Vec::new(),
+            usage: response.usage.clone(),
+            timestamp: Utc::now(),
+        }) {
+            Ok(receiver_count) => {
+                tracing::debug!(
+                    receiver_count,
+                    "Broadcasted system message to {} receivers",
+                    receiver_count
+                );
+            }
+            Err(_) => {
+                tracing::warn!("No receivers for system message (all portals may be disconnected)");
+            }
+        }
+
         // Update last_active
         {
             let mut conversations = self.conversations.write().await;
