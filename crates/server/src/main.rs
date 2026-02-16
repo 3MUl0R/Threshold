@@ -13,8 +13,8 @@ async fn main() -> anyhow::Result<()> {
     // 1. Load config
     let config = ThresholdConfig::load()?;
 
-    // 2. Initialize logging
-    init_logging(
+    // 2. Initialize logging (keep guard alive for entire program)
+    let _log_guard = init_logging(
         config.log_level.as_deref().unwrap_or("info"),
         &config.data_dir()?.join("logs"),
     )?;

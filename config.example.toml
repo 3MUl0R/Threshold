@@ -1,0 +1,120 @@
+# Threshold Configuration Example
+# Copy this to ~/.threshold/config.toml and customize
+
+# Optional: Override default data directory (~/.threshold)
+# data_dir = "/path/to/custom/data"
+
+# Optional: Set log level (trace, debug, info, warn, error)
+# Can also be set via RUST_LOG environment variable
+log_level = "info"
+
+# ── Claude CLI Configuration ──
+
+[cli.claude]
+# Optional: Claude CLI command (defaults to "claude")
+# command = "claude"
+
+# Optional: Default model (sonnet, opus, haiku)
+model = "sonnet"
+
+# Optional: CLI timeout in seconds (default: 300)
+# timeout_seconds = 300
+
+# Optional: Skip permission prompts (use with caution!)
+# skip_permissions = false
+
+# Optional: Extra CLI flags to pass
+# extra_flags = ["--some-flag"]
+
+# ── Discord Configuration ──
+
+[discord]
+# Your Discord server (guild) ID
+# Right-click server in Discord → Copy Server ID (Developer Mode must be enabled)
+guild_id = 1234567890123456789
+
+# List of allowed user IDs (only these users can interact with the bot)
+# Right-click user in Discord → Copy User ID
+allowed_user_ids = [
+    1234567890123456789,  # Your Discord user ID
+    # Add more user IDs as needed
+]
+
+# Note: Discord bot token is stored in keychain or DISCORD_BOT_TOKEN env var
+# Run: ./scripts/setup-discord-token.sh to set it up
+
+# ── Agent Configurations ──
+
+# Default agent (used for General conversation)
+[[agents]]
+id = "default"
+name = "Default Assistant"
+cli_provider = "claude"
+# Optional: Override model for this agent
+# model = "sonnet"
+# Optional: Custom system prompt
+# system_prompt = "You are a helpful assistant."
+# Optional: System prompt from file
+# system_prompt_file = "~/.threshold/prompts/default.txt"
+# Optional: Tool profile (see below)
+# tools = "minimal"
+
+# Coding agent (used for /coding conversations)
+[[agents]]
+id = "coder"
+name = "Coding Assistant"
+cli_provider = "claude"
+model = "sonnet"
+system_prompt = "You are an expert software engineer. Focus on writing clean, maintainable code."
+tools = "full"
+
+# Research agent (used for /research conversations)
+[[agents]]
+id = "researcher"
+name = "Research Assistant"
+cli_provider = "claude"
+model = "sonnet"
+system_prompt = "You are a research assistant. Provide thorough, well-sourced information."
+tools = "full"
+
+# ── Tool Configurations ──
+
+[tools]
+# Global permission mode for tools
+# Options: "allow_all", "deny_all", "prompt" (default: "prompt")
+permission_mode = "prompt"
+
+# Browser tool configuration
+[tools.browser]
+enabled = true
+# Optional: Run headless (default: true)
+# headless = true
+# Optional: Allowed origins (whitelist)
+# allowed_origins = ["https://example.com"]
+# Optional: Blocked origins (blacklist)
+# blocked_origins = ["https://malicious.com"]
+
+# Gmail tool configuration
+[tools.gmail]
+enabled = false
+# Optional: Specific inboxes to access
+# inboxes = ["INBOX", "work"]
+# Optional: Allow sending emails (default: false)
+# allow_send = false
+
+# Image generation tool
+[tools.image_gen]
+enabled = true
+
+# ── Heartbeat Configuration (Milestone 6) ──
+
+# [heartbeat]
+# enabled = true
+# interval_minutes = 60
+# instructions_file = "~/.threshold/heartbeat-instructions.txt"
+# notification_channel_id = 1234567890123456789
+
+# ── Scheduler Configuration (Milestone 7) ──
+
+# [scheduler]
+# enabled = true
