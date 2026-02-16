@@ -8,23 +8,37 @@ use std::time::Instant;
 use chrono::Utc;
 use serde::Serialize;
 use serde_json::Value;
-use threshold_core::{Result, ThresholdError};
+use threshold_core::{AuditTrail, Result, ThresholdError, ToolProfile};
 use tracing;
 
-use crate::{Tool, ToolContext, ToolProfile, ToolResult};
+use crate::{Tool, ToolContext, ToolProfileExt, ToolResult};
 
 /// Configuration for the tools system
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ToolsConfig {
-    /// Path to audit log file
-    pub audit_path: PathBuf,
+    /// Audit trail for tool execution logs
+    pub audit: Arc<AuditTrail>,
+}
+
+impl ToolsConfig {
+    /// Create a new ToolsConfig with default audit path
+    pub fn new() -> Self {
+        let audit = Arc::new(AuditTrail::new(PathBuf::from(
+            ".threshold/audit/tools.jsonl",
+        )));
+        Self { audit }
+    }
+
+    /// Create a ToolsConfig with a custom audit path
+    pub fn with_audit_path(path: PathBuf) -> Self {
+        let audit = Arc::new(AuditTrail::new(path));
+        Self { audit }
+    }
 }
 
 impl Default for ToolsConfig {
     fn default() -> Self {
-        Self {
-            audit_path: PathBuf::from(".threshold/audit/tools.jsonl"),
-        }
+        Self::new()
     }
 }
 
@@ -47,7 +61,7 @@ struct AuditEntry {
 /// Tool registry - manages tool registration and execution
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
-    audit_path: PathBuf,
+    audit: Arc<AuditTrail>,
 }
 
 impl ToolRegistry {
@@ -55,7 +69,7 @@ impl ToolRegistry {
     pub fn new(config: &ToolsConfig) -> Self {
         Self {
             tools: HashMap::new(),
-            audit_path: config.audit_path.clone(),
+            audit: Arc::clone(&config.audit),
         }
     }
 
@@ -70,10 +84,9 @@ impl ToolRegistry {
     ///
     /// Handles:
     /// 1. Permission check (is tool in the active profile?)
-    /// 2. Audit log entry (before execution)
-    /// 3. Execution with cancellation support
-    /// 4. Result size guard (truncate if > 100KB)
-    /// 5. Audit log completion (duration, success/failure)
+    /// 2. Execution with cancellation support
+    /// 3. Result size guard (truncate if > 100KB)
+    /// 4. Audit log completion (duration, success/failure)
     pub async fn execute(
         &self,
         tool_name: &str,
@@ -97,9 +110,14 @@ impl ToolRegistry {
             });
         }
 
-        // 3. Execute tool with timing
+        // 3. Execute tool with timing and cancellation support
         let start = Instant::now();
-        let result = tool.execute(params.clone(), ctx).await;
+        let result = tokio::select! {
+            result = tool.execute(params.clone(), ctx) => result,
+            _ = ctx.cancellation.cancelled() => {
+                return Err(ThresholdError::SchedulerShutdown);
+            }
+        };
         let duration = start.elapsed();
 
         // 4. Truncate result if needed
@@ -115,19 +133,20 @@ impl ToolRegistry {
             .map(|r| r.content.len())
             .unwrap_or(0);
 
-        self.write_audit(AuditEntry {
-            ts: Utc::now(),
-            tool: tool_name.to_string(),
-            params,
-            agent: ctx.agent_id.clone(),
-            conversation: ctx.conversation_id.map(|id| id.0.to_string()),
-            portal: ctx.portal_id.map(|id| id.0.to_string()),
-            duration_ms: duration.as_millis(),
-            success,
-            result_size,
-        })
-        .await
-        .ok(); // Don't fail execution if audit write fails
+        self.audit
+            .append_raw(&AuditEntry {
+                ts: Utc::now(),
+                tool: tool_name.to_string(),
+                params,
+                agent: ctx.agent_id.clone(),
+                conversation: ctx.conversation_id.map(|id| id.0.to_string()),
+                portal: ctx.portal_id.map(|id| id.0.to_string()),
+                duration_ms: duration.as_millis(),
+                success,
+                result_size,
+            })
+            .await
+            .ok(); // Don't fail execution if audit write fails
 
         result
     }
@@ -163,31 +182,6 @@ impl ToolRegistry {
     /// List all registered tool names
     pub fn list(&self) -> Vec<&str> {
         self.tools.keys().map(|s| s.as_str()).collect()
-    }
-
-    /// Write an audit entry to the log file
-    async fn write_audit(&self, entry: AuditEntry) -> Result<()> {
-        // Ensure parent directory exists
-        if let Some(parent) = self.audit_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
-        // Serialize entry to JSONL
-        let mut line = serde_json::to_string(&entry)?;
-        line.push('\n');
-
-        // Append to audit file
-        use tokio::io::AsyncWriteExt;
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.audit_path)
-            .await?;
-
-        file.write_all(line.as_bytes()).await?;
-        file.flush().await?;
-
-        Ok(())
     }
 }
 
@@ -301,9 +295,7 @@ mod tests {
     async fn registry_execute_writes_audit_log() {
         let temp_dir = tempdir().unwrap();
         let audit_path = temp_dir.path().join("tools.jsonl");
-        let config = ToolsConfig {
-            audit_path: audit_path.clone(),
-        };
+        let config = ToolsConfig::with_audit_path(audit_path.clone());
 
         let mut registry = ToolRegistry::new(&config);
         registry.register(Arc::new(MockTool {

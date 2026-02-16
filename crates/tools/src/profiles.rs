@@ -1,22 +1,20 @@
-//! Tool profile enforcement
+//! Tool profile enforcement - extends core ToolProfile with permission checking
 
 use std::collections::HashSet;
+use threshold_core::ToolProfile;
 
-/// Tool profile - controls which tools are available
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolProfile {
-    /// Minimal profile: read-only tools
-    Minimal,
-    /// Coding profile: adds write, edit, exec
-    Coding,
-    /// Full profile: all registered tools
-    Full,
-}
-
-impl ToolProfile {
+/// Extension trait for ToolProfile to check tool permissions
+pub trait ToolProfileExt {
     /// Get the set of allowed tools for this profile.
     /// Returns None for Full profile (allows all tools).
-    pub fn allowed_tools(&self) -> Option<HashSet<&'static str>> {
+    fn allowed_tools(&self) -> Option<HashSet<&'static str>>;
+
+    /// Check if a tool is allowed in this profile
+    fn allows(&self, tool_name: &str) -> bool;
+}
+
+impl ToolProfileExt for ToolProfile {
+    fn allowed_tools(&self) -> Option<HashSet<&'static str>> {
         match self {
             Self::Minimal => Some(HashSet::from(["web_search", "web_fetch", "read"])),
             Self::Coding => Some(HashSet::from([
@@ -26,8 +24,7 @@ impl ToolProfile {
         }
     }
 
-    /// Check if a tool is allowed in this profile
-    pub fn allows(&self, tool_name: &str) -> bool {
+    fn allows(&self, tool_name: &str) -> bool {
         match self.allowed_tools() {
             Some(set) => set.contains(tool_name),
             None => true, // Full profile allows all

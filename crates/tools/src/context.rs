@@ -1,21 +1,8 @@
 //! Tool execution context
 
 use std::path::PathBuf;
-use threshold_core::{ConversationId, PortalId};
+use threshold_core::{ConversationId, PortalId, ToolPermissionMode, ToolProfile};
 use tokio_util::sync::CancellationToken;
-
-use crate::ToolProfile;
-
-/// Permission mode for tool execution
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolPermissionMode {
-    /// Allow all tool calls without prompting
-    FullAuto,
-    /// Prompt only for destructive operations
-    ApproveDestructive,
-    /// Prompt for all tool calls
-    ApproveAll,
-}
 
 /// Context provided to tools during execution
 #[derive(Debug, Clone)]

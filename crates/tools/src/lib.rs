@@ -8,7 +8,7 @@ mod profiles;
 mod registry;
 
 pub use context::ToolContext;
-pub use profiles::ToolProfile;
+pub use profiles::ToolProfileExt;
 pub use registry::{ToolRegistry, ToolsConfig};
 
 use async_trait::async_trait;
