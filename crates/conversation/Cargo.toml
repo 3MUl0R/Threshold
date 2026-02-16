@@ -1,0 +1,18 @@
+[package]
+name = "threshold-conversation"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+threshold-core = { path = "../core" }
+threshold-cli-wrapper = { path = "../cli-wrapper" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio-test = "0.4"

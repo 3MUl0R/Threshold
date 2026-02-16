@@ -820,6 +820,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "threshold-conversation"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "threshold-cli-wrapper",
+ "threshold-core",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "threshold-core"
 version = "0.1.0"
 dependencies = [
