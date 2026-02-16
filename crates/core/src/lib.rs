@@ -6,6 +6,7 @@ pub mod secrets;
 pub mod types;
 
 pub use error::{Result, ThresholdError};
+pub use secrets::SecretStore;
 pub use types::{
     AgentConfig, CliProvider, Conversation, ConversationId, ConversationMode, Message, MessageRole,
     Portal, PortalId, PortalType, ToolPermissionMode, ToolProfile,

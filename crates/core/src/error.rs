@@ -42,6 +42,12 @@ pub enum ThresholdError {
     #[error("Audit trail write failed: {0}")]
     AuditWrite(#[source] std::io::Error),
 
+    #[error("Audit trail read failed: {0}")]
+    AuditRead(#[source] std::io::Error),
+
+    #[error("Logging initialization failed: {0}")]
+    LoggingInit(String),
+
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 

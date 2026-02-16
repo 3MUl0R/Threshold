@@ -13,6 +13,11 @@ thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-appender = "0.2"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 tokio = { version = "1", features = ["full"] }
 dirs = "6"
+
+[dev-dependencies]
+serial_test = "3"
+tempfile = "3"
