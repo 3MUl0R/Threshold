@@ -80,26 +80,42 @@ impl Tool for ReadTool {
             });
         }
 
-        // Read file contents
-        let contents = tokio::fs::read(&path).await?;
+        // Get file metadata to check size before reading
+        let metadata = tokio::fs::metadata(&path).await?;
+        let file_size = metadata.len() as usize;
 
         // Apply offset and limit
         let start = params.offset.unwrap_or(0);
-        let end = if let Some(limit) = params.limit {
-            std::cmp::min(start + limit, contents.len())
-        } else {
-            contents.len()
-        };
 
-        // Check read size limit
-        if end - start > MAX_READ_SIZE {
+        // Validate offset
+        if start > file_size {
             return Err(ThresholdError::InvalidInput {
                 message: format!(
-                    "Read size exceeds maximum of {} bytes",
-                    MAX_READ_SIZE
+                    "Offset {} exceeds file size {} bytes",
+                    start, file_size
                 ),
             });
         }
+
+        let end = if let Some(limit) = params.limit {
+            std::cmp::min(start + limit, file_size)
+        } else {
+            file_size
+        };
+
+        // Check read size limit BEFORE reading
+        let read_size = end - start;
+        if read_size > MAX_READ_SIZE {
+            return Err(ThresholdError::InvalidInput {
+                message: format!(
+                    "Read size {} exceeds maximum of {} bytes",
+                    read_size, MAX_READ_SIZE
+                ),
+            });
+        }
+
+        // Now safely read the file
+        let contents = tokio::fs::read(&path).await?;
 
         // Extract slice and convert to string
         let slice = &contents[start..end];

@@ -73,7 +73,13 @@ impl Tool for ExecTool {
 
         // Determine working directory
         let working_dir = if let Some(dir) = params.working_dir {
-            std::path::PathBuf::from(dir)
+            let path = std::path::PathBuf::from(dir);
+            if path.is_absolute() {
+                path
+            } else {
+                // Resolve relative paths against ctx.working_dir
+                ctx.working_dir.join(path)
+            }
         } else {
             ctx.working_dir.clone()
         };
@@ -103,22 +109,53 @@ impl Tool for ExecTool {
 
         let mut stdout_reader = BufReader::new(stdout).lines();
         let mut stderr_reader = BufReader::new(stderr).lines();
-        let mut stdout_lines = Vec::new();
-        let mut stderr_lines = Vec::new();
 
-        // Wait for command with timeout and capture output
+        // Read output concurrently to avoid deadlock on large output
+        let stdout_task = tokio::spawn(async move {
+            let mut lines = Vec::new();
+            while let Ok(Some(line)) = stdout_reader.next_line().await {
+                lines.push(line);
+            }
+            lines
+        });
+
+        let stderr_task = tokio::spawn(async move {
+            let mut lines = Vec::new();
+            while let Ok(Some(line)) = stderr_reader.next_line().await {
+                lines.push(line);
+            }
+            lines
+        });
+
+        // Wait for command with timeout
         let timeout = tokio::time::Duration::from_secs(params.timeout_secs);
-        let timed_out = tokio::select! {
-            result = child.wait() => {
-                // Command completed, read remaining output
-                while let Ok(Some(line)) = stdout_reader.next_line().await {
-                    stdout_lines.push(line);
-                }
-                while let Ok(Some(line)) = stderr_reader.next_line().await {
-                    stderr_lines.push(line);
-                }
+        let result = tokio::select! {
+            result = child.wait() => Some(result),
+            _ = tokio::time::sleep(timeout) => {
+                // Timeout - kill the process
+                child.kill().await.ok();
+                None
+            }
+            _ = ctx.cancellation.cancelled() => {
+                // Cancellation - kill the process
+                child.kill().await.ok();
+                return Err(ThresholdError::SchedulerShutdown);
+            }
+        };
 
-                let exit_status = result.map_err(|e| ThresholdError::ToolError {
+        // Wait for output tasks to complete
+        let stdout_lines = stdout_task.await.map_err(|e| ThresholdError::ToolError {
+            tool: "exec".to_string(),
+            message: format!("Failed to read stdout: {}", e),
+        })?;
+        let stderr_lines = stderr_task.await.map_err(|e| ThresholdError::ToolError {
+            tool: "exec".to_string(),
+            message: format!("Failed to read stderr: {}", e),
+        })?;
+
+        match result {
+            Some(exit_result) => {
+                let exit_status = exit_result.map_err(|e| ThresholdError::ToolError {
                     tool: "exec".to_string(),
                     message: format!("Failed to wait for command: {}", e),
                 })?;
@@ -130,31 +167,19 @@ impl Tool for ExecTool {
                     timed_out: false,
                 };
 
-                return Ok(ToolResult::success(serde_json::to_string_pretty(&output)?));
+                Ok(ToolResult::success(serde_json::to_string_pretty(&output)?))
             }
-            _ = tokio::time::sleep(timeout) => {
-                // Timeout - kill the process
-                child.kill().await.ok();
-                true
+            None => {
+                // Timeout occurred
+                let output = ExecOutput {
+                    stdout: stdout_lines.join("\n"),
+                    stderr: stderr_lines.join("\n"),
+                    exit_code: -1,
+                    timed_out: true,
+                };
+                Ok(ToolResult::failure(serde_json::to_string_pretty(&output)?))
             }
-            _ = ctx.cancellation.cancelled() => {
-                // Cancellation - kill the process
-                child.kill().await.ok();
-                return Err(ThresholdError::SchedulerShutdown);
-            }
-        };
-
-        if timed_out {
-            let output = ExecOutput {
-                stdout: stdout_lines.join("\n"),
-                stderr: stderr_lines.join("\n"),
-                exit_code: -1,
-                timed_out: true,
-            };
-            return Ok(ToolResult::failure(serde_json::to_string_pretty(&output)?));
         }
-
-        unreachable!("All select! branches should return")
     }
 }
 

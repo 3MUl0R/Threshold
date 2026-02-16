@@ -89,18 +89,20 @@ impl Tool for EditTool {
             });
         }
 
-        // Read file contents
-        let contents = tokio::fs::read_to_string(&path).await?;
-
-        // Check file size
-        if contents.len() > MAX_FILE_SIZE {
+        // Check file size BEFORE reading
+        let metadata = tokio::fs::metadata(&path).await?;
+        let file_size = metadata.len() as usize;
+        if file_size > MAX_FILE_SIZE {
             return Err(ThresholdError::InvalidInput {
                 message: format!(
-                    "File size exceeds maximum of {} bytes",
-                    MAX_FILE_SIZE
+                    "File size {} exceeds maximum of {} bytes",
+                    file_size, MAX_FILE_SIZE
                 ),
             });
         }
+
+        // Read file contents
+        let contents = tokio::fs::read_to_string(&path).await?;
 
         // Perform replacement
         let (new_contents, replacements) = if params.replace_all {
