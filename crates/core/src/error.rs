@@ -59,6 +59,12 @@ pub enum ThresholdError {
 
     #[error("Keychain error: {0}")]
     Keychain(String),
+
+    #[error("Unauthorized access attempt")]
+    Unauthorized,
+
+    #[error("External service error: {0}")]
+    External(String),
 }
 
 pub type Result<T> = std::result::Result<T, ThresholdError>;

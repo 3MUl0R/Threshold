@@ -1,0 +1,15 @@
+[package]
+name = "threshold-discord"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+threshold-core = { path = "../core" }
+threshold-conversation = { path = "../conversation" }
+
+poise = "0.6"
+serenity = { version = "0.12", features = ["client", "gateway", "model"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tracing = "0.1"
+anyhow = "1"

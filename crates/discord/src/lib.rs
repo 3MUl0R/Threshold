@@ -1,0 +1,14 @@
+//! Discord bot implementation for Threshold.
+//!
+//! Provides Discord integration via poise/serenity framework.
+
+mod bot;
+mod chunking;
+mod commands;
+mod handler;
+mod outbound;
+mod portals;
+mod security;
+
+pub use bot::{build_and_start, BotData};
+pub use outbound::DiscordOutbound;

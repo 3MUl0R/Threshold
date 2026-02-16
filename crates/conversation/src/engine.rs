@@ -356,6 +356,28 @@ impl ConversationEngine {
         conversations.list().into_iter().cloned().collect()
     }
 
+    /// Save all state to disk (conversations and portals)
+    pub async fn save_state(&self) -> Result<()> {
+        // Save conversations
+        {
+            let conversations = self.conversations.read().await;
+            conversations.save().await?;
+        }
+
+        // Save portals
+        {
+            let portals = self.portals.read().await;
+            portals.save().await?;
+        }
+
+        Ok(())
+    }
+
+    /// Get access to portals (for portal listener management)
+    pub fn portals(&self) -> Arc<RwLock<PortalRegistry>> {
+        self.portals.clone()
+    }
+
     /// Switch a portal to a different conversation mode
     pub async fn switch_mode(
         &self,
