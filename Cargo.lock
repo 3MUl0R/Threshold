@@ -1942,6 +1942,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "threshold"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "threshold-cli-wrapper",
+ "threshold-conversation",
+ "threshold-core",
+ "threshold-discord",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "threshold-cli-wrapper"
 version = "0.1.0"
 dependencies = [

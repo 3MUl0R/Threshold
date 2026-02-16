@@ -1,0 +1,19 @@
+[package]
+name = "threshold"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "threshold"
+path = "src/main.rs"
+
+[dependencies]
+threshold-core = { path = "../core" }
+threshold-cli-wrapper = { path = "../cli-wrapper" }
+threshold-conversation = { path = "../conversation" }
+threshold-discord = { path = "../discord" }
+
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tracing = "0.1"
+anyhow = "1"
