@@ -5,6 +5,7 @@ pub mod logging;
 pub mod secrets;
 pub mod types;
 
+pub use audit::AuditTrail;
 pub use error::{Result, ThresholdError};
 pub use secrets::SecretStore;
 pub use types::{
