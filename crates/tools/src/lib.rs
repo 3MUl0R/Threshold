@@ -3,6 +3,7 @@
 //! Provides a trait-based system for executing tools (shell commands, file operations,
 //! web access) with profile-based permission control and audit logging.
 
+pub mod builtin;
 mod context;
 mod profiles;
 mod registry;
