@@ -7,6 +7,7 @@ pub mod types;
 
 pub use audit::AuditTrail;
 pub use error::{Result, ThresholdError};
+pub use logging::init_logging;
 pub use secrets::SecretStore;
 pub use types::{
     AgentConfig, CliProvider, Conversation, ConversationId, ConversationMode, Message, MessageRole,
