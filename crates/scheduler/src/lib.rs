@@ -7,6 +7,7 @@ pub mod cron_utils;
 pub mod engine;
 pub mod execution;
 pub mod heartbeat;
+pub mod store;
 pub mod task;
 pub mod work_items;
 

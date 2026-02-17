@@ -20,6 +20,7 @@ use threshold_core::{ResultSender, ThresholdError};
 
 use crate::cron_utils;
 use crate::execution;
+use crate::store;
 use crate::task::ScheduledTask;
 
 /// Commands sent from handles to the scheduler loop.
@@ -95,7 +96,6 @@ pub struct Scheduler {
     /// Bounded concurrency for task execution (default: 4).
     task_semaphore: Arc<tokio::sync::Semaphore>,
     /// Path for persisting task state.
-    #[allow(dead_code)]
     store_path: PathBuf,
     /// Claude CLI client for NewConversation and ScriptThenConversation actions.
     claude: Arc<ClaudeClient>,
@@ -110,9 +110,9 @@ pub struct Scheduler {
 impl Scheduler {
     /// Create a new scheduler and its handle.
     ///
-    /// The `store_path` is where tasks will be persisted (Phase 6.5).
+    /// Loads persisted tasks from `store_path` on startup.
     /// Returns `(Scheduler, SchedulerHandle)` — call `scheduler.run()` to start the loop.
-    pub fn new(
+    pub async fn new(
         store_path: PathBuf,
         claude: Arc<ClaudeClient>,
         engine: Arc<ConversationEngine>,
@@ -121,8 +121,22 @@ impl Scheduler {
     ) -> (Self, SchedulerHandle) {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
 
+        // Load persisted tasks (non-fatal: log and start with empty)
+        let tasks = match store::load_tasks(&store_path).await {
+            Ok(tasks) => {
+                if !tasks.is_empty() {
+                    tracing::info!("Loaded {} scheduled tasks from disk", tasks.len());
+                }
+                tasks
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load scheduled tasks: {}", e);
+                Vec::new()
+            }
+        };
+
         let scheduler = Self {
-            tasks: Vec::new(),
+            tasks,
             running_tasks: Arc::new(RwLock::new(HashSet::new())),
             task_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             store_path,
@@ -135,6 +149,15 @@ impl Scheduler {
 
         let handle = SchedulerHandle { command_tx };
         (scheduler, handle)
+    }
+
+    /// Persist the current task list to disk.
+    ///
+    /// Non-fatal: logs a warning if saving fails.
+    async fn persist(&self) {
+        if let Err(e) = store::save_tasks(&self.store_path, &self.tasks).await {
+            tracing::warn!("Failed to persist scheduled tasks: {}", e);
+        }
     }
 
     /// Run the scheduler main loop.
@@ -166,13 +189,13 @@ impl Scheduler {
             SchedulerCommand::AddTask(task) => {
                 tracing::info!("Adding scheduled task: {} ({})", task.name, task.id);
                 self.tasks.push(task);
-                // TODO(Phase 6.5): persist after mutation
+                self.persist().await;
             }
             SchedulerCommand::RemoveTask { id, reply } => {
                 let result = if let Some(pos) = self.tasks.iter().position(|t| t.id == id) {
                     let task = self.tasks.remove(pos);
                     tracing::info!("Removed scheduled task: {} ({})", task.name, id);
-                    // TODO(Phase 6.5): persist after mutation
+                    self.persist().await;
                     Ok(())
                 } else {
                     Err(ThresholdError::NotFound {
@@ -193,7 +216,7 @@ impl Scheduler {
                         task.name,
                         if enabled { "enabled" } else { "disabled" }
                     );
-                    // TODO(Phase 6.5): persist after mutation
+                    self.persist().await;
                     Ok(())
                 } else {
                     Err(ThresholdError::NotFound {
@@ -286,7 +309,8 @@ impl Scheduler {
             });
         }
 
-        // TODO(Phase 6.5): persist after mutation
+        // Persist updated next_run values
+        self.persist().await;
     }
 }
 
@@ -360,6 +384,7 @@ mod tests {
             None,
             cancel,
         )
+        .await
     }
 
     #[tokio::test]
