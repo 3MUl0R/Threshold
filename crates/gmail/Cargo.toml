@@ -1,0 +1,20 @@
+[package]
+name = "threshold-gmail"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+threshold-core = { path = "../core" }
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", features = ["net", "time", "io-util"] }
+tracing = "0.1"
+clap = { version = "4", features = ["derive"] }
+base64 = "0.22"
+url = "2"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
