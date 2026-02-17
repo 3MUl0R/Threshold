@@ -4,4 +4,7 @@
 //! the heartbeat (autonomous agent wake-up) pattern. One engine runs them all.
 
 pub mod cron_utils;
+pub mod engine;
 pub mod task;
+
+pub use engine::{Scheduler, SchedulerHandle};

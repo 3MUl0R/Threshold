@@ -1,0 +1,475 @@
+//! Scheduler engine — command channel pattern and main scheduling loop.
+//!
+//! The `SchedulerHandle` provides a safe, cloneable interface for other components
+//! (CLI daemon API, Discord commands, conversation engine) to interact with the
+//! scheduler while its main loop runs.
+
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use chrono::Utc;
+use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+use threshold_core::ThresholdError;
+
+use crate::cron_utils;
+use crate::task::ScheduledTask;
+
+/// Commands sent from handles to the scheduler loop.
+enum SchedulerCommand {
+    AddTask(ScheduledTask),
+    RemoveTask {
+        id: Uuid,
+        reply: oneshot::Sender<Result<(), ThresholdError>>,
+    },
+    ToggleTask {
+        id: Uuid,
+        enabled: bool,
+        reply: oneshot::Sender<Result<(), ThresholdError>>,
+    },
+    ListTasks(oneshot::Sender<Vec<ScheduledTask>>),
+}
+
+/// Cloneable handle for sending commands to the scheduler.
+///
+/// This can be shared across tasks (Discord commands, daemon API, etc.)
+/// to interact with the scheduler without direct access to its internal state.
+#[derive(Clone)]
+pub struct SchedulerHandle {
+    command_tx: mpsc::UnboundedSender<SchedulerCommand>,
+}
+
+impl SchedulerHandle {
+    /// Add a new scheduled task.
+    pub async fn add_task(&self, task: ScheduledTask) -> Result<(), ThresholdError> {
+        self.command_tx
+            .send(SchedulerCommand::AddTask(task))
+            .map_err(|_| ThresholdError::SchedulerShutdown)?;
+        Ok(())
+    }
+
+    /// Remove a scheduled task by ID.
+    pub async fn remove_task(&self, id: Uuid) -> Result<(), ThresholdError> {
+        let (reply, rx) = oneshot::channel();
+        self.command_tx
+            .send(SchedulerCommand::RemoveTask { id, reply })
+            .map_err(|_| ThresholdError::SchedulerShutdown)?;
+        rx.await.map_err(|_| ThresholdError::SchedulerShutdown)?
+    }
+
+    /// Toggle a scheduled task on or off.
+    pub async fn toggle_task(&self, id: Uuid, enabled: bool) -> Result<(), ThresholdError> {
+        let (reply, rx) = oneshot::channel();
+        self.command_tx
+            .send(SchedulerCommand::ToggleTask {
+                id,
+                enabled,
+                reply,
+            })
+            .map_err(|_| ThresholdError::SchedulerShutdown)?;
+        rx.await.map_err(|_| ThresholdError::SchedulerShutdown)?
+    }
+
+    /// List all scheduled tasks.
+    pub async fn list_tasks(&self) -> Result<Vec<ScheduledTask>, ThresholdError> {
+        let (reply, rx) = oneshot::channel();
+        self.command_tx
+            .send(SchedulerCommand::ListTasks(reply))
+            .map_err(|_| ThresholdError::SchedulerShutdown)?;
+        rx.await.map_err(|_| ThresholdError::SchedulerShutdown)
+    }
+}
+
+/// The scheduler's internal state and main loop.
+pub struct Scheduler {
+    tasks: Vec<ScheduledTask>,
+    /// IDs of tasks currently executing (for skip-if-running).
+    running_tasks: Arc<RwLock<HashSet<Uuid>>>,
+    /// Bounded concurrency for task execution (default: 4).
+    task_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Path for persisting task state.
+    #[allow(dead_code)]
+    store_path: PathBuf,
+    command_rx: mpsc::UnboundedReceiver<SchedulerCommand>,
+    cancel: CancellationToken,
+}
+
+impl Scheduler {
+    /// Create a new scheduler and its handle.
+    ///
+    /// The `store_path` is where tasks will be persisted (Phase 6.5).
+    /// Returns `(Scheduler, SchedulerHandle)` — call `scheduler.run()` to start the loop.
+    pub fn new(
+        store_path: PathBuf,
+        cancel: CancellationToken,
+    ) -> (Self, SchedulerHandle) {
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+
+        let scheduler = Self {
+            tasks: Vec::new(),
+            running_tasks: Arc::new(RwLock::new(HashSet::new())),
+            task_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+            store_path,
+            command_rx,
+            cancel,
+        };
+
+        let handle = SchedulerHandle { command_tx };
+        (scheduler, handle)
+    }
+
+    /// Run the scheduler main loop.
+    ///
+    /// Ticks every 60 seconds, checks for due tasks, and handles commands
+    /// from the `SchedulerHandle`. Exits when the cancellation token fires.
+    pub async fn run(&mut self) {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    self.check_and_run().await;
+                }
+                Some(cmd) = self.command_rx.recv() => {
+                    self.handle_command(cmd).await;
+                }
+                _ = self.cancel.cancelled() => {
+                    tracing::info!("Scheduler shutting down.");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Handle a command from the SchedulerHandle.
+    async fn handle_command(&mut self, cmd: SchedulerCommand) {
+        match cmd {
+            SchedulerCommand::AddTask(task) => {
+                tracing::info!("Adding scheduled task: {} ({})", task.name, task.id);
+                self.tasks.push(task);
+                // TODO(Phase 6.5): persist after mutation
+            }
+            SchedulerCommand::RemoveTask { id, reply } => {
+                let result = if let Some(pos) = self.tasks.iter().position(|t| t.id == id) {
+                    let task = self.tasks.remove(pos);
+                    tracing::info!("Removed scheduled task: {} ({})", task.name, id);
+                    // TODO(Phase 6.5): persist after mutation
+                    Ok(())
+                } else {
+                    Err(ThresholdError::NotFound {
+                        message: format!("Task {} not found", id),
+                    })
+                };
+                let _ = reply.send(result);
+            }
+            SchedulerCommand::ToggleTask {
+                id,
+                enabled,
+                reply,
+            } => {
+                let result = if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
+                    task.enabled = enabled;
+                    tracing::info!(
+                        "Task '{}' {}",
+                        task.name,
+                        if enabled { "enabled" } else { "disabled" }
+                    );
+                    // TODO(Phase 6.5): persist after mutation
+                    Ok(())
+                } else {
+                    Err(ThresholdError::NotFound {
+                        message: format!("Task {} not found", id),
+                    })
+                };
+                let _ = reply.send(result);
+            }
+            SchedulerCommand::ListTasks(reply) => {
+                let _ = reply.send(self.tasks.clone());
+            }
+        }
+    }
+
+    /// Check for due tasks and spawn them with bounded concurrency.
+    async fn check_and_run(&mut self) {
+        let now = Utc::now();
+
+        let due_task_ids: Vec<Uuid> = self
+            .tasks
+            .iter()
+            .filter(|task| task.enabled && task.next_run.is_some_and(|next| now >= next))
+            .map(|task| task.id)
+            .collect();
+
+        if due_task_ids.is_empty() {
+            return;
+        }
+
+        for task_id in due_task_ids {
+            // Skip if already running
+            {
+                let running = self.running_tasks.read().await;
+                if running.contains(&task_id) {
+                    if let Some(task) = self.tasks.iter().find(|t| t.id == task_id) {
+                        if task.skip_if_running {
+                            tracing::info!(
+                                "Skipping task '{}': previous run still active",
+                                task.name
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Update next_run immediately (don't wait for execution)
+            if let Some(task) = self.tasks.iter_mut().find(|t| t.id == task_id) {
+                task.next_run = cron_utils::compute_next_run(&task.cron_expression);
+            }
+
+            let task_snapshot = match self.tasks.iter().find(|t| t.id == task_id).cloned() {
+                Some(task) => task,
+                None => continue,
+            };
+
+            // Spawn task execution with bounded concurrency
+            let semaphore = self.task_semaphore.clone();
+            let running_tasks = self.running_tasks.clone();
+            tokio::spawn(async move {
+                let _permit = match semaphore.acquire().await {
+                    Ok(permit) => permit,
+                    Err(_) => return, // semaphore closed
+                };
+
+                running_tasks.write().await.insert(task_snapshot.id);
+                tracing::info!("Running scheduled task: {}", task_snapshot.name);
+
+                // TODO(Phase 6.3): actual task execution
+                tracing::warn!(
+                    "Task execution not yet implemented for: {}",
+                    task_snapshot.name
+                );
+
+                running_tasks.write().await.remove(&task_snapshot.id);
+            });
+        }
+
+        // TODO(Phase 6.5): persist after mutation
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task::DeliveryTarget;
+    use threshold_core::ScheduledAction;
+
+    fn make_test_task(name: &str, cron: &str) -> ScheduledTask {
+        let mut task = ScheduledTask::new(
+            name.into(),
+            cron.into(),
+            ScheduledAction::Script {
+                command: "echo test".into(),
+                working_dir: None,
+            },
+        )
+        .unwrap();
+        task.delivery = DeliveryTarget::AuditLogOnly;
+        task
+    }
+
+    #[tokio::test]
+    async fn handle_add_and_list_tasks() {
+        let cancel = CancellationToken::new();
+        let (mut scheduler, handle) = Scheduler::new(PathBuf::from("/tmp/test"), cancel.clone());
+
+        // Run scheduler in background
+        let scheduler_task = tokio::spawn(async move {
+            scheduler.run().await;
+        });
+
+        let task = make_test_task("test-task", "0 0 3 * * * *");
+        let task_id = task.id;
+        handle.add_task(task).await.unwrap();
+
+        // Give scheduler time to process
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let tasks = handle.list_tasks().await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, task_id);
+        assert_eq!(tasks[0].name, "test-task");
+
+        cancel.cancel();
+        scheduler_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_remove_task() {
+        let cancel = CancellationToken::new();
+        let (mut scheduler, handle) = Scheduler::new(PathBuf::from("/tmp/test"), cancel.clone());
+
+        let scheduler_task = tokio::spawn(async move {
+            scheduler.run().await;
+        });
+
+        let task = make_test_task("to-remove", "0 0 3 * * * *");
+        let task_id = task.id;
+        handle.add_task(task).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        handle.remove_task(task_id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let tasks = handle.list_tasks().await.unwrap();
+        assert_eq!(tasks.len(), 0);
+
+        cancel.cancel();
+        scheduler_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_remove_nonexistent_returns_not_found() {
+        let cancel = CancellationToken::new();
+        let (mut scheduler, handle) = Scheduler::new(PathBuf::from("/tmp/test"), cancel.clone());
+
+        let scheduler_task = tokio::spawn(async move {
+            scheduler.run().await;
+        });
+
+        let result = handle.remove_task(Uuid::new_v4()).await;
+        assert!(result.is_err());
+
+        cancel.cancel();
+        scheduler_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_toggle_task() {
+        let cancel = CancellationToken::new();
+        let (mut scheduler, handle) = Scheduler::new(PathBuf::from("/tmp/test"), cancel.clone());
+
+        let scheduler_task = tokio::spawn(async move {
+            scheduler.run().await;
+        });
+
+        let task = make_test_task("toggle-me", "0 0 3 * * * *");
+        let task_id = task.id;
+        handle.add_task(task).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Disable
+        handle.toggle_task(task_id, false).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let tasks = handle.list_tasks().await.unwrap();
+        assert!(!tasks[0].enabled);
+
+        // Re-enable
+        handle.toggle_task(task_id, true).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let tasks = handle.list_tasks().await.unwrap();
+        assert!(tasks[0].enabled);
+
+        cancel.cancel();
+        scheduler_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scheduler_shuts_down_on_cancel() {
+        let cancel = CancellationToken::new();
+        let (mut scheduler, _handle) = Scheduler::new(PathBuf::from("/tmp/test"), cancel.clone());
+
+        let scheduler_task = tokio::spawn(async move {
+            scheduler.run().await;
+        });
+
+        // Cancel immediately
+        cancel.cancel();
+
+        // Should complete promptly
+        tokio::time::timeout(Duration::from_secs(5), scheduler_task)
+            .await
+            .expect("scheduler did not shut down within timeout")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn scheduler_handle_fails_after_scheduler_dropped() {
+        let cancel = CancellationToken::new();
+        let (mut scheduler, handle) = Scheduler::new(PathBuf::from("/tmp/test"), cancel.clone());
+
+        let scheduler_task = tokio::spawn(async move {
+            scheduler.run().await;
+        });
+
+        cancel.cancel();
+        scheduler_task.await.unwrap();
+
+        // Now the scheduler is gone — handle operations should fail
+        let result = handle.list_tasks().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn disabled_task_not_fired() {
+        let cancel = CancellationToken::new();
+        let (mut scheduler, handle) = Scheduler::new(PathBuf::from("/tmp/test"), cancel.clone());
+
+        let mut task = make_test_task("disabled-task", "0 * * * * * *");
+        task.enabled = false;
+        // Set next_run to the past so it would fire if enabled
+        task.next_run = Some(Utc::now() - chrono::Duration::minutes(1));
+
+        let scheduler_task = tokio::spawn(async move {
+            scheduler.run().await;
+        });
+
+        handle.add_task(task).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Verify task is still in the list but was not executed (still has old next_run)
+        let tasks = handle.list_tasks().await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert!(!tasks[0].enabled);
+
+        cancel.cancel();
+        scheduler_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn multiple_tasks_managed() {
+        let cancel = CancellationToken::new();
+        let (mut scheduler, handle) = Scheduler::new(PathBuf::from("/tmp/test"), cancel.clone());
+
+        let scheduler_task = tokio::spawn(async move {
+            scheduler.run().await;
+        });
+
+        let task1 = make_test_task("task-1", "0 0 3 * * * *");
+        let task2 = make_test_task("task-2", "0 0 6 * * * *");
+        let task3 = make_test_task("task-3", "0 0 9 * * * *");
+        let id2 = task2.id;
+
+        handle.add_task(task1).await.unwrap();
+        handle.add_task(task2).await.unwrap();
+        handle.add_task(task3).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(handle.list_tasks().await.unwrap().len(), 3);
+
+        handle.remove_task(id2).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let tasks = handle.list_tasks().await.unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks.iter().all(|t| t.id != id2));
+
+        cancel.cancel();
+        scheduler_task.await.unwrap();
+    }
+}
