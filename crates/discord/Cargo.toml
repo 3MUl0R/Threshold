@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 threshold-core = { path = "../core" }
 threshold-conversation = { path = "../conversation" }
+threshold-scheduler = { path = "../scheduler" }
 
 poise = "0.6"
 serenity = { version = "0.12", features = ["client", "gateway", "model"] }

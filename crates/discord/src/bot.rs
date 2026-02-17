@@ -3,11 +3,13 @@
 use crate::commands;
 use crate::handler::event_handler;
 use crate::outbound::DiscordOutbound;
+use crate::scheduler_commands;
 use crate::security::is_authorized;
 use std::sync::Arc;
 use threshold_conversation::ConversationEngine;
 use threshold_core::config::DiscordConfig;
 use threshold_core::{Result, ThresholdError};
+use threshold_scheduler::SchedulerHandle;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
@@ -16,6 +18,7 @@ pub struct BotData {
     pub engine: Arc<ConversationEngine>,
     pub config: DiscordConfig,
     pub outbound: Arc<DiscordOutbound>,
+    pub scheduler: Option<SchedulerHandle>,
 }
 
 pub type Context<'a> = poise::Context<'a, BotData, ThresholdError>;
@@ -29,6 +32,7 @@ pub async fn build_and_start(
     config: DiscordConfig,
     token: &str,
     cancel: CancellationToken,
+    scheduler: Option<SchedulerHandle>,
 ) -> Result<Arc<DiscordOutbound>> {
     // Shared slot for outbound handle - populated by setup closure
     let outbound_slot: Arc<RwLock<Option<Arc<DiscordOutbound>>>> = Arc::new(RwLock::new(None));
@@ -42,6 +46,9 @@ pub async fn build_and_start(
                 commands::research(),
                 commands::conversations(),
                 commands::join(),
+                scheduler_commands::schedule(),
+                scheduler_commands::schedules(),
+                scheduler_commands::heartbeat(),
             ],
             event_handler: |ctx, event, framework, data| {
                 Box::pin(event_handler(ctx, event, framework, data))
@@ -69,6 +76,7 @@ pub async fn build_and_start(
                     engine,
                     config,
                     outbound,
+                    scheduler,
                 })
             })
         })
