@@ -68,11 +68,20 @@ pub struct ConversationEngine {
     agents: HashMap<String, AgentConfig>,
     event_tx: broadcast::Sender<ConversationEvent>,
     audit_dir: PathBuf,
+    /// Tool-availability section to prepend to system prompts (from build_tool_prompt).
+    tool_prompt: Option<String>,
 }
 
 impl ConversationEngine {
-    /// Create a new engine
-    pub async fn new(config: &ThresholdConfig, claude: Arc<ClaudeClient>) -> Result<Self> {
+    /// Create a new engine.
+    ///
+    /// `tool_prompt` is an optional tool-availability section (from `build_tool_prompt()`)
+    /// that gets prepended to each agent's system prompt when launching Claude sessions.
+    pub async fn new(
+        config: &ThresholdConfig,
+        claude: Arc<ClaudeClient>,
+        tool_prompt: Option<String>,
+    ) -> Result<Self> {
         // Resolve data directory from config
         let data_dir = config.data_dir()?;
         let audit_dir = data_dir.join("audit");
@@ -104,6 +113,7 @@ impl ConversationEngine {
             agents,
             event_tx,
             audit_dir,
+            tool_prompt,
         })
     }
 
@@ -142,6 +152,17 @@ impl ConversationEngine {
         })
     }
 
+    /// Build the effective system prompt for an agent, prepending tool instructions
+    /// if a tool_prompt was provided at engine construction time.
+    fn effective_system_prompt(&self, agent: &AgentConfig) -> Option<String> {
+        match (&self.tool_prompt, &agent.system_prompt) {
+            (Some(tool), Some(agent_prompt)) => Some(format!("{}\n\n{}", tool, agent_prompt)),
+            (Some(tool), None) => Some(tool.clone()),
+            (None, Some(agent_prompt)) => Some(agent_prompt.clone()),
+            (None, None) => None,
+        }
+    }
+
     /// Subscribe to conversation events
     pub fn subscribe(&self) -> broadcast::Receiver<ConversationEvent> {
         self.event_tx.subscribe()
@@ -173,8 +194,9 @@ impl ConversationEngine {
             ThresholdError::Config(format!("Agent '{}' not found in configuration", agent_id))
         })?;
 
+        let effective_prompt = self.effective_system_prompt(agent);
         let (system_prompt, model) = match &cli_provider {
-            CliProvider::Claude { model } => (agent.system_prompt.as_deref(), model.as_str()),
+            CliProvider::Claude { model } => (effective_prompt.as_deref(), model.as_str()),
         };
 
         // 4. Write user message to audit trail
@@ -538,8 +560,9 @@ impl ConversationEngine {
             .get(&agent_id)
             .ok_or_else(|| ThresholdError::Config(format!("Agent '{}' not found", agent_id)))?;
 
+        let effective_prompt = self.effective_system_prompt(agent);
         let (system_prompt, model) = match &cli_provider {
-            CliProvider::Claude { model } => (agent.system_prompt.as_deref(), model.as_str()),
+            CliProvider::Claude { model } => (effective_prompt.as_deref(), model.as_str()),
         };
 
         // Call Claude
@@ -747,7 +770,7 @@ mod tests {
             .unwrap(),
         );
 
-        let engine = ConversationEngine::new(&config, claude).await.unwrap();
+        let engine = ConversationEngine::new(&config, claude, None).await.unwrap();
 
         let agent = engine.resolve_agent_for_mode(&ConversationMode::Coding {
             project: "test".to_string(),
@@ -769,7 +792,7 @@ mod tests {
             .unwrap(),
         );
 
-        let engine = ConversationEngine::new(&config, claude).await.unwrap();
+        let engine = ConversationEngine::new(&config, claude, None).await.unwrap();
 
         let agent = engine.resolve_agent_for_mode(&ConversationMode::General);
 

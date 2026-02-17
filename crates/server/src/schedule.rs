@@ -84,6 +84,9 @@ pub enum ScheduleCommands {
     Toggle {
         /// Task ID to toggle
         id: String,
+        /// Enable or disable the task
+        #[arg(long)]
+        enabled: bool,
         /// Output format
         #[arg(short = 'f', long, value_enum, default_value_t = OutputFormat::default())]
         format: OutputFormat,
@@ -135,7 +138,12 @@ pub async fn handle_schedule_command(command: ScheduleCommands) -> anyhow::Resul
         },
         ScheduleCommands::List { .. } => DaemonCommand::ScheduleList,
         ScheduleCommands::Delete { id, .. } => DaemonCommand::ScheduleDelete { id: id.clone() },
-        ScheduleCommands::Toggle { id, .. } => DaemonCommand::ScheduleToggle { id: id.clone() },
+        ScheduleCommands::Toggle { id, enabled, .. } => {
+            DaemonCommand::ScheduleToggle {
+                id: id.clone(),
+                enabled: *enabled,
+            }
+        }
     };
 
     let response = client.send_command(&daemon_command).await?;

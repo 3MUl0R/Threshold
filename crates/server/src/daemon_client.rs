@@ -1,6 +1,6 @@
 //! Client for communicating with the Threshold daemon via Unix socket.
 //!
-//! The daemon exposes a Unix domain socket at `~/.threshold/daemon.sock` for
+//! The daemon exposes a Unix domain socket at `~/.threshold/threshold.sock` for
 //! receiving commands from CLI subcommands (e.g., `threshold schedule`).
 //! The actual socket protocol is implemented in Milestone 6.
 
@@ -8,7 +8,17 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// Command sent from CLI to the daemon over the Unix socket.
+/// Protocol version for daemon communication.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Request envelope sent from CLI to daemon (NDJSON framing).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DaemonRequest {
+    pub version: u32,
+    pub command: DaemonCommand,
+}
+
+/// Command payload within a daemon request.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum DaemonCommand {
     /// Create a scheduled conversation task
@@ -38,18 +48,23 @@ pub enum DaemonCommand {
     /// Delete a scheduled task by ID
     ScheduleDelete { id: String },
     /// Toggle a scheduled task on/off
-    ScheduleToggle { id: String },
+    ScheduleToggle { id: String, enabled: bool },
 }
 
-/// Response from the daemon to a CLI command.
+/// Response envelope sent from daemon to CLI.
 #[derive(Debug, Serialize, Deserialize)]
-pub enum DaemonResponse {
-    /// Operation succeeded with a message
-    Ok { message: String },
-    /// Operation succeeded with a JSON data payload
-    Data { data: serde_json::Value },
-    /// Operation failed
-    Error { message: String },
+pub struct DaemonResponse {
+    pub version: u32,
+    pub status: ResponseStatus,
+    pub data: Option<serde_json::Value>,
+    pub error: Option<String>,
+}
+
+/// Status of a daemon response.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum ResponseStatus {
+    Ok,
+    Error,
 }
 
 /// Client for sending commands to the Threshold daemon.
@@ -61,12 +76,12 @@ pub struct DaemonClient {
 
 impl DaemonClient {
     /// Create a new daemon client using the default socket path
-    /// (`~/.threshold/daemon.sock`).
+    /// (`~/.threshold/threshold.sock`).
     pub fn new() -> Self {
         let socket_path = dirs::home_dir()
             .unwrap_or_default()
             .join(".threshold")
-            .join("daemon.sock");
+            .join("threshold.sock");
         Self { socket_path }
     }
 
@@ -79,9 +94,9 @@ impl DaemonClient {
     ) -> anyhow::Result<DaemonResponse> {
         // TODO(Milestone 6): Implement Unix socket communication
         // 1. Connect to self.socket_path via UnixStream
-        // 2. Serialize command as NDJSON
-        // 3. Send and read response
-        // 4. Deserialize DaemonResponse
+        // 2. Wrap command in DaemonRequest { version: PROTOCOL_VERSION, command }
+        // 3. Serialize as NDJSON and send
+        // 4. Read response line and deserialize DaemonResponse
         anyhow::bail!(
             "Daemon communication not yet implemented. \
              The daemon socket protocol is part of Milestone 6."
@@ -94,15 +109,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn daemon_command_serde_round_trip() {
-        let cmd = DaemonCommand::ScheduleConversation {
-            name: "test".into(),
-            cron: "0 * * * *".into(),
-            prompt: "hello".into(),
-            model: Some("sonnet".into()),
+    fn daemon_request_serde_round_trip() {
+        let req = DaemonRequest {
+            version: PROTOCOL_VERSION,
+            command: DaemonCommand::ScheduleConversation {
+                name: "test".into(),
+                cron: "0 * * * *".into(),
+                prompt: "hello".into(),
+                model: Some("sonnet".into()),
+            },
         };
-        let json = serde_json::to_string(&cmd).unwrap();
-        let restored: DaemonCommand = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&req).unwrap();
+        let restored: DaemonRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(serde_json::to_string(&restored).unwrap(), json);
     }
 
@@ -115,8 +133,11 @@ mod tests {
 
     #[test]
     fn daemon_response_ok_serde_round_trip() {
-        let resp = DaemonResponse::Ok {
-            message: "Task created".into(),
+        let resp = DaemonResponse {
+            version: PROTOCOL_VERSION,
+            status: ResponseStatus::Ok,
+            data: Some(serde_json::json!({"id": "abc-123"})),
+            error: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let restored: DaemonResponse = serde_json::from_str(&json).unwrap();
@@ -125,8 +146,11 @@ mod tests {
 
     #[test]
     fn daemon_response_error_serde_round_trip() {
-        let resp = DaemonResponse::Error {
-            message: "Not found".into(),
+        let resp = DaemonResponse {
+            version: PROTOCOL_VERSION,
+            status: ResponseStatus::Error,
+            data: None,
+            error: Some("Not found".into()),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let restored: DaemonResponse = serde_json::from_str(&json).unwrap();

@@ -2068,6 +2068,7 @@ dependencies = [
  "threshold-conversation",
  "threshold-core",
  "threshold-discord",
+ "threshold-tools",
  "tokio",
  "tokio-util",
  "tracing",

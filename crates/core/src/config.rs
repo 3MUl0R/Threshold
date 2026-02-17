@@ -118,11 +118,18 @@ impl ThresholdConfig {
             .ok()
             .map_or_else(Self::default_config_path, Ok)?;
 
+        Self::load_from(&path)
+    }
+
+    /// Load config from an explicit file path.
+    pub fn load_from(path: &std::path::Path) -> crate::Result<Self> {
         if !path.exists() {
-            return Err(crate::ThresholdError::ConfigNotFound { path });
+            return Err(crate::ThresholdError::ConfigNotFound {
+                path: path.to_path_buf(),
+            });
         }
 
-        let content = std::fs::read_to_string(&path)?;
+        let content = std::fs::read_to_string(path)?;
         let config: Self = toml::from_str(&content)?;
         config.validate()?;
         Ok(config)

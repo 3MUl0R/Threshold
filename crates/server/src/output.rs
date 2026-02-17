@@ -11,6 +11,6 @@ pub enum OutputFormat {
 
 impl Default for OutputFormat {
     fn default() -> Self {
-        Self::Table
+        Self::Json
     }
 }

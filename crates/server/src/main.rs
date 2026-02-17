@@ -60,15 +60,11 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
     use tokio::sync::RwLock;
     use tokio_util::sync::CancellationToken;
 
-    // If --config is provided, set THRESHOLD_CONFIG so ThresholdConfig::load() picks it up.
-    if let Some(config_path) = &args.config {
-        // SAFETY: Called before any threads are spawned (we are still in the
-        // single-threaded setup phase of run_daemon).
-        unsafe { std::env::set_var("THRESHOLD_CONFIG", config_path) };
-    }
-
-    // 1. Load config
-    let config = ThresholdConfig::load()?;
+    // 1. Load config (from explicit path or default)
+    let config = match &args.config {
+        Some(path) => ThresholdConfig::load_from(std::path::Path::new(path))?,
+        None => ThresholdConfig::load()?,
+    };
 
     // 2. Initialize logging (keep guard alive for entire program)
     let _log_guard = init_logging(
@@ -97,8 +93,14 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
     );
     tracing::info!("Claude CLI client configured.");
 
-    // 5. Create conversation engine
-    let engine = Arc::new(ConversationEngine::new(&config, claude.clone()).await?);
+    // 5. Build tool prompt and create conversation engine
+    let tool_prompt = {
+        let prompt = threshold_tools::build_tool_prompt(&config);
+        if prompt.is_empty() { None } else { Some(prompt) }
+    };
+    let engine = Arc::new(
+        ConversationEngine::new(&config, claude.clone(), tool_prompt).await?,
+    );
     tracing::info!("Conversation engine initialized.");
 
     // 6. Shared cancellation token for graceful shutdown

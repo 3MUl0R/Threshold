@@ -80,7 +80,7 @@ mod tests {
             .await
             .unwrap(),
         );
-        let engine = ConversationEngine::new(&config, claude).await.unwrap();
+        let engine = ConversationEngine::new(&config, claude, None).await.unwrap();
 
         let portal_id = resolve_or_create_portal(&engine, 123, 456).await;
 
@@ -103,7 +103,7 @@ mod tests {
             .await
             .unwrap(),
         );
-        let engine = ConversationEngine::new(&config, claude).await.unwrap();
+        let engine = ConversationEngine::new(&config, claude, None).await.unwrap();
 
         let portal_id1 = resolve_or_create_portal(&engine, 123, 456).await;
         let portal_id2 = resolve_or_create_portal(&engine, 123, 456).await;
