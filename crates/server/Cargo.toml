@@ -15,6 +15,7 @@ threshold-discord = { path = "../discord" }
 threshold-tools = { path = "../tools" }
 threshold-scheduler = { path = "../scheduler" }
 threshold-gmail = { path = "../gmail" }
+threshold-imagegen = { path = "../imagegen" }
 
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"

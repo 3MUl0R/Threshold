@@ -6,6 +6,7 @@
 
 mod daemon_client;
 mod gmail;
+mod imagegen;
 mod output;
 mod schedule;
 
@@ -30,6 +31,8 @@ enum Commands {
     },
     /// Gmail integration — read, search, and send email
     Gmail(threshold_gmail::GmailArgs),
+    /// Image generation — create images from text descriptions
+    Imagegen(threshold_imagegen::ImagegenArgs),
 }
 
 /// Arguments for the daemon subcommand.
@@ -48,6 +51,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Daemon(args) => run_daemon(args).await,
         Commands::Schedule { command } => schedule::handle_schedule_command(command).await,
         Commands::Gmail(args) => gmail::handle_gmail_command(args).await,
+        Commands::Imagegen(args) => imagegen::handle_imagegen_command(args).await,
     }
 }
 
