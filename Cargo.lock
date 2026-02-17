@@ -2181,6 +2181,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "threshold-cli-wrapper",
+ "threshold-conversation",
  "threshold-core",
  "tokio",
  "tokio-util",

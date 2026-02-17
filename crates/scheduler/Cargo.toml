@@ -5,6 +5,8 @@ edition.workspace = true
 
 [dependencies]
 threshold-core = { path = "../core" }
+threshold-cli-wrapper = { path = "../cli-wrapper" }
+threshold-conversation = { path = "../conversation" }
 
 cron = "0.13"
 chrono = { version = "0.4", features = ["serde"] }

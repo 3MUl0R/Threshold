@@ -14,9 +14,12 @@ use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use threshold_core::ThresholdError;
+use threshold_cli_wrapper::ClaudeClient;
+use threshold_conversation::ConversationEngine;
+use threshold_core::{ResultSender, ThresholdError};
 
 use crate::cron_utils;
+use crate::execution;
 use crate::task::ScheduledTask;
 
 /// Commands sent from handles to the scheduler loop.
@@ -94,6 +97,12 @@ pub struct Scheduler {
     /// Path for persisting task state.
     #[allow(dead_code)]
     store_path: PathBuf,
+    /// Claude CLI client for NewConversation and ScriptThenConversation actions.
+    claude: Arc<ClaudeClient>,
+    /// Conversation engine for ResumeConversation actions.
+    engine: Arc<ConversationEngine>,
+    /// Optional result sender for delivering task results to Discord.
+    result_sender: Option<Arc<dyn ResultSender>>,
     command_rx: mpsc::UnboundedReceiver<SchedulerCommand>,
     cancel: CancellationToken,
 }
@@ -105,6 +114,9 @@ impl Scheduler {
     /// Returns `(Scheduler, SchedulerHandle)` — call `scheduler.run()` to start the loop.
     pub fn new(
         store_path: PathBuf,
+        claude: Arc<ClaudeClient>,
+        engine: Arc<ConversationEngine>,
+        result_sender: Option<Arc<dyn ResultSender>>,
         cancel: CancellationToken,
     ) -> (Self, SchedulerHandle) {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -114,6 +126,9 @@ impl Scheduler {
             running_tasks: Arc::new(RwLock::new(HashSet::new())),
             task_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             store_path,
+            claude,
+            engine,
+            result_sender,
             command_rx,
             cancel,
         };
@@ -238,6 +253,9 @@ impl Scheduler {
             // Spawn task execution with bounded concurrency
             let semaphore = self.task_semaphore.clone();
             let running_tasks = self.running_tasks.clone();
+            let claude = self.claude.clone();
+            let engine = self.engine.clone();
+            let result_sender = self.result_sender.clone();
             tokio::spawn(async move {
                 let _permit = match semaphore.acquire().await {
                     Ok(permit) => permit,
@@ -247,11 +265,22 @@ impl Scheduler {
                 running_tasks.write().await.insert(task_snapshot.id);
                 tracing::info!("Running scheduled task: {}", task_snapshot.name);
 
-                // TODO(Phase 6.3): actual task execution
-                tracing::warn!(
-                    "Task execution not yet implemented for: {}",
-                    task_snapshot.name
-                );
+                let result = execution::execute_task(&task_snapshot, &claude, &engine).await;
+                execution::deliver_result(&task_snapshot, &result, &result_sender).await;
+
+                if result.success {
+                    tracing::info!(
+                        "Task '{}' completed in {}ms",
+                        task_snapshot.name,
+                        result.duration_ms
+                    );
+                } else {
+                    tracing::warn!(
+                        "Task '{}' failed: {}",
+                        task_snapshot.name,
+                        result.summary
+                    );
+                }
 
                 running_tasks.write().await.remove(&task_snapshot.id);
             });
@@ -266,6 +295,7 @@ mod tests {
     use super::*;
     use crate::task::DeliveryTarget;
     use threshold_core::ScheduledAction;
+    use threshold_core::config::ThresholdConfig;
 
     fn make_test_task(name: &str, cron: &str) -> ScheduledTask {
         let mut task = ScheduledTask::new(
@@ -281,10 +311,61 @@ mod tests {
         task
     }
 
+    async fn make_test_scheduler(
+        cancel: CancellationToken,
+    ) -> (Scheduler, SchedulerHandle) {
+        use threshold_core::config::{AgentConfigToml, ClaudeCliConfig, CliConfig, ToolsConfig};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = Arc::new(
+            ClaudeClient::new("claude".into(), tmp.path().join("cli"), false)
+                .await
+                .unwrap(),
+        );
+        let config = ThresholdConfig {
+            data_dir: Some(tmp.path().to_path_buf()),
+            log_level: None,
+            cli: CliConfig {
+                claude: ClaudeCliConfig {
+                    command: Some("claude".to_string()),
+                    model: Some("sonnet".to_string()),
+                    timeout_seconds: None,
+                    skip_permissions: Some(false),
+                    extra_flags: vec![],
+                },
+            },
+            discord: None,
+            agents: vec![AgentConfigToml {
+                id: "default".to_string(),
+                name: "Default Agent".to_string(),
+                cli_provider: "claude".to_string(),
+                model: Some("sonnet".to_string()),
+                system_prompt: None,
+                system_prompt_file: None,
+                tools: Some("full".to_string()),
+            }],
+            tools: ToolsConfig::default(),
+            heartbeat: None,
+            scheduler: None,
+        };
+        let engine = Arc::new(
+            ConversationEngine::new(&config, claude.clone(), None)
+                .await
+                .unwrap(),
+        );
+        Scheduler::new(
+            tmp.path().join("schedules.json"),
+            claude,
+            engine,
+            None,
+            cancel,
+        )
+    }
+
     #[tokio::test]
     async fn handle_add_and_list_tasks() {
         let cancel = CancellationToken::new();
-        let (mut scheduler, handle) = Scheduler::new(PathBuf::from("/tmp/test"), cancel.clone());
+        let (mut scheduler, handle) = make_test_scheduler(cancel.clone()).await;
 
         // Run scheduler in background
         let scheduler_task = tokio::spawn(async move {
@@ -310,7 +391,7 @@ mod tests {
     #[tokio::test]
     async fn handle_remove_task() {
         let cancel = CancellationToken::new();
-        let (mut scheduler, handle) = Scheduler::new(PathBuf::from("/tmp/test"), cancel.clone());
+        let (mut scheduler, handle) = make_test_scheduler(cancel.clone()).await;
 
         let scheduler_task = tokio::spawn(async move {
             scheduler.run().await;
@@ -334,7 +415,7 @@ mod tests {
     #[tokio::test]
     async fn handle_remove_nonexistent_returns_not_found() {
         let cancel = CancellationToken::new();
-        let (mut scheduler, handle) = Scheduler::new(PathBuf::from("/tmp/test"), cancel.clone());
+        let (mut scheduler, handle) = make_test_scheduler(cancel.clone()).await;
 
         let scheduler_task = tokio::spawn(async move {
             scheduler.run().await;
@@ -350,7 +431,7 @@ mod tests {
     #[tokio::test]
     async fn handle_toggle_task() {
         let cancel = CancellationToken::new();
-        let (mut scheduler, handle) = Scheduler::new(PathBuf::from("/tmp/test"), cancel.clone());
+        let (mut scheduler, handle) = make_test_scheduler(cancel.clone()).await;
 
         let scheduler_task = tokio::spawn(async move {
             scheduler.run().await;
@@ -382,7 +463,7 @@ mod tests {
     #[tokio::test]
     async fn scheduler_shuts_down_on_cancel() {
         let cancel = CancellationToken::new();
-        let (mut scheduler, _handle) = Scheduler::new(PathBuf::from("/tmp/test"), cancel.clone());
+        let (mut scheduler, _handle) = make_test_scheduler(cancel.clone()).await;
 
         let scheduler_task = tokio::spawn(async move {
             scheduler.run().await;
@@ -401,7 +482,7 @@ mod tests {
     #[tokio::test]
     async fn scheduler_handle_fails_after_scheduler_dropped() {
         let cancel = CancellationToken::new();
-        let (mut scheduler, handle) = Scheduler::new(PathBuf::from("/tmp/test"), cancel.clone());
+        let (mut scheduler, handle) = make_test_scheduler(cancel.clone()).await;
 
         let scheduler_task = tokio::spawn(async move {
             scheduler.run().await;
@@ -418,7 +499,7 @@ mod tests {
     #[tokio::test]
     async fn disabled_task_not_fired() {
         let cancel = CancellationToken::new();
-        let (mut scheduler, handle) = Scheduler::new(PathBuf::from("/tmp/test"), cancel.clone());
+        let (mut scheduler, handle) = make_test_scheduler(cancel.clone()).await;
 
         let mut task = make_test_task("disabled-task", "0 * * * * * *");
         task.enabled = false;
@@ -444,7 +525,7 @@ mod tests {
     #[tokio::test]
     async fn multiple_tasks_managed() {
         let cancel = CancellationToken::new();
-        let (mut scheduler, handle) = Scheduler::new(PathBuf::from("/tmp/test"), cancel.clone());
+        let (mut scheduler, handle) = make_test_scheduler(cancel.clone()).await;
 
         let scheduler_task = tokio::spawn(async move {
             scheduler.run().await;

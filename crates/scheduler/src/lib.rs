@@ -5,6 +5,7 @@
 
 pub mod cron_utils;
 pub mod engine;
+pub mod execution;
 pub mod task;
 
 pub use engine::{Scheduler, SchedulerHandle};
