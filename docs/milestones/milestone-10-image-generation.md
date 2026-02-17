@@ -2,7 +2,27 @@
 
 **Crate:** `imagegen`
 **Complexity:** Small
-**Dependencies:** Milestone 1 (core, secrets), Milestone 5 (tool framework)
+**Dependencies:** Milestone 1 (core, secrets), Milestone 5 (tool framework — CLI binary skeleton)
+
+## Architecture Note: CLI Subcommands
+
+> Per the CLI-based tool architecture (see Milestone 5), image generation is
+> exposed as `threshold imagegen generate` CLI subcommand rather than a Tool
+> trait implementation. Claude invokes it via native shell execution.
+>
+> ```
+> Claude needs to generate an image:
+>     → exec("threshold imagegen generate --prompt 'a gear icon, blue gradient' --style flat-design")
+>     → image saved to file, stdout returns JSON with file path and metadata
+>     → Claude references the file in its response
+> ```
+>
+> The Gemini API client and image generation logic remain unchanged from the
+> designs below. Only the interface changes from Tool trait to clap subcommand.
+>
+> **Artifact delivery:** The CLI writes the image to a temp file and returns
+> the path. The conversation engine or Discord handler picks up the file path
+> from Claude's response and delivers it as an attachment.
 
 ## What This Milestone Delivers
 
@@ -115,149 +135,154 @@ Response contains base64-encoded image data in the `inlineData` field.
 
 ---
 
-## Phase 10.2 — Image Generation Tool
+## Phase 10.2 — Image Generation CLI Subcommand
 
-### `crates/imagegen/src/tool.rs`
-
-```rust
-pub struct ImageGenTool {
-    client: ImageGenClient,
-}
-
-#[async_trait]
-impl Tool for ImageGenTool {
-    fn name(&self) -> &str { "image_gen" }
-
-    fn description(&self) -> &str {
-        "Generate images from text descriptions using Google's NanoBanana \
-         (Gemini image generation). Useful for creating icons, illustrations, \
-         backgrounds, and other visual assets."
-    }
-
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "prompt": {
-                    "type": "string",
-                    "description": "Text description of the image to generate. \
-                                    Be specific about style, colors, composition."
-                },
-                "width": {
-                    "type": "integer",
-                    "description": "Image width in pixels (optional)"
-                },
-                "height": {
-                    "type": "integer",
-                    "description": "Image height in pixels (optional)"
-                },
-                "style": {
-                    "type": "string",
-                    "description": "Style hint: 'photorealistic', 'illustration', \
-                                    'flat-design', 'pixel-art', etc."
-                },
-                "negative_prompt": {
-                    "type": "string",
-                    "description": "What to avoid in the image (optional)"
-                }
-            },
-            "required": ["prompt"]
-        })
-    }
-
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> Result<ToolResult> {
-        let prompt = params["prompt"].as_str()
-            .ok_or_else(|| tool_error("Missing 'prompt' parameter"))?;
-
-        let options = ImageGenOptions {
-            width: params["width"].as_u64().map(|n| n as u32),
-            height: params["height"].as_u64().map(|n| n as u32),
-            style: params["style"].as_str().map(String::from),
-            negative_prompt: params["negative_prompt"].as_str().map(String::from),
-        };
-
-        let image = self.client.generate(prompt, &options).await?;
-
-        // Determine file extension from MIME type
-        let ext = match image.mime_type.as_str() {
-            "image/png" => "png",
-            "image/jpeg" => "jpg",
-            "image/webp" => "webp",
-            _ => "png",
-        };
-
-        let filename = format!("generated-{}.{}", Uuid::new_v4(), ext);
-
-        Ok(ToolResult {
-            content: format!("Generated image for: {}", prompt),
-            artifacts: vec![Artifact {
-                name: filename,
-                data: image.data,
-                mime_type: image.mime_type,
-            }],
-            success: true,
-        })
-    }
-}
-```
-
----
-
-## Phase 10.3 — Discord Artifact Delivery
-
-Extend the Discord outbound handler to deliver image artifacts as file
-attachments.
-
-### In `crates/discord/src/outbound.rs`
+### `crates/imagegen/src/cli.rs`
 
 ```rust
-impl DiscordOutbound {
-    /// Send a message with file attachments.
-    pub async fn send_with_attachments(
-        &self,
-        channel_id: u64,
-        content: &str,
-        attachments: Vec<(String, Vec<u8>)>,  // (filename, data)
-    ) -> Result<()> {
-        let channel = serenity::ChannelId::new(channel_id);
+use clap::Parser;
 
-        let files: Vec<serenity::CreateAttachment> = attachments.iter()
-            .map(|(name, data)| serenity::CreateAttachment::bytes(data.clone(), name))
-            .collect();
-
-        channel.send_files(
-            &self.http,
-            files,
-            serenity::CreateMessage::new().content(content),
-        ).await?;
-
-        Ok(())
-    }
+#[derive(Parser)]
+pub struct ImagegenArgs {
+    #[command(subcommand)]
+    pub command: ImagegenCommands,
 }
-```
 
-### Integration with Message Handler
+#[derive(clap::Subcommand)]
+pub enum ImagegenCommands {
+    /// Generate an image from a text description
+    Generate {
+        #[arg(long)]
+        prompt: String,
+        #[arg(long)]
+        width: Option<u32>,
+        #[arg(long)]
+        height: Option<u32>,
+        #[arg(long)]
+        style: Option<String>,
+        #[arg(long)]
+        negative_prompt: Option<String>,
+        /// Output directory (default: system temp dir)
+        #[arg(long)]
+        output_dir: Option<String>,
+    },
+}
 
-When the conversation engine returns a response that includes artifacts
-(from any tool, not just image_gen), the Discord handler checks for them:
+pub async fn handle_imagegen_command(args: ImagegenArgs) -> Result<()> {
+    let secret_store = Arc::new(SecretStore::new());
+    let client = ImageGenClient::new(secret_store);
+    let audit = AuditTrail::new(/* ... */);
 
-```rust
-// In the portal listener
-ConversationEvent::AssistantMessage { content, artifacts, .. } => {
-    if artifacts.is_empty() {
-        // Text-only response
-        for chunk in chunk_message(&content, 2000) {
-            channel_id.say(&http, &chunk).await.ok();
+    match args.command {
+        ImagegenCommands::Generate { prompt, width, height, style, negative_prompt, output_dir } => {
+            let options = ImageGenOptions { width, height, style, negative_prompt };
+            let image = client.generate(&prompt, &options).await?;
+
+            // Determine file extension from MIME type
+            let ext = match image.mime_type.as_str() {
+                "image/png" => "png",
+                "image/jpeg" => "jpg",
+                "image/webp" => "webp",
+                _ => "png",
+            };
+
+            // Write to output directory or trusted artifacts dir
+            let dir = output_dir
+                .map(PathBuf::from)
+                .unwrap_or_else(|| std::env::temp_dir().join("threshold-generated"));
+            std::fs::create_dir_all(&dir)?;
+            let filename = format!("generated-{}.{}", Uuid::new_v4(), ext);
+            let path = dir.join(&filename);
+            std::fs::write(&path, &image.data)?;
+
+            // Output JSON with file path for Claude to reference
+            let output = json!({
+                "status": "ok",
+                "file_path": path.to_string_lossy(),
+                "filename": filename,
+                "mime_type": image.mime_type,
+                "size_bytes": image.data.len(),
+                "prompt": prompt,
+            });
+            audit.append_event("imagegen", &json!({"action": "generate", "prompt": prompt})).ok();
+            println!("{}", serde_json::to_string_pretty(&output)?);
         }
-    } else {
-        // Response with attachments
-        let files: Vec<_> = artifacts.iter()
-            .map(|a| (a.name.clone(), a.data.clone()))
-            .collect();
-        outbound.send_with_attachments(channel_id, &content, files).await.ok();
     }
+
+    Ok(())
 }
 ```
+
+### Artifact Delivery Model
+
+The CLI writes the generated image to a file and returns the path in JSON.
+Claude includes the file path in its response to the user. The Discord
+handler (or other portal) detects file paths in the response and delivers
+them as attachments.
+
+**Why file paths instead of inline artifacts:**
+- No need for base64 encoding/decoding in the CLI↔Claude pipeline
+- Files can be large; stdout is not ideal for binary data
+- Claude can reference the same file multiple times
+- Works naturally with Claude's existing file awareness
+
+### Discord Attachment Delivery
+
+The Discord handler extracts file paths from Claude's responses and
+attaches them. The contract: generated files follow the naming pattern
+`generated-<uuid>.<ext>` in the system temp directory.
+
+```rust
+use std::path::{Path, PathBuf};
+use regex::Regex;
+
+/// Trusted directory for generated artifacts. All generated files MUST
+/// be written here; the extractor only attaches files from this root.
+///
+/// Returns the canonicalized path (resolves symlinks like /tmp → /private/tmp
+/// on macOS) so that `starts_with` comparisons work correctly.
+fn generated_artifacts_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join("threshold-generated");
+    std::fs::create_dir_all(&dir).ok();
+    // Canonicalize to handle OS-specific symlinks (e.g., /tmp → /private/tmp)
+    dir.canonicalize().unwrap_or(dir)
+}
+
+/// Extract generated file paths from Claude's response text.
+///
+/// Security: only returns paths that are:
+/// 1. Under the trusted artifacts directory (no path traversal)
+/// 2. Match the `generated-<uuid>.<ext>` naming convention
+/// 3. Actually exist on disk
+fn extract_file_attachments(response: &str) -> Vec<PathBuf> {
+    let trusted_root = generated_artifacts_dir();
+    let re = Regex::new(r"(/[^\s\"']+/generated-[0-9a-f-]+\.\w+)").unwrap();
+    re.captures_iter(response)
+        .filter_map(|cap| {
+            let path = PathBuf::from(&cap[1]);
+            let canonical = path.canonicalize().ok()?;
+            if canonical.starts_with(&trusted_root) {
+                Some(canonical)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+```
+
+This is a post-processing step in the Discord portal, not part of the
+imagegen crate itself. The trusted-root constraint ensures only files
+generated by Threshold are attached — arbitrary file paths mentioned in
+conversation are ignored.
+
+**Note on `--output-dir`:** When the user specifies `--output-dir`, files
+are written outside the trusted root. These files will NOT be auto-attached
+as Discord attachments — the user is responsible for retrieving them. Only
+files in the default `generated_artifacts_dir()` are candidates for
+auto-attachment. This is intentional: `--output-dir` is for saving files
+to a specific location (e.g., a project's `assets/` directory), not for
+Discord delivery.
 
 ---
 
@@ -277,9 +302,9 @@ The Google API key is shared with Gmail (if both are enabled).
 
 ```
 crates/imagegen/src/
-  lib.rs            — re-exports ImageGenTool
+  lib.rs            — re-exports public API
+  cli.rs            — clap subcommand definition and handler
   client.rs         — ImageGenClient (Google Gemini API wrapper)
-  tool.rs           — ImageGenTool implementing the Tool trait
 ```
 
 ---
@@ -290,8 +315,8 @@ crates/imagegen/src/
 - [ ] Unit test: response parsing (base64 image extraction)
 - [ ] Unit test: file extension selection from MIME type
 - [ ] Integration test (with Google API key): generate an image
-- [ ] Integration test: generated image returned as artifact in ToolResult
-- [ ] Integration test: artifact delivery to Discord as file attachment
+- [ ] Integration test: generated image written to file, JSON output includes path
+- [ ] Integration test: Discord handler delivers file as attachment
 - [ ] Integration test: tool is blocked when config has `enabled = false`
 - [ ] Integration test: tool fails gracefully when API key is missing
 - [ ] Integration test: audit trail records image generation requests

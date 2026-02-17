@@ -123,7 +123,7 @@ impl ConversationEngine {
 
         let tool_profile = match toml.tools.as_deref() {
             Some("minimal") => ToolProfile::Minimal,
-            Some("coding") => ToolProfile::Coding,
+            Some("standard") | Some("coding") => ToolProfile::Standard,
             Some("full") | None => ToolProfile::Full,
             Some(other) => {
                 return Err(ThresholdError::Config(format!(
@@ -679,7 +679,7 @@ mod tests {
                     model: Some("opus".to_string()),
                     system_prompt: Some("You write code.".to_string()),
                     system_prompt_file: None,
-                    tools: Some("coding".to_string()),
+                    tools: Some("standard".to_string()),
                 },
             ],
             tools: ToolsConfig::default(),

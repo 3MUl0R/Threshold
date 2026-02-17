@@ -92,7 +92,11 @@ pub struct ImageGenToolConfig {
 pub struct HeartbeatConfig {
     pub enabled: bool,
     pub interval_minutes: Option<u64>,
-    pub instructions_file: Option<String>,
+    pub instruction_file: Option<String>,
+    pub handoff_notes_path: Option<String>,
+    pub conversation_id: Option<String>,
+    #[serde(default)]
+    pub skip_if_running: Option<bool>,
     pub notification_channel_id: Option<u64>,
 }
 
@@ -101,6 +105,7 @@ pub struct HeartbeatConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct SchedulerConfig {
     pub enabled: bool,
+    pub store_path: Option<String>,
 }
 
 // ── Loading ──
@@ -182,10 +187,10 @@ impl ThresholdConfig {
 
             if let Some(tools) = &agent.tools {
                 match tools.as_str() {
-                    "minimal" | "coding" | "full" => {}
+                    "minimal" | "standard" | "coding" | "full" => {}
                     _ => {
                         return Err(crate::ThresholdError::Config(format!(
-                            "invalid tools '{}' for agent '{}': expected minimal, coding, or full",
+                            "invalid tools '{}' for agent '{}': expected minimal, standard, or full",
                             tools, agent.id
                         )));
                     }
@@ -475,6 +480,21 @@ id = "a"
 name = "A"
 cli_provider = "claude"
 tools = "coding"
+"#;
+        let config: ThresholdConfig = toml::from_str(toml).unwrap();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_standard_profile() {
+        let toml = r#"
+[cli.claude]
+
+[[agents]]
+id = "a"
+name = "A"
+cli_provider = "claude"
+tools = "standard"
 "#;
         let config: ThresholdConfig = toml::from_str(toml).unwrap();
         assert!(config.validate().is_ok());

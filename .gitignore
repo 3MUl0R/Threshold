@@ -3,3 +3,5 @@
 *.swp
 *.swo
 .env
+# Test artifacts from audit trail (relative path defaults)
+.threshold/

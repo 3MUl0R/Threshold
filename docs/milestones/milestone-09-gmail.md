@@ -2,7 +2,33 @@
 
 **Crate:** `gmail`
 **Complexity:** Medium
-**Dependencies:** Milestone 1 (core, secrets), Milestone 5 (tool framework)
+**Dependencies:** Milestone 1 (core, secrets), Milestone 5 (tool framework — CLI binary skeleton)
+
+## Architecture Note: CLI Subcommands
+
+> Per the CLI-based tool architecture (see Milestone 5), Gmail is exposed as
+> `threshold gmail <action>` CLI subcommands rather than a Tool trait
+> implementation. Claude invokes Gmail commands via its native shell execution.
+>
+> ```
+> Claude needs to check email:
+>     → exec("threshold gmail list --inbox user@gmail.com --max 10")
+>     → stdout returns JSON array of message summaries
+>     → Claude reads and summarizes naturally
+>
+> Claude needs to send a reply:
+>     → exec("threshold gmail reply MSG_ID --body '...'")
+>     → stdout confirms send (or error)
+> ```
+>
+> The Gmail API client, OAuth flow, and permission gating remain unchanged
+> from the designs below. Only the interface changes from Tool trait to clap
+> subcommands. The `threshold gmail auth` command handles the interactive
+> OAuth setup flow.
+>
+> **Audit logging:** Each CLI subcommand writes its own audit entry via
+> `AuditTrail` before returning output. Send/reply actions are logged at
+> elevated prominence.
 
 ## What This Milestone Delivers
 
@@ -121,25 +147,29 @@ Google requires user consent via the OAuth flow.
 
 1. User registers a Google Cloud project and creates OAuth 2.0 credentials
    (client ID + client secret) with Gmail API scopes
-2. User runs `threshold gmail auth` CLI command, which:
+2. User runs `threshold gmail auth --inbox user@gmail.com` for each inbox, which:
    a. Opens a browser to Google's consent screen
-   b. User grants read/send permissions
+   b. User grants read/send permissions for that account
    c. Callback captures the authorization code
    d. Exchanges code for access + refresh tokens
-   e. Stores both tokens in OS keychain (`gmail-oauth-access-token`,
-      `gmail-oauth-refresh-token`)
-3. On subsequent API calls, the client uses the access token. If expired,
-   it uses the refresh token to obtain a new access token automatically.
+   e. Stores tokens in OS keychain, namespaced by inbox
+      (`gmail-oauth-access-token-user@gmail.com`,
+       `gmail-oauth-refresh-token-user@gmail.com`)
+3. On subsequent API calls, the client resolves the inbox-specific access
+   token. If expired, it uses the inbox-specific refresh token automatically.
 
 ```rust
 pub struct GmailAuth {
     secret_store: Arc<SecretStore>,
+    inbox: String,
     client_id: String,
     client_secret: String,
 }
 
 impl GmailAuth {
-    /// Get a valid access token, refreshing if expired.
+    pub fn new(secret_store: Arc<SecretStore>, inbox: &str) -> Self;
+
+    /// Get a valid access token for this inbox, refreshing if expired.
     pub async fn get_access_token(&self) -> Result<String>;
 
     /// Run the initial OAuth consent flow (interactive, opens browser).
@@ -147,11 +177,14 @@ impl GmailAuth {
 }
 ```
 
-**Keychain keys:**
-- `gmail-oauth-client-id` — Google OAuth client ID
-- `gmail-oauth-client-secret` — Google OAuth client secret
-- `gmail-oauth-access-token` — current access token
-- `gmail-oauth-refresh-token` — refresh token (long-lived)
+**Keychain keys (namespaced per inbox):**
+- `gmail-oauth-client-id` — Google OAuth client ID (shared across inboxes)
+- `gmail-oauth-client-secret` — Google OAuth client secret (shared across inboxes)
+- `gmail-oauth-access-token-{inbox}` — current access token for a specific inbox
+- `gmail-oauth-refresh-token-{inbox}` — refresh token for a specific inbox (long-lived)
+
+Where `{inbox}` is the email address (e.g., `gmail-oauth-access-token-user@gmail.com`).
+Each inbox requires its own OAuth consent flow via `threshold gmail auth --inbox <email>`.
 
 **Required scopes:**
 - `https://www.googleapis.com/auth/gmail.readonly` — read access
@@ -160,88 +193,106 @@ impl GmailAuth {
 
 ---
 
-## Phase 9.2 — Gmail Tool
+## Phase 9.2 — Gmail CLI Subcommands
 
-### `crates/gmail/src/tool.rs`
+### `crates/gmail/src/cli.rs`
 
 ```rust
-pub struct GmailTool {
-    client: GmailClient,
-    config: GmailToolConfig,
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+pub struct GmailArgs {
+    #[command(subcommand)]
+    pub command: GmailCommands,
 }
 
-#[async_trait]
-impl Tool for GmailTool {
-    fn name(&self) -> &str { "gmail" }
+#[derive(Subcommand)]
+pub enum GmailCommands {
+    /// Run OAuth setup flow (interactive, opens browser)
+    Auth {
+        #[arg(long)]
+        inbox: String,
+    },
+    /// List recent messages from an inbox
+    List {
+        #[arg(long)]
+        inbox: String,
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long, default_value = "10")]
+        max: u32,
+    },
+    /// Read a specific message by ID
+    Read {
+        #[arg(long)]
+        inbox: String,
+        /// Message ID
+        id: String,
+    },
+    /// Search messages with Gmail search syntax
+    Search {
+        #[arg(long)]
+        inbox: String,
+        /// Gmail search query
+        query: String,
+        #[arg(long, default_value = "10")]
+        max: u32,
+    },
+    /// Send a new email (requires allow_send = true)
+    Send {
+        #[arg(long)]
+        inbox: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        subject: String,
+        #[arg(long)]
+        body: String,
+    },
+    /// Reply to an existing email (requires allow_send = true)
+    Reply {
+        #[arg(long)]
+        inbox: String,
+        /// Message ID to reply to
+        id: String,
+        #[arg(long)]
+        body: String,
+    },
+}
 
-    fn description(&self) -> &str {
-        "Read and send email via Gmail. Can list inbox, search messages, \
-         read full emails, send new emails, and reply to existing ones."
-    }
+pub async fn handle_gmail_command(args: GmailArgs) -> Result<()> {
+    let config = load_gmail_config()?;
+    let secret_store = Arc::new(SecretStore::new());
+    let client = GmailClient::new(secret_store.clone());
+    let audit = AuditTrail::new(/* ... */);
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["list", "read", "search", "send", "reply"],
-                    "description": "Gmail action to perform"
-                },
-                "inbox": {
-                    "type": "string",
-                    "description": "Email address / inbox to use"
-                },
-                "query": {
-                    "type": "string",
-                    "description": "Search query (Gmail search syntax)"
-                },
-                "message_id": {
-                    "type": "string",
-                    "description": "Message ID (for read/reply)"
-                },
-                "to": {
-                    "type": "string",
-                    "description": "Recipient email (for send)"
-                },
-                "subject": {
-                    "type": "string",
-                    "description": "Email subject (for send)"
-                },
-                "body": {
-                    "type": "string",
-                    "description": "Email body text (for send/reply)"
-                },
-                "max_results": {
-                    "type": "integer",
-                    "description": "Max messages to return (default: 10)"
-                }
-            },
-            "required": ["action"]
-        })
-    }
-
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> Result<ToolResult> {
-        let action = params["action"].as_str()
-            .ok_or_else(|| tool_error("Missing 'action'"))?;
-
-        match action {
-            "list" => self.handle_list(&params).await,
-            "read" => self.handle_read(&params).await,
-            "search" => self.handle_search(&params).await,
-            "send" => {
-                self.check_send_permission(ctx)?;
-                self.handle_send(&params).await
-            }
-            "reply" => {
-                self.check_send_permission(ctx)?;
-                self.handle_reply(&params).await
-            }
-            _ => Err(tool_error(&format!("Unknown action: {}", action))),
+    match args.command {
+        GmailCommands::Auth { inbox } => {
+            let auth = GmailAuth::new(secret_store, &inbox);
+            auth.authorize().await?;
+            println!(r#"{{"status": "ok", "inbox": "{}", "message": "Gmail OAuth setup complete"}}"#, inbox);
         }
+        GmailCommands::List { inbox, query, max } => {
+            let messages = client.list_messages(&inbox, query.as_deref(), max).await?;
+            audit.append_event("gmail", &json!({"action": "list", "inbox": inbox})).ok();
+            println!("{}", serde_json::to_string_pretty(&messages)?);
+        }
+        GmailCommands::Send { inbox, to, subject, body } => {
+            check_send_permission(&config)?;
+            client.send(&inbox, &to, &subject, &body).await?;
+            audit.append_event("gmail", &json!({
+                "action": "send", "to": to, "subject": subject
+            })).ok();
+            println!(r#"{{"status": "ok", "message": "Email sent"}}"#);
+        }
+        // ... other commands follow same pattern
     }
+
+    Ok(())
 }
 ```
+
+All subcommands output **JSON to stdout** by default.
 
 ---
 
@@ -251,52 +302,27 @@ Sending email is a potentially destructive action. The permission system
 controls whether the AI can send without confirmation.
 
 ```rust
-impl GmailTool {
-    fn check_send_permission(&self, ctx: &ToolContext) -> Result<()> {
-        // Hard gate: config must explicitly enable sending
-        if !self.config.allow_send.unwrap_or(false) {
-            return Err(ThresholdError::ToolError {
-                tool: "gmail".into(),
-                message: "Email sending is disabled. Set tools.gmail.allow_send = true \
-                          in config to enable it.".into(),
-            });
-        }
-
-        // Permission mode gate: in non-FullAuto modes, sending is blocked.
-        // Runtime approval via Discord confirmation is a future enhancement.
-        match ctx.permission_mode {
-            ToolPermissionMode::FullAuto => {
-                tracing::info!("Gmail send: auto-approved (full-auto mode)");
-                Ok(())
-            }
-            ToolPermissionMode::ApproveDestructive | ToolPermissionMode::ApproveAll => {
-                Err(ThresholdError::ToolError {
-                    tool: "gmail".into(),
-                    message: format!(
-                        "Email sending requires full-auto permission mode. \
-                         Current mode: {:?}. Either change tools.permission_mode \
-                         to 'full-auto' or send the email manually.",
-                        ctx.permission_mode
-                    ),
-                })
-            }
-        }
+/// Check send permission — called by send/reply subcommands before execution.
+fn check_send_permission(config: &GmailToolConfig) -> Result<()> {
+    if !config.allow_send.unwrap_or(false) {
+        return Err(ThresholdError::ToolError {
+            tool: "gmail".into(),
+            message: "Email sending is disabled. Set tools.gmail.allow_send = true \
+                      in config to enable it.".into(),
+        });
     }
+    Ok(())
 }
 ```
 
 ### Design Note: No Silent Bypass
 
-In non-FullAuto permission modes, Gmail send/reply is **blocked, not
-silently allowed.** This is a deliberate choice — the permission model
-must mean what it says.
+Send/reply subcommands check `allow_send` in the config before executing.
+If disabled, the command exits with a JSON error and non-zero status code.
 
-Future enhancement: when the conversation engine supports confirmation
-requests (emit a "please confirm" event to the portal, wait for user
-response), we can allow send/reply with explicit Discord approval in
-ApproveDestructive mode. But until that mechanism exists, we block rather
-than pretend to gate.
-```
+Future enhancement: a confirmation flow where the CLI prompts the daemon
+to ask the user via Discord before proceeding with the send. But until
+that mechanism exists, we gate at the config level.
 
 ### Audit Trail
 
@@ -327,9 +353,10 @@ allow_send = false    # Must be explicitly enabled
 
 ```
 crates/gmail/src/
-  lib.rs            — re-exports GmailTool
+  lib.rs            — re-exports public API
+  cli.rs            — clap subcommand definitions and handler
   client.rs         — GmailClient (Google API wrapper)
-  tool.rs           — GmailTool implementing the Tool trait
+  auth.rs           — GmailAuth (OAuth 2.0 flow, token refresh)
   types.rs          — MessageSummary, EmailMessage, etc.
 ```
 
@@ -340,9 +367,8 @@ crates/gmail/src/
 - [ ] Unit test: message summary formatting
 - [ ] Unit test: email message parsing
 - [ ] Unit test: send permission gate — blocks when allow_send = false
-- [ ] Unit test: send permission gate — allows in FullAuto mode
-- [ ] Unit test: send permission gate — warns in ApproveDestructive mode
-- [ ] Integration test (with Google API key): list messages from inbox
+- [ ] Unit test: send permission gate — allows when allow_send = true
+- [ ] Integration test (with OAuth credentials): list messages from inbox
 - [ ] Integration test: search messages with query
 - [ ] Integration test: read a specific message by ID
 - [ ] Integration test: tool is blocked when config has `enabled = false`

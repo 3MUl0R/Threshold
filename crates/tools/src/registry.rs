@@ -316,19 +316,22 @@ mod tests {
     fn tools_for_profile_filters_by_profile() {
         let mut registry = ToolRegistry::new(&ToolsConfig::default());
         registry.register(Arc::new(MockTool {
-            name: "read".to_string(),
-        }));
-        registry.register(Arc::new(MockTool {
             name: "exec".to_string(),
         }));
+        registry.register(Arc::new(MockTool {
+            name: "gmail".to_string(),
+        }));
 
+        // Minimal: no internal tools allowed
         let minimal_tools = registry.tools_for_profile(&ToolProfile::Minimal);
-        assert_eq!(minimal_tools.len(), 1);
-        assert_eq!(minimal_tools[0].name(), "read");
+        assert_eq!(minimal_tools.len(), 0);
 
-        let coding_tools = registry.tools_for_profile(&ToolProfile::Coding);
-        assert_eq!(coding_tools.len(), 2);
+        // Standard: only exec allowed
+        let standard_tools = registry.tools_for_profile(&ToolProfile::Standard);
+        assert_eq!(standard_tools.len(), 1);
+        assert_eq!(standard_tools[0].name(), "exec");
 
+        // Full: all tools
         let full_tools = registry.tools_for_profile(&ToolProfile::Full);
         assert_eq!(full_tools.len(), 2);
     }
@@ -337,12 +340,12 @@ mod tests {
     fn schemas_for_profile_returns_tool_schemas() {
         let mut registry = ToolRegistry::new(&ToolsConfig::default());
         registry.register(Arc::new(MockTool {
-            name: "read".to_string(),
+            name: "exec".to_string(),
         }));
 
-        let schemas = registry.schemas_for_profile(&ToolProfile::Minimal);
+        let schemas = registry.schemas_for_profile(&ToolProfile::Standard);
         assert_eq!(schemas.len(), 1);
-        assert_eq!(schemas[0]["name"], "read");
+        assert_eq!(schemas[0]["name"], "exec");
         assert_eq!(schemas[0]["description"], "A mock tool for testing");
         assert!(schemas[0]["parameters"].is_object());
     }

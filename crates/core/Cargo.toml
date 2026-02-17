@@ -17,6 +17,7 @@ tracing-appender = "0.2"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 tokio = { version = "1", features = ["full"] }
 dirs = "6"
+async-trait = "0.1"
 
 [dev-dependencies]
 serial_test = "3"

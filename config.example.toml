@@ -114,10 +114,13 @@ enabled = true
 # [heartbeat]
 # enabled = true
 # interval_minutes = 60
-# instructions_file = "~/.threshold/heartbeat-instructions.txt"
+# instruction_file = "heartbeat.md"
+# handoff_notes_path = "~/.threshold/state/heartbeat-notes.md"
+# skip_if_running = true
 # notification_channel_id = 1234567890123456789
 
-# ── Scheduler Configuration (Milestone 7) ──
+# ── Scheduler Configuration (Milestone 6) ──
 
 # [scheduler]
 # enabled = true
+# store_path = "~/.threshold/state/schedules.json"

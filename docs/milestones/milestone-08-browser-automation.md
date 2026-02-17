@@ -2,14 +2,31 @@
 
 **Crate:** `browser`
 **Complexity:** Medium
-**Dependencies:** Milestone 5 (tool framework)
+**Dependencies:** Milestone 5 (tool framework — CLI binary skeleton)
+
+## Architecture Note: CLI Subcommands
+
+> Per the CLI-based tool architecture (see Milestone 5), browser automation is
+> exposed as `threshold browser <action>` CLI subcommands rather than a Tool
+> trait implementation. Claude invokes browser commands via its native shell
+> execution capability.
+>
+> ```
+> Claude needs to take a screenshot:
+>     → exec("threshold browser screenshot --session dev")
+>     → stdout returns file path or base64 image data
+>     → Claude reads the output naturally
+> ```
+>
+> The internal Playwright integration logic remains the same — only the
+> interface changes from Tool trait to clap subcommands with JSON stdout.
 
 ## What This Milestone Delivers
 
-Playwright CLI integration as a native tool. The AI can browse the web,
-interact with pages, take screenshots, fill forms, and manage persistent
-browser sessions. Disabled by default for security. Network origin filtering
-restricts which domains the AI can access.
+Playwright CLI integration as `threshold browser` subcommands. The AI can
+browse the web, interact with pages, take screenshots, fill forms, and manage
+persistent browser sessions. Disabled by default for security. Network origin
+filtering restricts which domains the AI can access.
 
 ### Use Cases
 
@@ -21,99 +38,79 @@ restricts which domains the AI can access.
 
 ---
 
-## Phase 8.1 — Playwright CLI Tool
+## Phase 8.1 — Browser CLI Subcommands
 
-### `crates/browser/src/tool.rs`
+### `threshold browser` Command Tree
+
+```
+threshold browser
+  open [url]          Open a browser session (optionally navigate to URL)
+  goto <url>          Navigate to URL in current session
+  close               Close the browser session
+  click <ref>         Click an element
+  fill <ref> <text>   Fill a form field
+  type <text>         Type text
+  select <ref> <val>  Select dropdown value
+  screenshot [ref]    Take screenshot (full page or element)
+  pdf                 Export page as PDF
+  tab-list            List open tabs
+  tab-new [url]       Open new tab
+  tab-close [idx]     Close tab
+  tab-select <idx>    Switch to tab
+  --session <name>    Named browser session (default: "default")
+  --format json|text  Output format (default: json)
+```
+
+### Implementation (`crates/browser/src/cli.rs`)
 
 ```rust
-pub struct BrowserTool {
-    config: BrowserToolConfig,
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+pub struct BrowserArgs {
+    #[command(subcommand)]
+    pub command: BrowserCommands,
+    #[arg(long, default_value = "default")]
+    pub session: String,
+    #[arg(long, default_value = "json")]
+    pub format: OutputFormat,
 }
 
-#[async_trait]
-impl Tool for BrowserTool {
-    fn name(&self) -> &str { "browser" }
+#[derive(Subcommand)]
+pub enum BrowserCommands {
+    Open { url: Option<String> },
+    Goto { url: String },
+    Close,
+    Click { selector: String },
+    Fill { selector: String, text: String },
+    Screenshot { selector: Option<String> },
+    // ... etc
+}
 
-    fn description(&self) -> &str {
-        "Control a web browser via Playwright CLI. Navigate pages, click elements, \
-         fill forms, take screenshots, and manage browser sessions."
-    }
+pub async fn handle_browser_command(args: BrowserArgs) -> Result<()> {
+    let config = load_browser_config()?;
+    let session_mgr = BrowserSessionManager::new();
 
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": [
-                        "open", "goto", "close",
-                        "click", "fill", "type", "select", "check", "uncheck",
-                        "hover", "press", "drag",
-                        "screenshot", "pdf",
-                        "cookie-list", "cookie-get", "cookie-set", "cookie-delete",
-                        "state-save", "state-load",
-                        "tab-list", "tab-new", "tab-close", "tab-select",
-                        "console", "network"
-                    ],
-                    "description": "Browser action to perform"
-                },
-                "args": {
-                    "type": "string",
-                    "description": "Arguments for the action (URL, element ref, text, etc.)"
-                },
-                "session": {
-                    "type": "string",
-                    "description": "Named browser session (default: 'default')"
-                }
-            },
-            "required": ["action"]
-        })
-    }
-
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> Result<ToolResult> {
-        let action = params["action"].as_str()
-            .ok_or_else(|| tool_error("Missing 'action' parameter"))?;
-        let args = params["args"].as_str().unwrap_or("");
-        let session = params["session"].as_str().unwrap_or("default");
-
-        // Build command
-        let mut cmd = Command::new("playwright-cli");
-        cmd.arg("-s").arg(session);
-        cmd.arg(action);
-        if !args.is_empty() {
-            // Split args respecting quotes
-            cmd.args(shell_words::split(args)?);
-        }
-
-        // Execute with timeout
-        let output = tokio::time::timeout(
-            Duration::from_secs(60),
-            cmd.output(),
-        ).await
-        .map_err(|_| tool_error("Browser action timed out after 60s"))??;
-
-        // Handle artifacts (screenshots)
-        let mut artifacts = vec![];
-        if action == "screenshot" || action == "pdf" {
-            if let Some(path) = extract_file_path(&output.stdout) {
-                let data = tokio::fs::read(&path).await?;
-                let mime = if action == "pdf" { "application/pdf" } else { "image/png" };
-                artifacts.push(Artifact {
-                    name: path.file_name().unwrap().to_string_lossy().to_string(),
-                    data,
-                    mime_type: mime.to_string(),
-                });
+    match args.command {
+        BrowserCommands::Open { url } => {
+            let mut cmd = Command::new("playwright-cli");
+            cmd.arg("-s").arg(&args.session).arg("open");
+            if let Some(url) = &url {
+                cmd.arg(url);
             }
+            let output = execute_with_timeout(&mut cmd, 60).await?;
+            session_mgr.track_session(&args.session).await;
+            print_output(&output, &args.format);
         }
-
-        Ok(ToolResult {
-            content: String::from_utf8_lossy(&output.stdout).to_string(),
-            artifacts,
-            success: output.status.success(),
-        })
+        // ... other commands follow same pattern
     }
+
+    Ok(())
 }
 ```
+
+Each command outputs JSON to stdout for Claude to parse, with optional
+`--format text` for human readability.
 
 ### Command Reference
 
@@ -135,9 +132,19 @@ impl Tool for BrowserTool {
 Generate `playwright-cli.json` from Threshold's config:
 
 ```rust
+/// Default allowed origins — localhost only (default-deny).
+const DEFAULT_ALLOWED_ORIGINS: &[&str] = &["http://localhost:*"];
+
 /// Write playwright-cli.json configuration. This is a synchronous function
 /// because it runs once at startup, not in a hot path.
 pub fn write_playwright_config(config: &BrowserToolConfig, path: &Path) -> Result<()> {
+    // Default-deny: if no allowed_origins configured, restrict to localhost only.
+    // An explicitly empty list in config means "allow nothing" (strictest).
+    // To allow all origins, the user must explicitly set allowed_origins = ["*"].
+    let allowed_origins = config.allowed_origins.clone().unwrap_or_else(|| {
+        DEFAULT_ALLOWED_ORIGINS.iter().map(|s| s.to_string()).collect()
+    });
+
     let playwright_config = json!({
         "browser": "chromium",
         "launchOptions": {
@@ -149,7 +156,7 @@ pub fn write_playwright_config(config: &BrowserToolConfig, path: &Path) -> Resul
         "actionTimeout": 5000,
         "navigationTimeout": 60000,
         "network": {
-            "allowedOrigins": config.allowed_origins.clone().unwrap_or_default(),
+            "allowedOrigins": allowed_origins,
             "blockedOrigins": config.blocked_origins.clone().unwrap_or_default()
         }
     });
@@ -167,12 +174,19 @@ Network origin filtering is the primary security control:
 [tools.browser]
 enabled = false                  # Disabled by default — explicit opt-in
 headless = true                  # No visible browser window
-allowed_origins = []             # Empty = allow all (use with caution)
-blocked_origins = [              # Block known tracking/ad domains
-    "https://ads.example.com",
-    "https://tracking.example.com",
+allowed_origins = [              # Default-deny: only listed origins are accessible
+    "http://localhost:*",        # Local dev servers
 ]
+blocked_origins = []             # Additional deny-list (applied after allow check)
 ```
+
+**Security model: default-deny.**
+- **Not set** (field omitted): defaults to `["http://localhost:*"]` — only local dev servers
+- **Non-empty list** (e.g., `["https://example.com"]`): only listed origins accessible
+- **Empty list** (`allowed_origins = []`): no origins accessible (strictest)
+- **Wildcard** (`allowed_origins = ["*"]`): all origins (use with extreme caution)
+
+`blocked_origins` is a second-pass filter applied after the allow check.
 
 ---
 
@@ -211,10 +225,10 @@ impl BrowserSessionManager {
 
 ### Session Lifecycle
 
-1. AI requests `browser` tool with `action: "open"` and `session: "dev-testing"`
-2. BrowserTool spawns `playwright-cli -s dev-testing open https://localhost:3000`
+1. Claude runs: `threshold browser open https://localhost:3000 --session dev-testing`
+2. Handler spawns `playwright-cli -s dev-testing open https://localhost:3000`
 3. Session manager tracks "dev-testing" as active
-4. Subsequent tool calls can reuse the session: `screenshot`, `click`, etc.
+4. Subsequent commands reuse the session: `threshold browser screenshot --session dev-testing`
 5. On shutdown, `close_all()` cleans up all active sessions
 
 ---
@@ -223,8 +237,8 @@ impl BrowserSessionManager {
 
 ```
 crates/browser/src/
-  lib.rs            — re-exports BrowserTool, BrowserSessionManager
-  tool.rs           — BrowserTool implementing the Tool trait
+  lib.rs            — re-exports public API, BrowserSessionManager
+  cli.rs            — clap subcommand definitions and handler
   config.rs         — playwright-cli.json generation
   sessions.rs       — session tracking and cleanup
 ```
@@ -238,7 +252,7 @@ crates/browser/src/
 - [ ] Unit test: playwright config JSON generation
 - [ ] Unit test: session tracking (add, remove, close_all)
 - [ ] Integration test (requires playwright-cli): open page, take screenshot
-- [ ] Integration test: screenshot returns image as artifact
+- [ ] Integration test: screenshot returns JSON with file path
 - [ ] Integration test: session persistence across multiple commands
 - [ ] Integration test: tool is blocked when config has `enabled = false`
 - [ ] Integration test: network filtering blocks disallowed origins

@@ -106,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Scheduler task (Milestone 7 — no-op until implemented)
+    // Scheduler task (Milestone 6 — no-op until implemented)
     let scheduler_handle = {
         let cancel = cancel.clone();
         async move {

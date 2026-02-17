@@ -11,5 +11,5 @@ pub use logging::init_logging;
 pub use secrets::SecretStore;
 pub use types::{
     AgentConfig, CliProvider, Conversation, ConversationId, ConversationMode, Message, MessageRole,
-    Portal, PortalId, PortalType, ToolPermissionMode, ToolProfile,
+    Portal, PortalId, PortalType, ResultSender, ScheduledAction, ToolPermissionMode, ToolProfile,
 };

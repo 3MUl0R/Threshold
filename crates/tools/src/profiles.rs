@@ -1,4 +1,8 @@
 //! Tool profile enforcement - extends core ToolProfile with permission checking
+//!
+//! Profiles control what the **scheduler** can do internally. Claude's access
+//! to CLI subcommands is governed by the system prompt and which commands are
+//! available on the system.
 
 use std::collections::HashSet;
 use threshold_core::ToolProfile;
@@ -16,10 +20,11 @@ pub trait ToolProfileExt {
 impl ToolProfileExt for ToolProfile {
     fn allowed_tools(&self) -> Option<HashSet<&'static str>> {
         match self {
-            Self::Minimal => Some(HashSet::from(["web_search", "web_fetch", "read"])),
-            Self::Coding => Some(HashSet::from([
-                "web_search", "web_fetch", "read", "write", "edit", "exec",
-            ])),
+            // Minimal: no internal tools (read-only agents)
+            Self::Minimal => Some(HashSet::new()),
+            // Standard: can run scripts via scheduler's ExecTool
+            Self::Standard => Some(HashSet::from(["exec"])),
+            // Full: all internal tools
             Self::Full => None, // None means "allow all"
         }
     }
@@ -37,34 +42,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn minimal_profile_allows_only_read_only_tools() {
+    fn minimal_profile_allows_no_tools() {
         let profile = ToolProfile::Minimal;
-        assert!(profile.allows("read"));
-        assert!(profile.allows("web_search"));
-        assert!(profile.allows("web_fetch"));
-        assert!(!profile.allows("write"));
-        assert!(!profile.allows("edit"));
         assert!(!profile.allows("exec"));
         assert!(!profile.allows("gmail"));
+        assert!(!profile.allows("arbitrary_tool"));
     }
 
     #[test]
-    fn coding_profile_allows_read_write_tools() {
-        let profile = ToolProfile::Coding;
-        assert!(profile.allows("read"));
-        assert!(profile.allows("write"));
-        assert!(profile.allows("edit"));
+    fn standard_profile_allows_exec_only() {
+        let profile = ToolProfile::Standard;
         assert!(profile.allows("exec"));
-        assert!(profile.allows("web_search"));
-        assert!(profile.allows("web_fetch"));
         assert!(!profile.allows("gmail"));
+        assert!(!profile.allows("arbitrary_tool"));
     }
 
     #[test]
     fn full_profile_allows_all_tools() {
         let profile = ToolProfile::Full;
-        assert!(profile.allows("read"));
-        assert!(profile.allows("write"));
         assert!(profile.allows("exec"));
         assert!(profile.allows("gmail"));
         assert!(profile.allows("arbitrary_tool"));
@@ -77,23 +72,17 @@ mod tests {
     }
 
     #[test]
-    fn allowed_tools_returns_set_for_minimal_profile() {
+    fn allowed_tools_returns_empty_set_for_minimal_profile() {
         let profile = ToolProfile::Minimal;
         let tools = profile.allowed_tools().unwrap();
-        assert_eq!(tools.len(), 3);
-        assert!(tools.contains("read"));
-        assert!(tools.contains("web_search"));
-        assert!(tools.contains("web_fetch"));
+        assert!(tools.is_empty());
     }
 
     #[test]
-    fn allowed_tools_returns_set_for_coding_profile() {
-        let profile = ToolProfile::Coding;
+    fn allowed_tools_returns_exec_for_standard_profile() {
+        let profile = ToolProfile::Standard;
         let tools = profile.allowed_tools().unwrap();
-        assert_eq!(tools.len(), 6);
-        assert!(tools.contains("read"));
-        assert!(tools.contains("write"));
-        assert!(tools.contains("edit"));
+        assert_eq!(tools.len(), 1);
         assert!(tools.contains("exec"));
     }
 }

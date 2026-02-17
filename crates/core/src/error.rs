@@ -66,7 +66,6 @@ pub enum ThresholdError {
     #[error("External service error: {0}")]
     External(String),
 
-    // Scheduler-specific errors (Milestone 7)
     #[error("Scheduler is shutting down")]
     SchedulerShutdown,
 

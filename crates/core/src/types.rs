@@ -106,7 +106,8 @@ pub struct AgentConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ToolProfile {
     Minimal,
-    Coding,
+    #[serde(alias = "Coding")]
+    Standard,
     Full,
 }
 
@@ -115,6 +116,61 @@ pub enum ToolPermissionMode {
     FullAuto,
     ApproveDestructive,
     ApproveAll,
+}
+
+// ──── Scheduled Actions ────
+
+/// What a scheduled task should do when it fires.
+///
+/// This is the source of truth for all scheduling action types across the system.
+/// The scheduler engine (Milestone 6) executes these, and the CLI/Discord
+/// interfaces create tasks that reference them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ScheduledAction {
+    /// Launch a new Claude conversation with this prompt.
+    /// Claude uses its native tools plus our custom CLI tools.
+    NewConversation {
+        prompt: String,
+        model: Option<String>,
+    },
+
+    /// Resume an existing conversation thread.
+    /// Maintains full conversation history and context.
+    /// This is the action type used by heartbeats.
+    ResumeConversation {
+        conversation_id: ConversationId,
+        prompt: String,
+    },
+
+    /// Run a script/command directly (no Claude involvement).
+    /// For simple automation that doesn't need AI.
+    Script {
+        command: String,
+        working_dir: Option<String>,
+    },
+
+    /// Run a script, then feed the output to Claude for analysis.
+    /// Use `{output}` placeholder in `prompt_template` for script output.
+    ScriptThenConversation {
+        command: String,
+        prompt_template: String,
+        model: Option<String>,
+    },
+}
+
+// ──── Result Delivery ────
+
+/// Trait for delivering scheduled task results to external channels.
+///
+/// Defined in core to break the scheduler→discord circular dependency.
+/// The discord crate implements this as `DiscordOutbound`, and it's injected
+/// into the scheduler at construction time in the server binary.
+#[async_trait::async_trait]
+pub trait ResultSender: Send + Sync {
+    /// Send a message to a Discord channel (or other channel-like destination).
+    async fn send_to_channel(&self, channel_id: u64, message: &str) -> Result<(), crate::ThresholdError>;
+    /// Send a direct message to a user.
+    async fn send_dm(&self, user_id: u64, message: &str) -> Result<(), crate::ThresholdError>;
 }
 
 // ──── Messages ────
@@ -246,7 +302,7 @@ mod tests {
 
     #[test]
     fn tool_profile_serde_round_trip() {
-        for profile in [ToolProfile::Minimal, ToolProfile::Coding, ToolProfile::Full] {
+        for profile in [ToolProfile::Minimal, ToolProfile::Standard, ToolProfile::Full] {
             let json = serde_json::to_string(&profile).unwrap();
             let restored: ToolProfile = serde_json::from_str(&json).unwrap();
             assert_eq!(profile, restored);
@@ -267,6 +323,75 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_action_new_conversation_serde_round_trip() {
+        let action = ScheduledAction::NewConversation {
+            prompt: "Run nightly tests".into(),
+            model: Some("sonnet".into()),
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        let restored: ScheduledAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(action, restored);
+    }
+
+    #[test]
+    fn scheduled_action_resume_conversation_serde_round_trip() {
+        let action = ScheduledAction::ResumeConversation {
+            conversation_id: ConversationId::new(),
+            prompt: "Continue working on the project".into(),
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        let restored: ScheduledAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(action, restored);
+    }
+
+    #[test]
+    fn scheduled_action_script_serde_round_trip() {
+        let action = ScheduledAction::Script {
+            command: "cargo test".into(),
+            working_dir: Some("/home/user/project".into()),
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        let restored: ScheduledAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(action, restored);
+    }
+
+    #[test]
+    fn scheduled_action_script_then_conversation_serde_round_trip() {
+        let action = ScheduledAction::ScriptThenConversation {
+            command: "curl https://api.example.com/health".into(),
+            prompt_template: "API health check result:\n{output}\n\nAnalyze this.".into(),
+            model: None,
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        let restored: ScheduledAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(action, restored);
+    }
+
+    #[test]
+    fn scheduled_action_script_optional_fields() {
+        let action = ScheduledAction::Script {
+            command: "echo hello".into(),
+            working_dir: None,
+        };
+        let json = serde_json::to_string(&action).unwrap();
+        let restored: ScheduledAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(action, restored);
+
+        // Verify None working_dir serializes correctly
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["Script"]["working_dir"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn tool_profile_coding_alias_deserializes_to_standard() {
+        // Regression test: legacy "Coding" value must deserialize into Standard
+        // to maintain backwards compatibility after the Coding→Standard rename.
+        let json = r#""Coding""#;
+        let profile: ToolProfile = serde_json::from_str(json).unwrap();
+        assert_eq!(profile, ToolProfile::Standard);
+    }
+
+    #[test]
     fn agent_config_serde_round_trip() {
         let agent = AgentConfig {
             id: "coder".into(),
@@ -275,7 +400,7 @@ mod tests {
                 model: "opus".into(),
             },
             system_prompt: Some("You are a coding assistant.".into()),
-            tool_profile: ToolProfile::Coding,
+            tool_profile: ToolProfile::Standard,
         };
         let json = serde_json::to_string(&agent).unwrap();
         let restored: AgentConfig = serde_json::from_str(&json).unwrap();
