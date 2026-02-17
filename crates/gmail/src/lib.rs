@@ -16,4 +16,8 @@
 //! - Send/reply gated by `allow_send` config flag
 
 pub mod auth;
+pub mod cli;
+pub mod client;
 pub mod types;
+
+pub use cli::{GmailArgs, handle_gmail_command};

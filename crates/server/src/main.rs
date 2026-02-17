@@ -5,6 +5,7 @@
 //! - `threshold schedule <subcommand>` — Manage scheduled tasks (Milestone 6)
 
 mod daemon_client;
+mod gmail;
 mod output;
 mod schedule;
 
@@ -27,6 +28,8 @@ enum Commands {
         #[command(subcommand)]
         command: schedule::ScheduleCommands,
     },
+    /// Gmail integration — read, search, and send email
+    Gmail(threshold_gmail::GmailArgs),
 }
 
 /// Arguments for the daemon subcommand.
@@ -44,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Daemon(args) => run_daemon(args).await,
         Commands::Schedule { command } => schedule::handle_schedule_command(command).await,
+        Commands::Gmail(args) => gmail::handle_gmail_command(args).await,
     }
 }
 
