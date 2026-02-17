@@ -14,10 +14,13 @@ pub async fn handle_gmail_command(args: threshold_gmail::GmailArgs) -> anyhow::R
         )
     })?;
 
-    let audit_path = config
-        .data_dir()
-        .ok()
-        .map(|d| d.join("audit").join("gmail.jsonl"));
+    let audit_path = match config.data_dir() {
+        Ok(d) => Some(d.join("audit").join("gmail.jsonl")),
+        Err(e) => {
+            tracing::warn!("Could not resolve data_dir for audit logging: {}", e);
+            None
+        }
+    };
 
     threshold_gmail::handle_gmail_command(
         args,

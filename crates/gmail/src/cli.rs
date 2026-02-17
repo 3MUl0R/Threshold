@@ -115,6 +115,10 @@ pub async fn handle_gmail_command(
             include_send,
         } => {
             validate_inbox(&inbox, config)?;
+            // If requesting send scope, verify allow_send is enabled
+            if include_send {
+                check_send_permission(config)?;
+            }
             let auth = GmailAuth::new(secret_store, &inbox);
             auth.authorize(include_send).await?;
 
@@ -227,17 +231,19 @@ pub async fn handle_gmail_command(
 
 /// Log an action to the audit trail (non-fatal: log warning on failure).
 async fn audit_log(audit: &Option<AuditTrail>, data: &serde_json::Value) {
-    if let Some(trail) = audit {
-        if let Err(e) = trail.append_event("gmail", data).await {
-            tracing::warn!("Failed to write Gmail audit entry: {}", e);
-        }
+    if let Some(trail) = audit
+        && let Err(e) = trail.append_event("gmail", data).await
+    {
+        tracing::warn!("Failed to write Gmail audit entry: {}", e);
     }
 }
 
 /// Validate that the inbox is in the config allowlist (if set).
+/// Comparison is case-insensitive since email addresses are case-insensitive.
 fn validate_inbox(inbox: &str, config: &GmailToolConfig) -> anyhow::Result<()> {
     if let Some(ref allowed) = config.inboxes {
-        if !allowed.iter().any(|a| a == inbox) {
+        let inbox_lower = inbox.to_lowercase();
+        if !allowed.iter().any(|a| a.to_lowercase() == inbox_lower) {
             let output = serde_json::json!({
                 "error": format!(
                     "Inbox '{}' is not in the allowed list. Allowed: {:?}",
@@ -252,7 +258,7 @@ fn validate_inbox(inbox: &str, config: &GmailToolConfig) -> anyhow::Result<()> {
 }
 
 /// Check that send permission is enabled in config.
-pub fn check_send_permission(config: &GmailToolConfig) -> anyhow::Result<()> {
+fn check_send_permission(config: &GmailToolConfig) -> anyhow::Result<()> {
     if !config.allow_send.unwrap_or(false) {
         let output = serde_json::json!({
             "error": "Email sending is disabled. Set tools.gmail.allow_send = true in config."
@@ -303,6 +309,13 @@ mod tests {
     fn validate_inbox_not_in_allowlist_fails() {
         let config = config_with_inboxes();
         assert!(validate_inbox("eve@hacker.com", &config).is_err());
+    }
+
+    #[test]
+    fn validate_inbox_case_insensitive() {
+        let config = config_with_inboxes();
+        assert!(validate_inbox("Alice@Gmail.Com", &config).is_ok());
+        assert!(validate_inbox("BOB@COMPANY.COM", &config).is_ok());
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -13,6 +13,31 @@ use threshold_core::SecretStore;
 
 use crate::auth::{AuthError, GmailAuth};
 use crate::types::{AttachmentInfo, EmailMessage, MessageSummary};
+
+/// Validate that a message ID contains only safe characters (alphanumeric).
+/// Gmail message IDs are hex strings — reject anything else to prevent URL injection.
+fn validate_message_id(id: &str) -> Result<&str, GmailApiError> {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(GmailApiError::ParseError(format!(
+            "Invalid message ID: '{}'",
+            id
+        )));
+    }
+    Ok(id)
+}
+
+/// Strip CR/LF from header values to prevent header injection.
+fn sanitize_header_value(value: &str) -> String {
+    value.replace(['\r', '\n'], "")
+}
+
+/// Decode base64url data tolerantly (handles both padded and unpadded).
+fn decode_base64url(data: &str) -> Option<Vec<u8>> {
+    URL_SAFE_NO_PAD
+        .decode(data)
+        .or_else(|_| URL_SAFE.decode(data))
+        .ok()
+}
 
 /// Base URL for the Gmail API v1.
 const GMAIL_API_BASE: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
@@ -62,8 +87,9 @@ impl GmailClient {
 
     /// Get the full content of a message by ID.
     pub async fn get_message(&self, message_id: &str) -> Result<EmailMessage, GmailApiError> {
+        let id = validate_message_id(message_id)?;
         let token = self.get_token().await?;
-        let url = format!("{}/messages/{}?format=full", GMAIL_API_BASE, message_id);
+        let url = format!("{}/messages/{}?format=full", GMAIL_API_BASE, id);
         let raw: RawMessage = self.get_json(&url, &token).await?;
         parse_full_message(raw)
     }
@@ -93,26 +119,7 @@ impl GmailClient {
         let url = format!("{}/messages/send", GMAIL_API_BASE);
         let payload = serde_json::json!({ "raw": encoded });
 
-        let response = self
-            .http
-            .post(&url)
-            .bearer_auth(&token)
-            .json(&payload)
-            .timeout(std::time::Duration::from_secs(30))
-            .send()
-            .await
-            .map_err(|e| GmailApiError::HttpError(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(GmailApiError::ApiError {
-                status: status.as_u16(),
-                message: body,
-            });
-        }
-
-        Ok(())
+        self.post_with_retry(&url, &payload, &token).await
     }
 
     /// Reply to an existing message.
@@ -121,19 +128,25 @@ impl GmailClient {
         message_id: &str,
         body: &str,
     ) -> Result<(), GmailApiError> {
+        let id = validate_message_id(message_id)?;
         let token = self.get_token().await?;
 
-        // Fetch original message to get threading headers
+        // Fetch original message to get threading headers (include Reply-To)
         let url = format!(
-            "{}/messages/{}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Message-ID",
-            GMAIL_API_BASE, message_id
+            "{}/messages/{}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Message-ID&metadataHeaders=Reply-To",
+            GMAIL_API_BASE, id
         );
         let original: RawMessage = self.get_json(&url, &token).await?;
 
         let headers = extract_headers(&original);
-        let original_from = headers.get("From").cloned().unwrap_or_default();
-        let original_subject = headers.get("Subject").cloned().unwrap_or_default();
-        let original_message_id = headers.get("Message-ID").cloned();
+        // Prefer Reply-To over From for the reply recipient
+        let reply_to = headers
+            .get("reply-to")
+            .or_else(|| headers.get("from"))
+            .cloned()
+            .unwrap_or_default();
+        let original_subject = headers.get("subject").cloned().unwrap_or_default();
+        let original_message_id = headers.get("message-id").cloned();
 
         let reply_subject = if original_subject.starts_with("Re: ") {
             original_subject
@@ -143,36 +156,22 @@ impl GmailClient {
 
         let from = self.auth.inbox();
         let raw_message =
-            build_rfc2822_message(from, &original_from, &reply_subject, body, original_message_id.as_deref());
+            build_rfc2822_message(from, &reply_to, &reply_subject, body, original_message_id.as_deref());
 
         let encoded = URL_SAFE_NO_PAD.encode(raw_message.as_bytes());
 
         let send_url = format!("{}/messages/send", GMAIL_API_BASE);
-        let payload = serde_json::json!({
-            "raw": encoded,
-            "threadId": original.thread_id
-        });
+        // Only include threadId if present (avoid sending null)
+        let payload = if let Some(ref thread_id) = original.thread_id {
+            serde_json::json!({
+                "raw": encoded,
+                "threadId": thread_id
+            })
+        } else {
+            serde_json::json!({ "raw": encoded })
+        };
 
-        let response = self
-            .http
-            .post(&send_url)
-            .bearer_auth(&token)
-            .json(&payload)
-            .timeout(std::time::Duration::from_secs(30))
-            .send()
-            .await
-            .map_err(|e| GmailApiError::HttpError(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body_text = response.text().await.unwrap_or_default();
-            return Err(GmailApiError::ApiError {
-                status: status.as_u16(),
-                message: body_text,
-            });
-        }
-
-        Ok(())
+        self.post_with_retry(&send_url, &payload, &token).await
     }
 
     /// Get an access token, retrying with refresh on 401.
@@ -189,6 +188,7 @@ impl GmailClient {
         id: &str,
         token: &str,
     ) -> Result<MessageSummary, GmailApiError> {
+        let id = validate_message_id(id)?;
         let url = format!(
             "{}/messages/{}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date",
             GMAIL_API_BASE, id
@@ -196,17 +196,77 @@ impl GmailClient {
         let raw: RawMessage = self.get_json(&url, token).await?;
 
         let headers = extract_headers(&raw);
+        let date = parse_date(&raw, &headers);
         let labels = raw.label_ids.unwrap_or_default();
 
         Ok(MessageSummary {
             id: raw.id,
-            from: headers.get("From").cloned().unwrap_or_default(),
-            subject: headers.get("Subject").cloned().unwrap_or_default(),
+            from: headers.get("from").cloned().unwrap_or_default(),
+            subject: headers.get("subject").cloned().unwrap_or_default(),
             snippet: raw.snippet.unwrap_or_default(),
-            date: parse_date_header(headers.get("Date").map(|s| s.as_str())),
+            date,
             labels: labels.clone(),
             is_unread: labels.contains(&"UNREAD".to_string()),
         })
+    }
+
+    /// Make an authenticated POST request with 401 retry.
+    async fn post_with_retry(
+        &self,
+        url: &str,
+        payload: &serde_json::Value,
+        token: &str,
+    ) -> Result<(), GmailApiError> {
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(token)
+            .json(payload)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| GmailApiError::HttpError(e.to_string()))?;
+
+        if response.status() == 401 {
+            // Token expired — try refresh and retry
+            let new_token = self
+                .auth
+                .refresh_access_token()
+                .await
+                .map_err(|e| GmailApiError::AuthError(e.to_string()))?;
+
+            let response = self
+                .http
+                .post(url)
+                .bearer_auth(&new_token)
+                .json(payload)
+                .timeout(std::time::Duration::from_secs(30))
+                .send()
+                .await
+                .map_err(|e| GmailApiError::HttpError(e.to_string()))?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let error_body = response.text().await.unwrap_or_default();
+                return Err(GmailApiError::ApiError {
+                    status: status.as_u16(),
+                    message: error_body,
+                });
+            }
+
+            return Ok(());
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_body = response.text().await.unwrap_or_default();
+            return Err(GmailApiError::ApiError {
+                status: status.as_u16(),
+                message: error_body,
+            });
+        }
+
+        Ok(())
     }
 
     /// Make an authenticated GET request and deserialize JSON.
@@ -275,6 +335,8 @@ impl GmailClient {
 // ── RFC 2822 message construction ──
 
 /// Build an RFC 2822 email message.
+///
+/// All header values are sanitized to prevent header injection (CR/LF stripped).
 pub fn build_rfc2822_message(
     from: &str,
     to: &str,
@@ -283,15 +345,21 @@ pub fn build_rfc2822_message(
     in_reply_to: Option<&str>,
 ) -> String {
     let mut message = String::new();
-    message.push_str(&format!("From: {}\r\n", from));
-    message.push_str(&format!("To: {}\r\n", to));
-    message.push_str(&format!("Subject: {}\r\n", subject));
+    message.push_str(&format!("From: {}\r\n", sanitize_header_value(from)));
+    message.push_str(&format!("To: {}\r\n", sanitize_header_value(to)));
+    message.push_str(&format!("Subject: {}\r\n", sanitize_header_value(subject)));
     message.push_str("MIME-Version: 1.0\r\n");
     message.push_str("Content-Type: text/plain; charset=utf-8\r\n");
 
     if let Some(reply_id) = in_reply_to {
-        message.push_str(&format!("In-Reply-To: {}\r\n", reply_id));
-        message.push_str(&format!("References: {}\r\n", reply_id));
+        message.push_str(&format!(
+            "In-Reply-To: {}\r\n",
+            sanitize_header_value(reply_id)
+        ));
+        message.push_str(&format!(
+            "References: {}\r\n",
+            sanitize_header_value(reply_id)
+        ));
     }
 
     message.push_str("\r\n");
@@ -365,27 +433,36 @@ struct MessagePart {
 
 // ── Parsing helpers ──
 
+/// Extract headers into a case-insensitive map (all keys lowercased).
 fn extract_headers(raw: &RawMessage) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
-    if let Some(ref payload) = raw.payload {
-        if let Some(ref headers) = payload.headers {
-            for h in headers {
-                map.insert(h.name.clone(), h.value.clone());
-            }
+    if let Some(ref payload) = raw.payload
+        && let Some(ref headers) = payload.headers
+    {
+        for h in headers {
+            map.insert(h.name.to_lowercase(), h.value.clone());
         }
     }
     map
 }
 
-fn parse_date_header(date_str: Option<&str>) -> DateTime<Utc> {
-    date_str
-        .and_then(|s| {
-            // Try RFC 2822 format first
-            DateTime::parse_from_rfc2822(s)
-                .ok()
-                .map(|dt| dt.with_timezone(&Utc))
-        })
-        .unwrap_or_else(Utc::now)
+/// Parse a date, trying the Date header first, then internalDate (epoch millis),
+/// and falling back to Utc::now() as last resort.
+fn parse_date(raw: &RawMessage, headers: &std::collections::HashMap<String, String>) -> DateTime<Utc> {
+    // Try Date header (RFC 2822)
+    if let Some(date_str) = headers.get("date")
+        && let Ok(dt) = DateTime::parse_from_rfc2822(date_str)
+    {
+        return dt.with_timezone(&Utc);
+    }
+    // Fallback to internalDate (epoch millis from Gmail API)
+    if let Some(ref ms) = raw.internal_date
+        && let Ok(millis) = ms.parse::<i64>()
+        && let Some(dt) = DateTime::from_timestamp_millis(millis)
+    {
+        return dt;
+    }
+    Utc::now()
 }
 
 /// Parse a full message response into an `EmailMessage`.
@@ -401,14 +478,14 @@ fn parse_full_message(raw: RawMessage) -> Result<EmailMessage, GmailApiError> {
     }
 
     Ok(EmailMessage {
-        id: raw.id,
-        from: headers.get("From").cloned().unwrap_or_default(),
-        to: parse_address_list(headers.get("To").map(|s| s.as_str())),
-        cc: parse_address_list(headers.get("Cc").map(|s| s.as_str())),
-        subject: headers.get("Subject").cloned().unwrap_or_default(),
+        id: raw.id.clone(),
+        from: headers.get("from").cloned().unwrap_or_default(),
+        to: parse_address_list(headers.get("to").map(|s| s.as_str())),
+        cc: parse_address_list(headers.get("cc").map(|s| s.as_str())),
+        subject: headers.get("subject").cloned().unwrap_or_default(),
         body_text,
         body_html,
-        date: parse_date_header(headers.get("Date").map(|s| s.as_str())),
+        date: parse_date(&raw, &headers),
         labels: raw.label_ids.unwrap_or_default(),
         attachments,
     })
@@ -422,25 +499,15 @@ fn extract_body_parts(
     attachments: &mut Vec<AttachmentInfo>,
 ) {
     // Check if this payload has a direct body
-    if let Some(ref body) = payload.body {
-        if let Some(ref data) = body.data {
-            if let Ok(decoded) = URL_SAFE_NO_PAD.decode(data) {
-                if let Ok(content) = String::from_utf8(decoded) {
-                    match payload.mime_type.as_deref() {
-                        Some("text/plain") => {
-                            if text.is_empty() {
-                                *text = content;
-                            }
-                        }
-                        Some("text/html") => {
-                            if html.is_none() {
-                                *html = Some(content);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
+    if let Some(ref body) = payload.body
+        && let Some(ref data) = body.data
+        && let Some(decoded) = decode_base64url(data)
+        && let Ok(content) = String::from_utf8(decoded)
+    {
+        match payload.mime_type.as_deref() {
+            Some("text/plain") if text.is_empty() => *text = content,
+            Some("text/html") if html.is_none() => *html = Some(content),
+            _ => {}
         }
     }
 
@@ -459,39 +526,29 @@ fn extract_part(
     attachments: &mut Vec<AttachmentInfo>,
 ) {
     // Check for attachment
-    if let Some(ref filename) = part.filename {
-        if !filename.is_empty() {
-            if let Some(ref body) = part.body {
-                attachments.push(AttachmentInfo {
-                    filename: filename.clone(),
-                    mime_type: part.mime_type.clone().unwrap_or_default(),
-                    size_bytes: body.size.unwrap_or(0),
-                });
-            }
-            return;
+    if let Some(ref filename) = part.filename
+        && !filename.is_empty()
+    {
+        if let Some(ref body) = part.body {
+            attachments.push(AttachmentInfo {
+                filename: filename.clone(),
+                mime_type: part.mime_type.clone().unwrap_or_default(),
+                size_bytes: body.size.unwrap_or(0),
+            });
         }
+        return;
     }
 
     // Decode body data
-    if let Some(ref body) = part.body {
-        if let Some(ref data) = body.data {
-            if let Ok(decoded) = URL_SAFE_NO_PAD.decode(data) {
-                if let Ok(content) = String::from_utf8(decoded) {
-                    match part.mime_type.as_deref() {
-                        Some("text/plain") => {
-                            if text.is_empty() {
-                                *text = content;
-                            }
-                        }
-                        Some("text/html") => {
-                            if html.is_none() {
-                                *html = Some(content);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
+    if let Some(ref body) = part.body
+        && let Some(ref data) = body.data
+        && let Some(decoded) = decode_base64url(data)
+        && let Ok(content) = String::from_utf8(decoded)
+    {
+        match part.mime_type.as_deref() {
+            Some("text/plain") if text.is_empty() => *text = content,
+            Some("text/html") if html.is_none() => *html = Some(content),
+            _ => {}
         }
     }
 
@@ -606,23 +663,67 @@ mod tests {
         assert!(!encoded.contains(' '));
     }
 
+    fn make_raw_message_with_date(date_header: Option<&str>, internal_date: Option<&str>) -> RawMessage {
+        let headers = date_header.map(|d| {
+            vec![Header {
+                name: "Date".into(),
+                value: d.into(),
+            }]
+        });
+        RawMessage {
+            id: "test".into(),
+            thread_id: None,
+            label_ids: None,
+            snippet: None,
+            payload: Some(MessagePayload {
+                headers,
+                mime_type: None,
+                body: None,
+                parts: None,
+            }),
+            internal_date: internal_date.map(|s| s.to_string()),
+        }
+    }
+
     #[test]
-    fn parse_date_header_valid_rfc2822() {
-        let dt = parse_date_header(Some("Tue, 17 Feb 2026 12:00:00 +0000"));
+    fn parse_date_valid_rfc2822() {
+        let raw = make_raw_message_with_date(
+            Some("Tue, 17 Feb 2026 12:00:00 +0000"),
+            None,
+        );
+        let headers = extract_headers(&raw);
+        let dt = parse_date(&raw, &headers);
         assert_eq!(dt.year(), 2026);
         assert_eq!(dt.month(), 2);
     }
 
     #[test]
-    fn parse_date_header_invalid_falls_back() {
-        let dt = parse_date_header(Some("not a date"));
-        // Should fall back to now — just verify it doesn't panic
-        assert!(dt.year() >= 2024);
+    fn parse_date_invalid_header_uses_internal_date() {
+        let raw = make_raw_message_with_date(
+            Some("not a date"),
+            Some("1708185600000"), // 2024-02-17T12:00:00Z in millis
+        );
+        let headers = extract_headers(&raw);
+        let dt = parse_date(&raw, &headers);
+        assert_eq!(dt.year(), 2024);
     }
 
     #[test]
-    fn parse_date_header_none_falls_back() {
-        let dt = parse_date_header(None);
+    fn parse_date_no_header_uses_internal_date() {
+        let raw = make_raw_message_with_date(
+            None,
+            Some("1708185600000"),
+        );
+        let headers = extract_headers(&raw);
+        let dt = parse_date(&raw, &headers);
+        assert_eq!(dt.year(), 2024);
+    }
+
+    #[test]
+    fn parse_date_nothing_falls_back_to_now() {
+        let raw = make_raw_message_with_date(None, None);
+        let headers = extract_headers(&raw);
+        let dt = parse_date(&raw, &headers);
         assert!(dt.year() >= 2024);
     }
 
@@ -700,8 +801,8 @@ mod tests {
         };
 
         let headers = extract_headers(&raw);
-        assert_eq!(headers["From"], "alice@example.com");
-        assert_eq!(headers["Subject"], "Test");
+        assert_eq!(headers["from"], "alice@example.com");
+        assert_eq!(headers["subject"], "Test");
     }
 
     #[test]
@@ -845,6 +946,41 @@ mod tests {
         };
         assert!(err.to_string().contains("404"));
         assert!(err.to_string().contains("Not Found"));
+    }
+
+    #[test]
+    fn validate_message_id_valid() {
+        assert!(validate_message_id("18f3a2b4c5d6e7f8").is_ok());
+        assert!(validate_message_id("abc123").is_ok());
+    }
+
+    #[test]
+    fn validate_message_id_rejects_traversal() {
+        assert!(validate_message_id("../../../etc/passwd").is_err());
+        assert!(validate_message_id("msg?query=x").is_err());
+        assert!(validate_message_id("msg/other").is_err());
+        assert!(validate_message_id("").is_err());
+    }
+
+    #[test]
+    fn sanitize_header_strips_crlf() {
+        assert_eq!(sanitize_header_value("normal value"), "normal value");
+        assert_eq!(
+            sanitize_header_value("injected\r\nBcc: hacker@evil.com"),
+            "injectedBcc: hacker@evil.com"
+        );
+        assert_eq!(sanitize_header_value("line\nbreak"), "linebreak");
+    }
+
+    #[test]
+    fn decode_base64url_tolerant() {
+        // Unpadded
+        let data = URL_SAFE_NO_PAD.encode("hello");
+        assert_eq!(decode_base64url(&data).unwrap(), b"hello");
+
+        // Padded
+        let data_padded = URL_SAFE.encode("hello");
+        assert_eq!(decode_base64url(&data_padded).unwrap(), b"hello");
     }
 
     use chrono::Datelike;

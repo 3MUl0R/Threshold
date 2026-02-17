@@ -1,17 +1,21 @@
 //! OAuth 2.0 authentication for Gmail API.
 //!
-//! Handles the full OAuth consent flow:
+//! Handles the full OAuth consent flow with PKCE (RFC 7636) and state
+//! parameter for CSRF protection:
 //! 1. User runs `threshold gmail auth --inbox user@gmail.com`
 //! 2. CLI prints Google OAuth URL for user to visit
 //! 3. Local HTTP server receives callback with authorization code
-//! 4. Code is exchanged for access + refresh tokens
-//! 5. Tokens are stored in OS keychain, namespaced by inbox
+//! 4. State parameter is verified to prevent CSRF
+//! 5. Code is exchanged for access + refresh tokens (with PKCE verifier)
+//! 6. Tokens are stored in OS keychain, namespaced by inbox
 //!
 //! On subsequent API calls, access tokens are retrieved from keychain
 //! and automatically refreshed when expired.
 
 use std::sync::Arc;
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use threshold_core::SecretStore;
 use url::Url;
 
@@ -62,13 +66,15 @@ impl GmailAuth {
         }
     }
 
-    /// Run the interactive OAuth consent flow.
+    /// Run the interactive OAuth consent flow with PKCE and state.
     ///
     /// 1. Resolves client ID and secret from keychain
-    /// 2. Prints authorization URL for user to visit
-    /// 3. Starts local HTTP server to receive callback
-    /// 4. Exchanges authorization code for tokens
-    /// 5. Stores tokens in keychain
+    /// 2. Generates PKCE code verifier/challenge and random state
+    /// 3. Prints authorization URL for user to visit (to stderr)
+    /// 4. Starts local HTTP server to receive callback
+    /// 5. Verifies state parameter matches to prevent CSRF
+    /// 6. Exchanges authorization code for tokens (with PKCE verifier)
+    /// 7. Stores tokens in keychain
     pub async fn authorize(&self, include_send_scope: bool) -> Result<(), AuthError> {
         let client_id = self.resolve_client_id()?;
         let client_secret = self.resolve_client_secret()?;
@@ -78,14 +84,30 @@ impl GmailAuth {
             scopes.push(SCOPE_SEND);
         }
 
+        // Generate PKCE code verifier and challenge (RFC 7636)
+        let code_verifier = generate_pkce_verifier();
+        let code_challenge = generate_pkce_challenge(&code_verifier);
+
+        // Generate random state for CSRF protection
+        let state = generate_random_state();
+
         let redirect_uri = format!("http://{}:{}", REDIRECT_HOST, REDIRECT_PORT);
-        let auth_url = build_auth_url(&client_id, &scopes, &redirect_uri);
+        let auth_url =
+            build_auth_url(&client_id, &scopes, &redirect_uri, &state, &code_challenge);
 
-        println!("Open this URL in your browser to authorize Gmail access:\n");
-        println!("  {}\n", auth_url);
-        println!("Waiting for authorization callback on {}...", redirect_uri);
+        // Interactive prompts go to stderr to keep stdout JSON-only
+        eprintln!("Open this URL in your browser to authorize Gmail access:\n");
+        eprintln!("  {}\n", auth_url);
+        eprintln!("Waiting for authorization callback on {}...", redirect_uri);
 
-        let code = receive_authorization_code().await?;
+        let (code, returned_state) = receive_authorization_code().await?;
+
+        // Verify state to prevent CSRF
+        if returned_state.as_deref() != Some(state.as_str()) {
+            return Err(AuthError::CallbackError(
+                "OAuth state mismatch — possible CSRF attack. Please try again.".into(),
+            ));
+        }
 
         tracing::info!("Received authorization code, exchanging for tokens...");
 
@@ -95,6 +117,7 @@ impl GmailAuth {
             &client_id,
             &client_secret,
             &redirect_uri,
+            &code_verifier,
         )
         .await?;
 
@@ -206,8 +229,35 @@ impl GmailAuth {
     }
 }
 
-/// Build the Google OAuth authorization URL.
-pub fn build_auth_url(client_id: &str, scopes: &[&str], redirect_uri: &str) -> String {
+/// Generate a PKCE code verifier (43-128 char URL-safe random string).
+fn generate_pkce_verifier() -> String {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).expect("getrandom failed");
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Generate the PKCE code challenge (S256) from a verifier.
+pub fn generate_pkce_challenge(verifier: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(verifier.as_bytes());
+    URL_SAFE_NO_PAD.encode(hash)
+}
+
+/// Generate a random state string for CSRF protection.
+fn generate_random_state() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("getrandom failed");
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Build the Google OAuth authorization URL with PKCE and state.
+pub fn build_auth_url(
+    client_id: &str,
+    scopes: &[&str],
+    redirect_uri: &str,
+    state: &str,
+    code_challenge: &str,
+) -> String {
     let mut url = Url::parse(GOOGLE_AUTH_URL).expect("valid static URL");
     url.query_pairs_mut()
         .append_pair("client_id", client_id)
@@ -215,14 +265,19 @@ pub fn build_auth_url(client_id: &str, scopes: &[&str], redirect_uri: &str) -> S
         .append_pair("response_type", "code")
         .append_pair("scope", &scopes.join(" "))
         .append_pair("access_type", "offline")
-        .append_pair("prompt", "consent");
+        .append_pair("prompt", "consent")
+        .append_pair("state", state)
+        .append_pair("code_challenge", code_challenge)
+        .append_pair("code_challenge_method", "S256");
     url.to_string()
 }
 
 /// Start a local HTTP server and wait for the OAuth callback.
 ///
-/// Returns the authorization code from the callback query parameter.
-async fn receive_authorization_code() -> Result<String, AuthError> {
+/// Returns the authorization code and state from the callback query parameters.
+async fn receive_authorization_code() -> Result<(String, Option<String>), AuthError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     let listener = tokio::net::TcpListener::bind((REDIRECT_HOST, REDIRECT_PORT))
         .await
         .map_err(|e| {
@@ -232,7 +287,7 @@ async fn receive_authorization_code() -> Result<String, AuthError> {
             ))
         })?;
 
-    let (stream, _) = tokio::time::timeout(
+    let (mut stream, _) = tokio::time::timeout(
         std::time::Duration::from_secs(300), // 5 minute timeout
         listener.accept(),
     )
@@ -240,15 +295,35 @@ async fn receive_authorization_code() -> Result<String, AuthError> {
     .map_err(|_| AuthError::CallbackError("Timed out waiting for OAuth callback".into()))?
     .map_err(|e| AuthError::CallbackError(format!("Accept failed: {}", e)))?;
 
-    // Read the HTTP request
+    // Read the HTTP request (loop until we have the full request line)
     let mut buf = vec![0u8; 4096];
-    stream.readable().await.map_err(|e| {
-        AuthError::CallbackError(format!("Stream not readable: {}", e))
-    })?;
-    let n = stream
-        .try_read(&mut buf)
+    let mut total = 0;
+    loop {
+        if total >= buf.len() {
+            return Err(AuthError::CallbackError("Request too large".into()));
+        }
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read(&mut buf[total..]),
+        )
+        .await
+        .map_err(|_| AuthError::CallbackError("Read timed out".into()))?
         .map_err(|e| AuthError::CallbackError(format!("Read failed: {}", e)))?;
-    let request = String::from_utf8_lossy(&buf[..n]);
+
+        if n == 0 {
+            break;
+        }
+        total += n;
+
+        // We only need the first line, check if we have \r\n or \n
+        if buf[..total].windows(2).any(|w| w == b"\r\n")
+            || buf[..total].contains(&b'\n')
+        {
+            break;
+        }
+    }
+
+    let request = String::from_utf8_lossy(&buf[..total]);
 
     // Parse the GET request line to extract query parameters
     let path = request
@@ -257,26 +332,24 @@ async fn receive_authorization_code() -> Result<String, AuthError> {
         .and_then(|line| line.split_whitespace().nth(1))
         .ok_or_else(|| AuthError::CallbackError("Invalid HTTP request".into()))?;
 
-    let code = extract_code_from_path(path)?;
+    let (code, state) = extract_code_and_state_from_path(path)?;
 
-    // Send a success response
+    // Send a success response (no leading whitespace in headers)
     let response = "HTTP/1.1 200 OK\r\n\
-                    Content-Type: text/html\r\n\
-                    Connection: close\r\n\r\n\
-                    <html><body><h2>Authorization successful!</h2>\
-                    <p>You can close this tab and return to the terminal.</p>\
-                    </body></html>";
+Content-Type: text/html\r\n\
+Connection: close\r\n\
+\r\n\
+<html><body><h2>Authorization successful!</h2>\
+<p>You can close this tab and return to the terminal.</p>\
+</body></html>";
 
-    stream.writable().await.map_err(|e| {
-        AuthError::CallbackError(format!("Stream not writable: {}", e))
-    })?;
-    let _ = stream.try_write(response.as_bytes());
+    let _ = stream.write_all(response.as_bytes()).await;
 
-    Ok(code)
+    Ok((code, state))
 }
 
-/// Extract the authorization code from the callback URL path.
-fn extract_code_from_path(path: &str) -> Result<String, AuthError> {
+/// Extract the authorization code and state from the callback URL path.
+fn extract_code_and_state_from_path(path: &str) -> Result<(String, Option<String>), AuthError> {
     let url = Url::parse(&format!("http://localhost{}", path))
         .map_err(|e| AuthError::CallbackError(format!("Invalid callback URL: {}", e)))?;
 
@@ -285,19 +358,28 @@ fn extract_code_from_path(path: &str) -> Result<String, AuthError> {
         return Err(AuthError::OAuthRejected(error.1.to_string()));
     }
 
-    url.query_pairs()
+    let code = url
+        .query_pairs()
         .find(|(k, _)| k == "code")
         .map(|(_, v)| v.to_string())
-        .ok_or_else(|| AuthError::CallbackError("No 'code' parameter in callback".into()))
+        .ok_or_else(|| AuthError::CallbackError("No 'code' parameter in callback".into()))?;
+
+    let state = url
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .map(|(_, v)| v.to_string());
+
+    Ok((code, state))
 }
 
-/// Exchange an authorization code for access and refresh tokens.
+/// Exchange an authorization code for access and refresh tokens (with PKCE verifier).
 async fn exchange_code(
     http: &reqwest::Client,
     code: &str,
     client_id: &str,
     client_secret: &str,
     redirect_uri: &str,
+    code_verifier: &str,
 ) -> Result<TokenResponse, AuthError> {
     let response = http
         .post(GOOGLE_TOKEN_URL)
@@ -307,6 +389,7 @@ async fn exchange_code(
             ("client_secret", client_secret),
             ("redirect_uri", redirect_uri),
             ("grant_type", "authorization_code"),
+            ("code_verifier", code_verifier),
         ])
         .timeout(std::time::Duration::from_secs(30))
         .send()
@@ -435,6 +518,8 @@ mod tests {
             "test-client-id",
             &[SCOPE_READONLY],
             "http://127.0.0.1:8085",
+            "test-state",
+            "test-challenge",
         );
 
         assert!(url.contains("client_id=test-client-id"));
@@ -442,6 +527,9 @@ mod tests {
         assert!(url.contains("access_type=offline"));
         assert!(url.contains("prompt=consent"));
         assert!(url.contains("gmail.readonly"));
+        assert!(url.contains("state=test-state"));
+        assert!(url.contains("code_challenge=test-challenge"));
+        assert!(url.contains("code_challenge_method=S256"));
         assert!(url.starts_with(GOOGLE_AUTH_URL));
     }
 
@@ -451,6 +539,8 @@ mod tests {
             "test-client-id",
             &[SCOPE_READONLY, SCOPE_SEND],
             "http://127.0.0.1:8085",
+            "state",
+            "challenge",
         );
 
         assert!(url.contains("gmail.readonly"));
@@ -463,6 +553,8 @@ mod tests {
             "test-client-id",
             &[SCOPE_READONLY],
             "http://127.0.0.1:8085",
+            "state",
+            "challenge",
         );
 
         // URL should contain the redirect_uri parameter
@@ -470,16 +562,41 @@ mod tests {
     }
 
     #[test]
-    fn extract_code_from_valid_path() {
-        let path = "/?code=4/P7q7W91a-oMsCeLvIaQm6bTrgtp7&scope=email%20profile";
-        let code = extract_code_from_path(path).unwrap();
+    fn pkce_challenge_is_deterministic() {
+        let verifier = "test-verifier-string";
+        let c1 = generate_pkce_challenge(verifier);
+        let c2 = generate_pkce_challenge(verifier);
+        assert_eq!(c1, c2);
+        assert!(!c1.is_empty());
+    }
+
+    #[test]
+    fn pkce_challenge_differs_for_different_verifiers() {
+        let c1 = generate_pkce_challenge("verifier-a");
+        let c2 = generate_pkce_challenge("verifier-b");
+        assert_ne!(c1, c2);
+    }
+
+    #[test]
+    fn extract_code_and_state_from_valid_path() {
+        let path = "/?code=4/P7q7W91a-oMsCeLvIaQm6bTrgtp7&state=abc123&scope=email%20profile";
+        let (code, state) = extract_code_and_state_from_path(path).unwrap();
         assert_eq!(code, "4/P7q7W91a-oMsCeLvIaQm6bTrgtp7");
+        assert_eq!(state.unwrap(), "abc123");
+    }
+
+    #[test]
+    fn extract_code_and_state_without_state() {
+        let path = "/?code=4/P7q7W91a-oMsCeLvIaQm6bTrgtp7";
+        let (code, state) = extract_code_and_state_from_path(path).unwrap();
+        assert_eq!(code, "4/P7q7W91a-oMsCeLvIaQm6bTrgtp7");
+        assert!(state.is_none());
     }
 
     #[test]
     fn extract_code_from_path_with_error() {
         let path = "/?error=access_denied";
-        let result = extract_code_from_path(path);
+        let result = extract_code_and_state_from_path(path);
         assert!(result.is_err());
         match result.unwrap_err() {
             AuthError::OAuthRejected(msg) => assert_eq!(msg, "access_denied"),
@@ -490,7 +607,7 @@ mod tests {
     #[test]
     fn extract_code_from_path_missing_code() {
         let path = "/?state=xyz";
-        let result = extract_code_from_path(path);
+        let result = extract_code_and_state_from_path(path);
         assert!(result.is_err());
         match result.unwrap_err() {
             AuthError::CallbackError(msg) => assert!(msg.contains("No 'code' parameter")),
