@@ -1,11 +1,13 @@
 //! CLI subcommand definitions and handler for `threshold gmail`.
 //!
 //! All subcommands output JSON to stdout for Claude to parse.
+//! All actions are logged to the audit trail.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use threshold_core::config::GmailToolConfig;
-use threshold_core::SecretStore;
+use threshold_core::{AuditTrail, SecretStore};
 
 use crate::auth::GmailAuth;
 use crate::client::GmailClient;
@@ -89,9 +91,12 @@ pub enum GmailCommands {
 }
 
 /// Handle a Gmail CLI command.
+///
+/// If `audit_path` is provided, all actions are logged to the audit trail.
 pub async fn handle_gmail_command(
     args: GmailArgs,
     config: &GmailToolConfig,
+    audit_path: Option<&Path>,
 ) -> anyhow::Result<()> {
     if !config.enabled {
         let output = serde_json::json!({
@@ -101,6 +106,7 @@ pub async fn handle_gmail_command(
         anyhow::bail!("Gmail is disabled");
     }
 
+    let audit = audit_path.map(|p| AuditTrail::new(p.to_path_buf()));
     let secret_store = Arc::new(SecretStore::new());
 
     match args.command {
@@ -111,6 +117,11 @@ pub async fn handle_gmail_command(
             validate_inbox(&inbox, config)?;
             let auth = GmailAuth::new(secret_store, &inbox);
             auth.authorize(include_send).await?;
+
+            audit_log(&audit, &serde_json::json!({
+                "action": "auth",
+                "inbox": inbox
+            })).await;
 
             let output = serde_json::json!({
                 "status": "ok",
@@ -125,6 +136,12 @@ pub async fn handle_gmail_command(
             let client = GmailClient::new(secret_store, &inbox);
             let messages = client.list_messages(query.as_deref(), max).await?;
 
+            audit_log(&audit, &serde_json::json!({
+                "action": "list",
+                "inbox": inbox,
+                "count": messages.len()
+            })).await;
+
             println!("{}", serde_json::to_string_pretty(&messages)?);
         }
 
@@ -133,6 +150,12 @@ pub async fn handle_gmail_command(
             let client = GmailClient::new(secret_store, &inbox);
             let message = client.get_message(&id).await?;
 
+            audit_log(&audit, &serde_json::json!({
+                "action": "read",
+                "inbox": inbox,
+                "message_id": id
+            })).await;
+
             println!("{}", serde_json::to_string_pretty(&message)?);
         }
 
@@ -140,6 +163,13 @@ pub async fn handle_gmail_command(
             validate_inbox(&inbox, config)?;
             let client = GmailClient::new(secret_store, &inbox);
             let messages = client.search(&query, max).await?;
+
+            audit_log(&audit, &serde_json::json!({
+                "action": "search",
+                "inbox": inbox,
+                "query": query,
+                "count": messages.len()
+            })).await;
 
             println!("{}", serde_json::to_string_pretty(&messages)?);
         }
@@ -154,6 +184,13 @@ pub async fn handle_gmail_command(
             check_send_permission(config)?;
             let client = GmailClient::new(secret_store, &inbox);
             client.send(&to, &subject, &body).await?;
+
+            audit_log(&audit, &serde_json::json!({
+                "action": "send",
+                "inbox": inbox,
+                "to": to,
+                "subject": subject
+            })).await;
 
             let output = serde_json::json!({
                 "status": "ok",
@@ -170,6 +207,12 @@ pub async fn handle_gmail_command(
             let client = GmailClient::new(secret_store, &inbox);
             client.reply(&id, &body).await?;
 
+            audit_log(&audit, &serde_json::json!({
+                "action": "reply",
+                "inbox": inbox,
+                "message_id": id
+            })).await;
+
             let output = serde_json::json!({
                 "status": "ok",
                 "message": "Reply sent",
@@ -180,6 +223,15 @@ pub async fn handle_gmail_command(
     }
 
     Ok(())
+}
+
+/// Log an action to the audit trail (non-fatal: log warning on failure).
+async fn audit_log(audit: &Option<AuditTrail>, data: &serde_json::Value) {
+    if let Some(trail) = audit {
+        if let Err(e) = trail.append_event("gmail", data).await {
+            tracing::warn!("Failed to write Gmail audit entry: {}", e);
+        }
+    }
 }
 
 /// Validate that the inbox is in the config allowlist (if set).
@@ -281,5 +333,60 @@ mod tests {
             allow_send: Some(true),
         };
         assert!(check_send_permission(&config).is_ok());
+    }
+
+    #[tokio::test]
+    async fn audit_log_writes_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("gmail-audit.jsonl");
+        let audit = Some(AuditTrail::new(audit_path.clone()));
+
+        audit_log(
+            &audit,
+            &serde_json::json!({"action": "list", "inbox": "test@gmail.com", "count": 5}),
+        )
+        .await;
+
+        let content = tokio::fs::read_to_string(&audit_path).await.unwrap();
+        let entry: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(entry["type"], "gmail");
+        assert_eq!(entry["data"]["action"], "list");
+        assert_eq!(entry["data"]["inbox"], "test@gmail.com");
+        assert_eq!(entry["data"]["count"], 5);
+        assert!(entry["ts"].is_string());
+    }
+
+    #[tokio::test]
+    async fn audit_log_send_includes_to_and_subject() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit_path = dir.path().join("gmail-audit.jsonl");
+        let audit = Some(AuditTrail::new(audit_path.clone()));
+
+        audit_log(
+            &audit,
+            &serde_json::json!({
+                "action": "send",
+                "inbox": "sender@gmail.com",
+                "to": "recipient@example.com",
+                "subject": "Important update"
+            }),
+        )
+        .await;
+
+        let content = tokio::fs::read_to_string(&audit_path).await.unwrap();
+        let entry: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(entry["data"]["action"], "send");
+        assert_eq!(entry["data"]["to"], "recipient@example.com");
+        assert_eq!(entry["data"]["subject"], "Important update");
+    }
+
+    #[tokio::test]
+    async fn audit_log_none_does_nothing() {
+        // No audit trail configured — should not panic
+        audit_log(
+            &None,
+            &serde_json::json!({"action": "list", "inbox": "test@gmail.com"}),
+        )
+        .await;
     }
 }

@@ -14,5 +14,15 @@ pub async fn handle_gmail_command(args: threshold_gmail::GmailArgs) -> anyhow::R
         )
     })?;
 
-    threshold_gmail::handle_gmail_command(args, gmail_config).await
+    let audit_path = config
+        .data_dir()
+        .ok()
+        .map(|d| d.join("audit").join("gmail.jsonl"));
+
+    threshold_gmail::handle_gmail_command(
+        args,
+        gmail_config,
+        audit_path.as_deref(),
+    )
+    .await
 }
