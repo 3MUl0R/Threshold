@@ -23,12 +23,14 @@ pub struct DaemonClient {
 impl DaemonClient {
     /// Create a new daemon client using the default socket path
     /// (`~/.threshold/threshold.sock`).
-    pub fn new() -> Self {
+    ///
+    /// Returns an error if the home directory cannot be determined.
+    pub fn new() -> anyhow::Result<Self> {
         let socket_path = dirs::home_dir()
-            .unwrap_or_default()
+            .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
             .join(".threshold")
             .join("threshold.sock");
-        Self { socket_path }
+        Ok(Self { socket_path })
     }
 
     /// Send a command to the running daemon and await the response.

@@ -13,11 +13,21 @@ use threshold_core::{ResultSender, ScheduledAction, ThresholdError};
 use crate::task::{DeliveryTarget, ScheduledTask, TaskRunResult};
 
 /// Truncate a string to at most `max_len` bytes, appending "..." if truncated.
+///
+/// Uses `char_indices()` to find a valid UTF-8 boundary, preventing panics
+/// on multi-byte characters (e.g., em-dashes, smart quotes from Claude).
 fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len.saturating_sub(3)])
+        let end = max_len.saturating_sub(3);
+        let boundary = s
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i <= end)
+            .last()
+            .unwrap_or(0);
+        format!("{}...", &s[..boundary])
     }
 }
 
@@ -189,6 +199,17 @@ mod tests {
         let result = truncate(&long, 20);
         assert!(result.len() <= 20);
         assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_multibyte_utf8_does_not_panic() {
+        // Em-dashes and smart quotes are multi-byte UTF-8, common in Claude responses
+        let s = "Hello \u{2014} world \u{201C}test\u{201D} done";
+        let result = truncate(s, 10);
+        assert!(result.len() <= 13); // 10 chars of content + "..."
+        assert!(result.ends_with("..."));
+        // Verify it's valid UTF-8 (would panic if not)
+        let _ = result.as_bytes();
     }
 
     #[tokio::test]

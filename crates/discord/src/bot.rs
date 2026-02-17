@@ -53,6 +53,21 @@ pub async fn build_and_start(
             event_handler: |ctx, event, framework, data| {
                 Box::pin(event_handler(ctx, event, framework, data))
             },
+            command_check: Some(|ctx| {
+                Box::pin(async move {
+                    let guild_id = ctx.guild_id().map(|g| g.get());
+                    let user_id = ctx.author().id.get();
+                    let authorized = is_authorized(&ctx.data().config, guild_id, user_id);
+                    if !authorized {
+                        tracing::warn!(
+                            "Unauthorized command attempt from user {} in guild {:?}",
+                            user_id,
+                            guild_id
+                        );
+                    }
+                    Ok(authorized)
+                })
+            }),
             pre_command: |ctx| Box::pin(pre_command(ctx)),
             ..Default::default()
         })
@@ -126,28 +141,12 @@ pub async fn build_and_start(
     Ok(outbound)
 }
 
-/// Pre-command hook for authorization and logging
+/// Pre-command hook for logging (authorization is handled by `command_check`).
 async fn pre_command(ctx: Context<'_>) {
-    let guild_id = ctx.guild_id().map(|g| g.get());
-    let user_id = ctx.author().id.get();
-
-    // Authorization check
-    if !is_authorized(&ctx.data().config, guild_id, user_id) {
-        tracing::warn!(
-            "Unauthorized command attempt from user {} in guild {:?}",
-            user_id,
-            guild_id
-        );
-        // Silently ignore unauthorized commands
-        // Note: Command execution will be blocked by poise if we don't proceed
-        return;
-    }
-
-    // Log command invocation
     tracing::info!(
         command = ctx.command().name,
-        user_id = user_id,
-        guild_id = ?guild_id,
+        user_id = ctx.author().id.get(),
+        guild_id = ?ctx.guild_id().map(|g| g.get()),
         "Command invoked"
     );
 }

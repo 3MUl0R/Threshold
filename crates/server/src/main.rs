@@ -181,6 +181,7 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
         let heartbeat_config = config.heartbeat.clone();
         let data_dir = data_dir.clone();
         let scheduler_cmd_handle = scheduler_cmd_handle.clone();
+        let discord_outbound_for_scheduler = discord_outbound.clone();
 
         async move {
             let (mut scheduler, handle) = match (scheduler_instance, scheduler_cmd_handle) {
@@ -191,19 +192,51 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
                 }
             };
 
-            // Add heartbeat task if configured
+            // Wait briefly for Discord to connect, then wire result sender
+            {
+                let outbound = discord_outbound_for_scheduler.clone();
+                let cancel_clone = cancel.clone();
+                tokio::spawn(async move {
+                    // This is handled by the Discord task; we just check periodically
+                    // The result_sender is set once Discord is ready
+                    loop {
+                        tokio::select! {
+                            _ = cancel_clone.cancelled() => break,
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                                let slot = outbound.read().await;
+                                if slot.is_some() {
+                                    tracing::info!("Discord outbound available for scheduler result delivery");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+
+            // Add heartbeat task if configured (skip if one already exists from persistence)
             if let Some(hb_config) = heartbeat_config {
                 if hb_config.enabled {
-                    match threshold_scheduler::heartbeat::heartbeat_task_from_config(
-                        &hb_config,
-                        &data_dir,
-                    ) {
-                        Ok(task) => {
-                            tracing::info!("Adding heartbeat task to scheduler");
-                            handle.add_task(task).await.ok();
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to create heartbeat task: {}", e);
+                    // Check if a heartbeat task already exists from persisted state
+                    let existing_tasks = handle.list_tasks().await.unwrap_or_default();
+                    let has_heartbeat = existing_tasks
+                        .iter()
+                        .any(|t| t.kind == threshold_scheduler::task::TaskKind::Heartbeat);
+
+                    if has_heartbeat {
+                        tracing::info!("Heartbeat task already exists from persisted state, skipping creation");
+                    } else {
+                        match threshold_scheduler::heartbeat::heartbeat_task_from_config(
+                            &hb_config,
+                            &data_dir,
+                        ) {
+                            Ok(task) => {
+                                tracing::info!("Adding heartbeat task to scheduler");
+                                handle.add_task(task).await.ok();
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to create heartbeat task: {}", e);
+                            }
                         }
                     }
                 }
@@ -221,6 +254,15 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
                     tracing::error!("Daemon API error: {}", e);
                 }
             });
+
+            // Wire result_sender once Discord outbound is available
+            {
+                let slot = discord_outbound_for_scheduler.read().await;
+                if let Some(outbound) = slot.as_ref() {
+                    scheduler.set_result_sender(outbound.clone());
+                    tracing::info!("Scheduler result sender wired to Discord outbound");
+                }
+            }
 
             // Run scheduler main loop
             scheduler.run().await;

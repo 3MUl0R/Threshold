@@ -46,19 +46,18 @@ impl TaskStore {
     ///
     /// If the file doesn't exist, returns an empty store.
     pub async fn load(path: &Path) -> Result<Self, ThresholdError> {
-        let items = if path.exists() {
-            let data = tokio::fs::read_to_string(path)
-                .await
-                .map_err(|e| ThresholdError::IoError {
-                    path: path.display().to_string(),
-                    message: e.to_string(),
-                })?;
-            serde_json::from_str(&data).map_err(|e| ThresholdError::IoError {
+        let items = match tokio::fs::read_to_string(path).await {
+            Ok(data) => serde_json::from_str(&data).map_err(|e| ThresholdError::IoError {
                 path: path.display().to_string(),
                 message: format!("JSON parse error: {}", e),
-            })?
-        } else {
-            Vec::new()
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                return Err(ThresholdError::IoError {
+                    path: path.display().to_string(),
+                    message: e.to_string(),
+                });
+            }
         };
 
         Ok(Self {

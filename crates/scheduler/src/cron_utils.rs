@@ -24,9 +24,9 @@ use std::str::FromStr;
 pub fn normalize_cron(expr: &str) -> String {
     let fields: Vec<&str> = expr.split_whitespace().collect();
     if fields.len() == 6 {
-        format!("{} *", expr)
+        format!("{} *", fields.join(" "))
     } else {
-        expr.to_string()
+        fields.join(" ")
     }
 }
 

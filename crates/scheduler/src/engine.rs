@@ -21,7 +21,7 @@ use threshold_core::{ResultSender, ThresholdError};
 use crate::cron_utils;
 use crate::execution;
 use crate::store;
-use crate::task::ScheduledTask;
+use crate::task::{ScheduledTask, TaskRunResult};
 
 /// Commands sent from handles to the scheduler loop.
 enum SchedulerCommand {
@@ -104,6 +104,9 @@ pub struct Scheduler {
     /// Optional result sender for delivering task results to Discord.
     result_sender: Option<Arc<dyn ResultSender>>,
     command_rx: mpsc::UnboundedReceiver<SchedulerCommand>,
+    /// Receives task completion results from spawned execution tasks.
+    completion_rx: mpsc::UnboundedReceiver<(Uuid, TaskRunResult)>,
+    completion_tx: mpsc::UnboundedSender<(Uuid, TaskRunResult)>,
     cancel: CancellationToken,
 }
 
@@ -120,6 +123,7 @@ impl Scheduler {
         cancel: CancellationToken,
     ) -> (Self, SchedulerHandle) {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let (completion_tx, completion_rx) = mpsc::unbounded_channel();
 
         // Load persisted tasks (non-fatal: log and start with empty)
         let tasks = match store::load_tasks(&store_path).await {
@@ -144,11 +148,21 @@ impl Scheduler {
             engine,
             result_sender,
             command_rx,
+            completion_rx,
+            completion_tx,
             cancel,
         };
 
         let handle = SchedulerHandle { command_tx };
         (scheduler, handle)
+    }
+
+    /// Set the result sender after construction.
+    ///
+    /// Used to wire the Discord outbound handle after Discord connects,
+    /// since the scheduler must be created before Discord starts.
+    pub fn set_result_sender(&mut self, sender: Arc<dyn ResultSender>) {
+        self.result_sender = Some(sender);
     }
 
     /// Persist the current task list to disk.
@@ -174,6 +188,9 @@ impl Scheduler {
                 }
                 Some(cmd) = self.command_rx.recv() => {
                     self.handle_command(cmd).await;
+                }
+                Some((task_id, result)) = self.completion_rx.recv() => {
+                    self.record_completion(task_id, result).await;
                 }
                 _ = self.cancel.cancelled() => {
                     tracing::info!("Scheduler shutting down.");
@@ -231,6 +248,15 @@ impl Scheduler {
         }
     }
 
+    /// Record a completed task's result and persist the update.
+    async fn record_completion(&mut self, task_id: Uuid, result: TaskRunResult) {
+        if let Some(task) = self.tasks.iter_mut().find(|t| t.id == task_id) {
+            task.last_run = Some(result.timestamp);
+            task.last_result = Some(result);
+            self.persist().await;
+        }
+    }
+
     /// Check for due tasks and spawn them with bounded concurrency.
     async fn check_and_run(&mut self) {
         let now = Utc::now();
@@ -279,6 +305,7 @@ impl Scheduler {
             let claude = self.claude.clone();
             let engine = self.engine.clone();
             let result_sender = self.result_sender.clone();
+            let completion_tx = self.completion_tx.clone();
             tokio::spawn(async move {
                 let _permit = match semaphore.acquire().await {
                     Ok(permit) => permit,
@@ -304,6 +331,9 @@ impl Scheduler {
                         result.summary
                     );
                 }
+
+                // Send completion back to scheduler loop to update last_run/last_result
+                let _ = completion_tx.send((task_snapshot.id, result));
 
                 running_tasks.write().await.remove(&task_snapshot.id);
             });

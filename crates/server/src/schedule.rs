@@ -82,13 +82,18 @@ pub enum ScheduleCommands {
         #[arg(short = 'f', long, value_enum, default_value_t = OutputFormat::default())]
         format: OutputFormat,
     },
-    /// Toggle a scheduled task on/off
-    Toggle {
-        /// Task ID to toggle
+    /// Enable a scheduled task
+    Enable {
+        /// Task ID to enable
         id: String,
-        /// Enable or disable the task
-        #[arg(long)]
-        enabled: bool,
+        /// Output format
+        #[arg(short = 'f', long, value_enum, default_value_t = OutputFormat::default())]
+        format: OutputFormat,
+    },
+    /// Disable a scheduled task
+    Disable {
+        /// Task ID to disable
+        id: String,
         /// Output format
         #[arg(short = 'f', long, value_enum, default_value_t = OutputFormat::default())]
         format: OutputFormat,
@@ -97,7 +102,7 @@ pub enum ScheduleCommands {
 
 /// Handle a schedule subcommand by dispatching to the daemon.
 pub async fn handle_schedule_command(command: ScheduleCommands) -> anyhow::Result<()> {
-    let client = DaemonClient::new();
+    let client = DaemonClient::new()?;
 
     let daemon_command = match &command {
         ScheduleCommands::Conversation {
@@ -155,9 +160,13 @@ pub async fn handle_schedule_command(command: ScheduleCommands) -> anyhow::Resul
         }
         ScheduleCommands::List { .. } => DaemonCommand::ScheduleList,
         ScheduleCommands::Delete { id, .. } => DaemonCommand::ScheduleDelete { id: id.clone() },
-        ScheduleCommands::Toggle { id, enabled, .. } => DaemonCommand::ScheduleToggle {
+        ScheduleCommands::Enable { id, .. } => DaemonCommand::ScheduleToggle {
             id: id.clone(),
-            enabled: *enabled,
+            enabled: true,
+        },
+        ScheduleCommands::Disable { id, .. } => DaemonCommand::ScheduleToggle {
+            id: id.clone(),
+            enabled: false,
         },
     };
 
@@ -170,7 +179,8 @@ pub async fn handle_schedule_command(command: ScheduleCommands) -> anyhow::Resul
         | ScheduleCommands::Monitor { format, .. }
         | ScheduleCommands::List { format, .. }
         | ScheduleCommands::Delete { format, .. }
-        | ScheduleCommands::Toggle { format, .. } => format,
+        | ScheduleCommands::Enable { format, .. }
+        | ScheduleCommands::Disable { format, .. } => format,
     };
 
     println!("{}", serde_json::to_string_pretty(&response)?);

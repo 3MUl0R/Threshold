@@ -14,16 +14,16 @@ use crate::task::ScheduledTask;
 /// Returns an empty `Vec` if the file doesn't exist.
 /// Returns an error if the file exists but can't be read or parsed.
 pub async fn load_tasks(store_path: &Path) -> Result<Vec<ScheduledTask>, ThresholdError> {
-    if !store_path.exists() {
-        return Ok(Vec::new());
-    }
-
-    let data = tokio::fs::read_to_string(store_path)
-        .await
-        .map_err(|e| ThresholdError::IoError {
-            path: store_path.display().to_string(),
-            message: e.to_string(),
-        })?;
+    let data = match tokio::fs::read_to_string(store_path).await {
+        Ok(data) => data,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(ThresholdError::IoError {
+                path: store_path.display().to_string(),
+                message: e.to_string(),
+            });
+        }
+    };
 
     let tasks: Vec<ScheduledTask> =
         serde_json::from_str(&data).map_err(|e| ThresholdError::IoError {
