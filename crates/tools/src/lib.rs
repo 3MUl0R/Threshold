@@ -4,12 +4,14 @@
 //! web access) with profile-based permission control and audit logging.
 
 pub mod builtin;
+pub mod prompt;
 mod context;
 mod profiles;
 mod registry;
 
 pub use context::ToolContext;
 pub use profiles::ToolProfileExt;
+pub use prompt::build_tool_prompt;
 pub use registry::{ToolRegistry, ToolsConfig};
 
 use async_trait::async_trait;

@@ -1,15 +1,72 @@
-//! Threshold server - main binary that wires everything together.
+//! Threshold — CLI binary and daemon entry point.
+//!
+//! Provides a clap-based CLI with:
+//! - `threshold daemon` — Start the background daemon
+//! - `threshold schedule <subcommand>` — Manage scheduled tasks (Milestone 6)
 
-use std::sync::Arc;
-use threshold_cli_wrapper::ClaudeClient;
-use threshold_conversation::ConversationEngine;
-use threshold_core::config::ThresholdConfig;
-use threshold_core::{init_logging, SecretStore, ThresholdError};
-use tokio::sync::RwLock;
-use tokio_util::sync::CancellationToken;
+mod daemon_client;
+mod output;
+mod schedule;
+
+use clap::Parser;
+
+/// Threshold — orchestrate Claude CLI sessions with Discord, scheduling, and tools.
+#[derive(Parser)]
+#[command(name = "threshold", version, about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(clap::Subcommand)]
+enum Commands {
+    /// Start the Threshold daemon (Discord bot, scheduler, heartbeat)
+    Daemon(DaemonArgs),
+    /// Manage scheduled tasks (requires running daemon)
+    Schedule {
+        #[command(subcommand)]
+        command: schedule::ScheduleCommands,
+    },
+}
+
+/// Arguments for the daemon subcommand.
+#[derive(clap::Args)]
+struct DaemonArgs {
+    /// Path to the configuration file (overrides THRESHOLD_CONFIG env var)
+    #[arg(short, long)]
+    config: Option<String>,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Daemon(args) => run_daemon(args).await,
+        Commands::Schedule { command } => schedule::handle_schedule_command(command).await,
+    }
+}
+
+/// Run the Threshold daemon.
+///
+/// This contains the full daemon lifecycle extracted from the original main():
+/// config loading, logging, Discord bot, heartbeat, scheduler, and graceful shutdown.
+async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
+    use std::sync::Arc;
+    use threshold_cli_wrapper::ClaudeClient;
+    use threshold_conversation::ConversationEngine;
+    use threshold_core::config::ThresholdConfig;
+    use threshold_core::{init_logging, SecretStore, ThresholdError};
+    use tokio::sync::RwLock;
+    use tokio_util::sync::CancellationToken;
+
+    // If --config is provided, set THRESHOLD_CONFIG so ThresholdConfig::load() picks it up.
+    if let Some(config_path) = &args.config {
+        // SAFETY: Called before any threads are spawned (we are still in the
+        // single-threaded setup phase of run_daemon).
+        unsafe { std::env::set_var("THRESHOLD_CONFIG", config_path) };
+    }
+
     // 1. Load config
     let config = ThresholdConfig::load()?;
 
@@ -60,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
         let engine = engine.clone();
         let outbound_slot = discord_outbound.clone();
         let cancel = cancel.clone();
-        let discord_config_opt: Option<threshold_core::config::DiscordConfig> = config.discord.clone();
+        let discord_config_opt = config.discord.clone();
         async move {
             if let Some(discord_config) = discord_config_opt {
                 let token = secrets
@@ -71,8 +128,6 @@ async fn main() -> anyhow::Result<()> {
 
                 tracing::info!("Starting Discord bot...");
 
-                // build_and_start returns outbound immediately after setup,
-                // then spawns event loop in background
                 let outbound = threshold_discord::build_and_start(
                     engine,
                     discord_config.clone(),
@@ -81,13 +136,10 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await?;
 
-                // Publish outbound for heartbeat/scheduler to use
                 *outbound_slot.write().await = Some(outbound);
-
                 tracing::info!("Discord bot ready.");
             }
 
-            // Keep task alive until cancellation
             cancel.cancelled().await;
             Ok::<(), anyhow::Error>(())
         }
@@ -138,7 +190,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 10. Graceful shutdown
-    cancel.cancel(); // Signal all tasks to stop
+    cancel.cancel();
     engine.save_state().await?;
     tracing::info!("Threshold shut down cleanly.");
 
