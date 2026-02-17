@@ -69,13 +69,21 @@ pub async fn handle_imagegen_command(
             let ext = mime_to_extension(&image.mime_type);
 
             // Generate unique filename
-            let filename = generate_filename(ext);
+            let filename = generate_filename(ext)?;
 
-            // Determine output directory
-            let dir = output_dir
-                .map(PathBuf::from)
-                .unwrap_or_else(default_output_dir);
-            std::fs::create_dir_all(&dir)?;
+            // Determine output directory — canonicalize to prevent path traversal
+            let dir = match output_dir {
+                Some(d) => {
+                    let p = PathBuf::from(&d);
+                    std::fs::create_dir_all(&p)?;
+                    p.canonicalize()?
+                }
+                None => {
+                    let p = default_output_dir();
+                    std::fs::create_dir_all(&p)?;
+                    p.canonicalize().unwrap_or(p)
+                }
+            };
 
             let path = dir.join(&filename);
             std::fs::write(&path, &image.data)?;
@@ -114,17 +122,18 @@ fn mime_to_extension(mime_type: &str) -> &str {
         "image/jpeg" => "jpg",
         "image/webp" => "webp",
         "image/gif" => "gif",
-        _ => "png",
+        _ => "bin",
     }
 }
 
 /// Generate a unique filename: `generated-{timestamp_ms}-{random_hex}.{ext}`.
-fn generate_filename(ext: &str) -> String {
+fn generate_filename(ext: &str) -> anyhow::Result<String> {
     let ts = chrono::Utc::now().timestamp_millis();
     let mut rand_bytes = [0u8; 4];
-    getrandom::fill(&mut rand_bytes).expect("getrandom failed");
+    getrandom::fill(&mut rand_bytes)
+        .map_err(|e| anyhow::anyhow!("Failed to generate random bytes: {}", e))?;
     let hex: String = rand_bytes.iter().map(|b| format!("{:02x}", b)).collect();
-    format!("generated-{}-{}.{}", ts, hex, ext)
+    Ok(format!("generated-{}-{}.{}", ts, hex, ext))
 }
 
 /// Default output directory: `$TMPDIR/threshold-generated/`.
@@ -232,14 +241,14 @@ mod tests {
     }
 
     #[test]
-    fn mime_to_extension_unknown_defaults_to_png() {
-        assert_eq!(mime_to_extension("application/octet-stream"), "png");
+    fn mime_to_extension_unknown_defaults_to_bin() {
+        assert_eq!(mime_to_extension("application/octet-stream"), "bin");
     }
 
     #[test]
     fn generate_filename_produces_unique_names() {
-        let a = generate_filename("png");
-        let b = generate_filename("png");
+        let a = generate_filename("png").unwrap();
+        let b = generate_filename("png").unwrap();
         assert_ne!(a, b);
         assert!(a.starts_with("generated-"));
         assert!(a.ends_with(".png"));
@@ -247,7 +256,7 @@ mod tests {
 
     #[test]
     fn generate_filename_uses_correct_extension() {
-        let name = generate_filename("jpg");
+        let name = generate_filename("jpg").unwrap();
         assert!(name.ends_with(".jpg"));
     }
 

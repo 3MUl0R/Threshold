@@ -1,7 +1,7 @@
 //! Google Gemini image generation API client.
 //!
 //! Wraps the Gemini `generateContent` endpoint to produce images from text
-//! prompts. Uses the `gemini-2.0-flash-exp` model (NanoBanana).
+//! prompts. Uses the `gemini-2.5-flash-image` model (NanoBanana).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -63,12 +63,12 @@ pub struct ImageGenClient {
 }
 
 impl ImageGenClient {
-    /// Create a new client with default model (`gemini-2.0-flash-exp`).
+    /// Create a new client with default model (`gemini-2.5-flash-image`).
     pub fn new(secret_store: Arc<SecretStore>) -> Self {
         Self {
             http: reqwest::Client::new(),
             secret_store,
-            model: "gemini-2.0-flash-exp".to_string(),
+            model: "gemini-2.5-flash-image".to_string(),
         }
     }
 
@@ -88,13 +88,14 @@ impl ImageGenClient {
         let body = build_request_body(&effective_prompt);
 
         let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            self.model, api_key
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
+            self.model
         );
 
         let response = self
             .http
             .post(&url)
+            .header("x-goog-api-key", &api_key)
             .json(&body)
             .timeout(Duration::from_secs(60))
             .send()
@@ -177,14 +178,29 @@ struct GeminiInlineData {
     data: String,
 }
 
+/// Maximum response body size (50 MB). Prevents OOM from malicious/unexpected payloads.
+const MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
+
 /// Parse the Gemini API response and extract the generated image.
 async fn parse_response(
     response: reqwest::Response,
     prompt: &str,
 ) -> Result<GeneratedImage, ImageGenError> {
-    let body: GeminiResponse = response
-        .json()
+    // Read response with size limit to prevent OOM
+    let bytes = response
+        .bytes()
         .await
+        .map_err(|e| ImageGenError::ParseError(format!("Failed to read response body: {}", e)))?;
+
+    if bytes.len() > MAX_RESPONSE_BYTES {
+        return Err(ImageGenError::ParseError(format!(
+            "Response too large: {} bytes (max {})",
+            bytes.len(),
+            MAX_RESPONSE_BYTES
+        )));
+    }
+
+    let body: GeminiResponse = serde_json::from_slice(&bytes)
         .map_err(|e| ImageGenError::ParseError(format!("Failed to deserialize response: {}", e)))?;
 
     extract_image_from_response(&body, prompt)
