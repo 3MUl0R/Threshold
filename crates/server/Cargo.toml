@@ -13,6 +13,7 @@ threshold-cli-wrapper = { path = "../cli-wrapper" }
 threshold-conversation = { path = "../conversation" }
 threshold-discord = { path = "../discord" }
 threshold-tools = { path = "../tools" }
+threshold-scheduler = { path = "../scheduler" }
 
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"

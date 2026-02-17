@@ -1,0 +1,354 @@
+//! Daemon API — Unix socket server for CLI-to-scheduler communication.
+//!
+//! The daemon exposes a Unix domain socket at `~/.threshold/threshold.sock`.
+//! Protocol: newline-delimited JSON (NDJSON) with request-response pattern.
+
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{UnixListener, UnixStream};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+use crate::engine::SchedulerHandle;
+use crate::task::ScheduledTask;
+
+/// Protocol version for daemon communication.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Request envelope sent from CLI to daemon (NDJSON framing).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DaemonRequest {
+    pub version: u32,
+    pub command: DaemonCommand,
+}
+
+/// Command payload within a daemon request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DaemonCommand {
+    /// Create a scheduled task.
+    ScheduleCreate(ScheduledTask),
+    /// List all scheduled tasks.
+    ScheduleList,
+    /// Delete a scheduled task by ID.
+    ScheduleDelete { id: String },
+    /// Toggle a scheduled task on/off.
+    ScheduleToggle { id: String, enabled: bool },
+}
+
+/// Response envelope sent from daemon to CLI.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DaemonResponse {
+    pub version: u32,
+    pub status: ResponseStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+/// Status of a daemon response.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub enum ResponseStatus {
+    #[serde(rename = "ok")]
+    Ok,
+    #[serde(rename = "error")]
+    Error,
+}
+
+impl DaemonResponse {
+    fn ok(data: serde_json::Value) -> Self {
+        Self {
+            version: PROTOCOL_VERSION,
+            status: ResponseStatus::Ok,
+            data: Some(data),
+            message: None,
+            code: None,
+        }
+    }
+
+    fn ok_message(message: &str) -> Self {
+        Self {
+            version: PROTOCOL_VERSION,
+            status: ResponseStatus::Ok,
+            data: None,
+            message: Some(message.to_string()),
+            code: None,
+        }
+    }
+
+    fn error(code: &str, message: &str) -> Self {
+        Self {
+            version: PROTOCOL_VERSION,
+            status: ResponseStatus::Error,
+            data: None,
+            message: Some(message.to_string()),
+            code: Some(code.to_string()),
+        }
+    }
+}
+
+/// Unix socket server for the scheduler daemon API.
+pub struct DaemonApi {
+    scheduler: SchedulerHandle,
+    socket_path: PathBuf,
+}
+
+impl DaemonApi {
+    /// Create a new daemon API server.
+    pub fn new(scheduler: SchedulerHandle, socket_path: PathBuf) -> Self {
+        Self {
+            scheduler,
+            socket_path,
+        }
+    }
+
+    /// Run the daemon API server.
+    ///
+    /// Binds to the Unix socket, handles stale sockets, and accepts connections
+    /// until the cancellation token fires.
+    pub async fn run(&self, cancel: CancellationToken) -> Result<(), anyhow::Error> {
+        // Handle stale socket
+        self.handle_stale_socket().await?;
+
+        let listener = UnixListener::bind(&self.socket_path)?;
+        tracing::info!("Daemon API listening on {}", self.socket_path.display());
+
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, _)) => {
+                            let handle = self.scheduler.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = Self::handle_connection(stream, handle).await {
+                                    tracing::debug!("Connection handler error: {}", e);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to accept connection: {}", e);
+                        }
+                    }
+                }
+                _ = cancel.cancelled() => break,
+            }
+        }
+
+        // Clean up socket file
+        tokio::fs::remove_file(&self.socket_path).await.ok();
+        tracing::info!("Daemon API shut down, socket removed.");
+        Ok(())
+    }
+
+    /// Handle a stale socket file.
+    ///
+    /// If the socket file already exists:
+    /// - Try to connect to it — if succeeds, another daemon is running → error
+    /// - If connection fails → stale socket → delete it
+    async fn handle_stale_socket(&self) -> Result<(), anyhow::Error> {
+        if !self.socket_path.exists() {
+            // Create parent directory if needed
+            if let Some(parent) = self.socket_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            return Ok(());
+        }
+
+        // Try to connect — if it works, another daemon is already running
+        match UnixStream::connect(&self.socket_path).await {
+            Ok(_) => {
+                anyhow::bail!(
+                    "Another daemon is already running (socket {} is active)",
+                    self.socket_path.display()
+                );
+            }
+            Err(_) => {
+                // Stale socket — remove it
+                tracing::info!(
+                    "Removing stale socket: {}",
+                    self.socket_path.display()
+                );
+                tokio::fs::remove_file(&self.socket_path).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle a single client connection.
+    ///
+    /// Reads one NDJSON request line, dispatches to the scheduler, and writes
+    /// one NDJSON response line.
+    async fn handle_connection(
+        stream: UnixStream,
+        scheduler: SchedulerHandle,
+    ) -> Result<(), anyhow::Error> {
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+
+        reader.read_line(&mut line).await?;
+
+        let response = match serde_json::from_str::<DaemonRequest>(line.trim()) {
+            Ok(request) => {
+                if request.version != PROTOCOL_VERSION {
+                    DaemonResponse::error(
+                        "version_mismatch",
+                        &format!(
+                            "Unsupported protocol version {}. Expected {}.",
+                            request.version, PROTOCOL_VERSION
+                        ),
+                    )
+                } else {
+                    Self::dispatch_command(request.command, &scheduler).await
+                }
+            }
+            Err(e) => DaemonResponse::error("invalid_input", &format!("Invalid request: {}", e)),
+        };
+
+        let mut response_json = serde_json::to_string(&response)?;
+        response_json.push('\n');
+        writer.write_all(response_json.as_bytes()).await?;
+        writer.flush().await?;
+
+        Ok(())
+    }
+
+    /// Dispatch a command to the scheduler and build a response.
+    async fn dispatch_command(
+        command: DaemonCommand,
+        scheduler: &SchedulerHandle,
+    ) -> DaemonResponse {
+        match command {
+            DaemonCommand::ScheduleCreate(task) => {
+                let id = task.id;
+                match scheduler.add_task(task).await {
+                    Ok(()) => DaemonResponse::ok(serde_json::json!({ "id": id.to_string() })),
+                    Err(e) => DaemonResponse::error("internal", &e.to_string()),
+                }
+            }
+            DaemonCommand::ScheduleList => match scheduler.list_tasks().await {
+                Ok(tasks) => {
+                    let json = serde_json::to_value(&tasks).unwrap_or_default();
+                    DaemonResponse::ok(json)
+                }
+                Err(e) => DaemonResponse::error("scheduler_shutdown", &e.to_string()),
+            },
+            DaemonCommand::ScheduleDelete { id } => {
+                let uuid = match Uuid::parse_str(&id) {
+                    Ok(uuid) => uuid,
+                    Err(_) => {
+                        return DaemonResponse::error(
+                            "invalid_input",
+                            &format!("Invalid task ID: {}", id),
+                        )
+                    }
+                };
+                match scheduler.remove_task(uuid).await {
+                    Ok(()) => DaemonResponse::ok_message(&format!("Task {} deleted", id)),
+                    Err(e) => DaemonResponse::error("not_found", &e.to_string()),
+                }
+            }
+            DaemonCommand::ScheduleToggle { id, enabled } => {
+                let uuid = match Uuid::parse_str(&id) {
+                    Ok(uuid) => uuid,
+                    Err(_) => {
+                        return DaemonResponse::error(
+                            "invalid_input",
+                            &format!("Invalid task ID: {}", id),
+                        )
+                    }
+                };
+                match scheduler.toggle_task(uuid, enabled).await {
+                    Ok(()) => {
+                        let state = if enabled { "enabled" } else { "disabled" };
+                        DaemonResponse::ok_message(&format!("Task {} {}", id, state))
+                    }
+                    Err(e) => DaemonResponse::error("not_found", &e.to_string()),
+                }
+            }
+        }
+    }
+
+    /// Get the default socket path.
+    pub fn default_socket_path(data_dir: &Path) -> PathBuf {
+        data_dir.join("threshold.sock")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_command_schedule_list_serde() {
+        let cmd = DaemonCommand::ScheduleList;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, r#""ScheduleList""#);
+    }
+
+    #[test]
+    fn daemon_command_schedule_delete_serde() {
+        let cmd = DaemonCommand::ScheduleDelete {
+            id: "abc-123".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let restored: DaemonCommand = serde_json::from_str(&json).unwrap();
+        match restored {
+            DaemonCommand::ScheduleDelete { id } => assert_eq!(id, "abc-123"),
+            _ => panic!("Expected ScheduleDelete"),
+        }
+    }
+
+    #[test]
+    fn daemon_request_serde_round_trip() {
+        let req = DaemonRequest {
+            version: PROTOCOL_VERSION,
+            command: DaemonCommand::ScheduleList,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let restored: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.version, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn daemon_response_ok_serde() {
+        let resp = DaemonResponse::ok(serde_json::json!({"id": "abc"}));
+        let json = serde_json::to_string(&resp).unwrap();
+        let restored: DaemonResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.status, ResponseStatus::Ok);
+        assert!(restored.data.is_some());
+        assert!(restored.message.is_none());
+        assert!(restored.code.is_none());
+    }
+
+    #[test]
+    fn daemon_response_error_serde() {
+        let resp = DaemonResponse::error("not_found", "Task not found");
+        let json = serde_json::to_string(&resp).unwrap();
+        let restored: DaemonResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.status, ResponseStatus::Error);
+        assert_eq!(restored.code.as_deref(), Some("not_found"));
+        assert_eq!(restored.message.as_deref(), Some("Task not found"));
+        assert!(restored.data.is_none());
+    }
+
+    #[test]
+    fn daemon_response_ok_message_serde() {
+        let resp = DaemonResponse::ok_message("Task deleted");
+        let json = serde_json::to_string(&resp).unwrap();
+        let restored: DaemonResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.status, ResponseStatus::Ok);
+        assert_eq!(restored.message.as_deref(), Some("Task deleted"));
+    }
+
+    #[test]
+    fn default_socket_path() {
+        let path = DaemonApi::default_socket_path(Path::new("/home/user/.threshold"));
+        assert_eq!(path.to_str().unwrap(), "/home/user/.threshold/threshold.sock");
+    }
+}

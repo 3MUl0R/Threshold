@@ -107,6 +107,25 @@ impl DiscordOutbound {
     }
 }
 
+/// Implement `ResultSender` so the scheduler can deliver results via Discord.
+///
+/// This bridges the dependency inversion: the scheduler depends on the
+/// `ResultSender` trait (in core), and Discord provides the concrete impl.
+#[async_trait::async_trait]
+impl threshold_core::ResultSender for DiscordOutbound {
+    async fn send_to_channel(
+        &self,
+        channel_id: u64,
+        message: &str,
+    ) -> threshold_core::Result<()> {
+        self.send_to_channel(channel_id, message).await
+    }
+
+    async fn send_dm(&self, user_id: u64, message: &str) -> threshold_core::Result<()> {
+        self.send_dm(user_id, message).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

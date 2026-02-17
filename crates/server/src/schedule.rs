@@ -1,7 +1,9 @@
 //! Schedule subcommands for managing scheduled tasks.
 //!
 //! These commands communicate with the running daemon via Unix socket.
-//! The daemon-side socket listener is implemented in Milestone 6.
+
+use threshold_core::ScheduledAction;
+use threshold_scheduler::task::ScheduledTask;
 
 use crate::daemon_client::{DaemonClient, DaemonCommand};
 use crate::output::OutputFormat;
@@ -104,24 +106,34 @@ pub async fn handle_schedule_command(command: ScheduleCommands) -> anyhow::Resul
             prompt,
             model,
             ..
-        } => DaemonCommand::ScheduleConversation {
-            name: name.clone(),
-            cron: cron.clone(),
-            prompt: prompt.clone(),
-            model: model.clone(),
-        },
+        } => {
+            let task = build_task(
+                name.clone(),
+                cron.clone(),
+                ScheduledAction::NewConversation {
+                    prompt: prompt.clone(),
+                    model: model.clone(),
+                },
+            )?;
+            DaemonCommand::ScheduleCreate(task)
+        }
         ScheduleCommands::Script {
             name,
             cron,
             command: cmd,
             working_dir,
             ..
-        } => DaemonCommand::ScheduleScript {
-            name: name.clone(),
-            cron: cron.clone(),
-            command: cmd.clone(),
-            working_dir: working_dir.clone(),
-        },
+        } => {
+            let task = build_task(
+                name.clone(),
+                cron.clone(),
+                ScheduledAction::Script {
+                    command: cmd.clone(),
+                    working_dir: working_dir.clone(),
+                },
+            )?;
+            DaemonCommand::ScheduleCreate(task)
+        }
         ScheduleCommands::Monitor {
             name,
             cron,
@@ -129,21 +141,24 @@ pub async fn handle_schedule_command(command: ScheduleCommands) -> anyhow::Resul
             prompt_template,
             model,
             ..
-        } => DaemonCommand::ScheduleMonitor {
-            name: name.clone(),
-            cron: cron.clone(),
-            command: cmd.clone(),
-            prompt_template: prompt_template.clone(),
-            model: model.clone(),
-        },
+        } => {
+            let task = build_task(
+                name.clone(),
+                cron.clone(),
+                ScheduledAction::ScriptThenConversation {
+                    command: cmd.clone(),
+                    prompt_template: prompt_template.clone(),
+                    model: model.clone(),
+                },
+            )?;
+            DaemonCommand::ScheduleCreate(task)
+        }
         ScheduleCommands::List { .. } => DaemonCommand::ScheduleList,
         ScheduleCommands::Delete { id, .. } => DaemonCommand::ScheduleDelete { id: id.clone() },
-        ScheduleCommands::Toggle { id, enabled, .. } => {
-            DaemonCommand::ScheduleToggle {
-                id: id.clone(),
-                enabled: *enabled,
-            }
-        }
+        ScheduleCommands::Toggle { id, enabled, .. } => DaemonCommand::ScheduleToggle {
+            id: id.clone(),
+            enabled: *enabled,
+        },
     };
 
     let response = client.send_command(&daemon_command).await?;
@@ -158,8 +173,18 @@ pub async fn handle_schedule_command(command: ScheduleCommands) -> anyhow::Resul
         | ScheduleCommands::Toggle { format, .. } => format,
     };
 
-    // TODO(Milestone 6): Format response based on OutputFormat
     println!("{}", serde_json::to_string_pretty(&response)?);
 
     Ok(())
+}
+
+/// Build a `ScheduledTask` from CLI arguments.
+///
+/// Validates the cron expression and computes the initial `next_run`.
+fn build_task(
+    name: String,
+    cron: String,
+    action: ScheduledAction,
+) -> anyhow::Result<ScheduledTask> {
+    ScheduledTask::new(name, cron, action).map_err(|e| anyhow::anyhow!("{}", e))
 }

@@ -4,6 +4,7 @@
 //! the heartbeat (autonomous agent wake-up) pattern. One engine runs them all.
 
 pub mod cron_utils;
+pub mod daemon_api;
 pub mod engine;
 pub mod execution;
 pub mod heartbeat;

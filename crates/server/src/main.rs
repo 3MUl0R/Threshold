@@ -147,24 +147,88 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
         }
     };
 
-    // Heartbeat task (Milestone 6 — no-op until implemented)
-    let heartbeat_handle = {
-        let cancel = cancel.clone();
-        let _outbound = discord_outbound.clone();
-        async move {
-            // When milestone 6 is implemented:
-            // let outbound = outbound.read().await.clone();
-            // HeartbeatRunner::new(..., outbound).run(cancel).await;
-            cancel.cancelled().await;
-            Ok::<(), anyhow::Error>(())
-        }
-    };
-
-    // Scheduler task (Milestone 6 — no-op until implemented)
+    // Scheduler + Heartbeat + Daemon API task
     let scheduler_handle = {
         let cancel = cancel.clone();
+        let claude = claude.clone();
+        let engine = engine.clone();
+        let discord_outbound = discord_outbound.clone();
+        let scheduler_enabled = config
+            .scheduler
+            .as_ref()
+            .is_some_and(|s| s.enabled);
+        let heartbeat_config = config.heartbeat.clone();
+        let data_dir = config.data_dir()?;
+        let store_path = config
+            .scheduler
+            .as_ref()
+            .and_then(|s| s.store_path.as_ref())
+            .map(|p| threshold_core::resolve_path(p, &data_dir))
+            .unwrap_or_else(|| data_dir.join("state").join("schedules.json"));
+
         async move {
-            cancel.cancelled().await;
+            if !scheduler_enabled {
+                cancel.cancelled().await;
+                return Ok::<(), anyhow::Error>(());
+            }
+
+            // Wait briefly for Discord outbound to be set up
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            // Build result sender from Discord outbound if available
+            let result_sender: Option<Arc<dyn threshold_core::ResultSender>> = {
+                let outbound = discord_outbound.read().await;
+                outbound.as_ref().map(|o| {
+                    Arc::clone(o) as Arc<dyn threshold_core::ResultSender>
+                })
+            };
+
+            let (mut scheduler, handle) = threshold_scheduler::Scheduler::new(
+                store_path,
+                claude,
+                engine,
+                result_sender,
+                cancel.clone(),
+            )
+            .await;
+
+            // Add heartbeat task if configured
+            if let Some(hb_config) = heartbeat_config {
+                if hb_config.enabled {
+                    match threshold_scheduler::heartbeat::heartbeat_task_from_config(
+                        &hb_config,
+                        &data_dir,
+                    ) {
+                        Ok(task) => {
+                            tracing::info!("Adding heartbeat task to scheduler");
+                            handle.add_task(task).await.ok();
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to create heartbeat task: {}", e);
+                        }
+                    }
+                }
+            }
+
+            // Start daemon API in parallel with scheduler
+            let socket_path =
+                threshold_scheduler::daemon_api::DaemonApi::default_socket_path(&data_dir);
+            let daemon_api =
+                threshold_scheduler::daemon_api::DaemonApi::new(handle, socket_path);
+
+            let daemon_cancel = cancel.clone();
+            let daemon_handle = tokio::spawn(async move {
+                if let Err(e) = daemon_api.run(daemon_cancel).await {
+                    tracing::error!("Daemon API error: {}", e);
+                }
+            });
+
+            // Run scheduler main loop
+            scheduler.run().await;
+
+            // Wait for daemon API to shut down
+            daemon_handle.await.ok();
+
             Ok::<(), anyhow::Error>(())
         }
     };
@@ -174,11 +238,6 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
         r = discord_handle => {
             if let Err(e) = r {
                 tracing::error!("Discord error: {}", e);
-            }
-        }
-        r = heartbeat_handle => {
-            if let Err(e) = r {
-                tracing::error!("Heartbeat error: {}", e);
             }
         }
         r = scheduler_handle => {
