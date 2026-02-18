@@ -65,36 +65,57 @@ impl ClaudeClient {
                 // Check for existing session
                 let existing_session = self.sessions.get(conversation_id).await;
 
-                let args = if let Some(session_id) = existing_session {
+                let result = if let Some(session_id) = existing_session {
                     // Resume mode
                     tracing::debug!(
                         conversation_id = %conversation_id,
                         session_id = %session_id,
                         "resuming existing CLI session"
                     );
-                    self.build_resume_args(&session_id, message)
+                    let args = self.build_resume_args(&session_id, message);
+                    self.process.run(&args, None, None).await
                 } else {
-                    // New session mode
+                    // New session mode — generate a fresh UUID (decoupled from conversation ID)
+                    let session_id = Uuid::new_v4();
                     let resolved_model = model
                         .map(|m| resolve_model_alias(m).into_owned())
                         .unwrap_or_else(|| "sonnet".to_string());
 
                     tracing::debug!(
                         conversation_id = %conversation_id,
+                        session_id = %session_id,
                         model = %resolved_model,
                         "starting new CLI session"
                     );
 
-                    self.build_new_session_args(
-                        conversation_id,
+                    let args = self.build_new_session_args(
+                        session_id,
                         message,
                         system_prompt,
                         &resolved_model,
-                    )
+                    );
+                    let res = self.process.run(&args, None, None).await;
+
+                    // If "already in use", fall back to resume
+                    if let Err(ThresholdError::CliError { ref stderr, .. }) = res {
+                        if stderr.contains("already in use") {
+                            tracing::warn!(
+                                conversation_id = %conversation_id,
+                                session_id = %session_id,
+                                "session ID collision, retrying with --resume"
+                            );
+                            let retry_args = self.build_resume_args(&session_id.to_string(), message);
+                            self.process.run(&retry_args, None, None).await
+                        } else {
+                            res
+                        }
+                    } else {
+                        res
+                    }
                 };
 
                 // Execute CLI
-                let output = self.process.run(&args, None, None).await?;
+                let output = result?;
 
                 // Parse response
                 let response = ClaudeResponse::parse(&output.stdout)?;
@@ -165,7 +186,7 @@ impl ClaudeClient {
 
     fn build_new_session_args(
         &self,
-        conversation_id: Uuid,
+        session_id: Uuid,
         message: &str,
         system_prompt: Option<&str>,
         model: &str,
@@ -181,7 +202,7 @@ impl ClaudeClient {
         }
 
         args.push("--session-id".to_string());
-        args.push(conversation_id.to_string());
+        args.push(session_id.to_string());
 
         args.push("--model".to_string());
         args.push(model.to_string());
@@ -240,15 +261,16 @@ mod tests {
             .await
             .unwrap();
 
-        let conv_id = Uuid::new_v4();
-        let args = client.build_new_session_args(conv_id, "Hello", Some("You are helpful"), "opus");
+        let session_id = Uuid::new_v4();
+        let args =
+            client.build_new_session_args(session_id, "Hello", Some("You are helpful"), "opus");
 
         assert!(args.contains(&"-p".to_string()));
         assert!(args.contains(&"--output-format".to_string()));
         assert!(args.contains(&"json".to_string()));
         assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
         assert!(args.contains(&"--session-id".to_string()));
-        assert!(args.contains(&conv_id.to_string()));
+        assert!(args.contains(&session_id.to_string()));
         assert!(args.contains(&"--model".to_string()));
         assert!(args.contains(&"opus".to_string()));
         assert!(args.contains(&"--append-system-prompt".to_string()));
@@ -263,11 +285,26 @@ mod tests {
             .await
             .unwrap();
 
-        let conv_id = Uuid::new_v4();
-        let args = client.build_new_session_args(conv_id, "Hello", None, "sonnet");
+        let session_id = Uuid::new_v4();
+        let args = client.build_new_session_args(session_id, "Hello", None, "sonnet");
 
         assert!(!args.contains(&"--append-system-prompt".to_string()));
         assert!(!args.contains(&"--dangerously-skip-permissions".to_string()));
+    }
+
+    #[tokio::test]
+    async fn build_new_session_args_uses_decoupled_session_id() {
+        let dir = tempdir().unwrap();
+        let client = ClaudeClient::new("claude".to_string(), dir.path().to_path_buf(), false)
+            .await
+            .unwrap();
+
+        let session_id = Uuid::new_v4();
+        let args = client.build_new_session_args(session_id, "Hello", None, "sonnet");
+
+        // Session ID should be the generated UUID, not tied to any conversation ID
+        assert!(args.contains(&session_id.to_string()));
+        assert!(args.contains(&"--session-id".to_string()));
     }
 
     #[tokio::test]
