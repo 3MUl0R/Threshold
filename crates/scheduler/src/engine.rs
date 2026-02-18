@@ -30,6 +30,9 @@ enum SchedulerCommand {
         id: Uuid,
         reply: oneshot::Sender<Result<(), ThresholdError>>,
     },
+    RemoveByConversation {
+        conversation_id: threshold_core::ConversationId,
+    },
     ToggleTask {
         id: Uuid,
         enabled: bool,
@@ -76,6 +79,20 @@ impl SchedulerHandle {
             })
             .map_err(|_| ThresholdError::SchedulerShutdown)?;
         rx.await.map_err(|_| ThresholdError::SchedulerShutdown)?
+    }
+
+    /// Remove all tasks associated with a conversation (fire-and-forget).
+    ///
+    /// Used when a conversation is deleted — removes heartbeat and any other
+    /// tasks whose `conversation_id` matches. Does not require a reply since
+    /// deletion is best-effort.
+    pub fn remove_tasks_for_conversation(
+        &self,
+        conversation_id: threshold_core::ConversationId,
+    ) -> Result<(), ThresholdError> {
+        self.command_tx
+            .send(SchedulerCommand::RemoveByConversation { conversation_id })
+            .map_err(|_| ThresholdError::SchedulerShutdown)
     }
 
     /// List all scheduled tasks.
@@ -262,6 +279,44 @@ impl Scheduler {
                     })
                 };
                 let _ = reply.send(result);
+            }
+            SchedulerCommand::RemoveByConversation { conversation_id } => {
+                let before = self.tasks.len();
+                self.tasks.retain(|task| {
+                    if let ScheduledAction::ResumeConversation {
+                        conversation_id: cid,
+                        ..
+                    } = &task.action
+                    {
+                        if cid == &conversation_id {
+                            tracing::info!(
+                                "Removing task '{}' for deleted conversation {}",
+                                task.name,
+                                conversation_id.0
+                            );
+                            return false;
+                        }
+                    }
+                    // Also check the task's conversation_id field
+                    if task.conversation_id == Some(conversation_id) {
+                        tracing::info!(
+                            "Removing task '{}' for deleted conversation {}",
+                            task.name,
+                            conversation_id.0
+                        );
+                        return false;
+                    }
+                    true
+                });
+                let removed = before - self.tasks.len();
+                if removed > 0 {
+                    tracing::info!(
+                        "Removed {} task(s) for conversation {}",
+                        removed,
+                        conversation_id.0
+                    );
+                    self.persist().await;
+                }
             }
             SchedulerCommand::ToggleTask {
                 id,

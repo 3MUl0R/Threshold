@@ -495,22 +495,36 @@ impl ConversationEngine {
                 .expect("General conversation must exist")
         };
 
-        // 1. Re-attach all portals from this conversation to General
-        {
-            let portals_to_move = {
-                let portals = self.portals.read().await;
-                portals
-                    .get_portals_for_conversation(conversation_id)
-                    .into_iter()
-                    .map(|p| p.id)
-                    .collect::<Vec<_>>()
-            };
-            if !portals_to_move.is_empty() {
+        // 1. Re-attach all portals from this conversation to General.
+        //
+        // NOTE: There is a small TOCTOU window between snapshotting portal IDs and
+        // re-attaching them. A concurrent switch_mode/join_conversation could re-attach
+        // a portal back to the soon-to-be-deleted conversation. This is acceptable since
+        // deletion is a rare, user-initiated operation and the dangling reference is
+        // cleaned up on the next message (portal lookup fails → re-creation).
+        let portals_to_move = {
+            let portals = self.portals.read().await;
+            portals
+                .get_portals_for_conversation(conversation_id)
+                .into_iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>()
+        };
+        if !portals_to_move.is_empty() {
+            {
                 let mut portals = self.portals.write().await;
                 for portal_id in &portals_to_move {
                     portals.attach(portal_id, general_id)?;
                 }
                 portals.save().await?;
+            }
+            // Emit PortalAttached events so active listeners (Discord portal_listener)
+            // update their tracked conversation_id to General.
+            for portal_id in &portals_to_move {
+                let _ = self.event_tx.send(ConversationEvent::PortalAttached {
+                    portal_id: *portal_id,
+                    conversation_id: general_id,
+                });
             }
         }
 
@@ -1256,10 +1270,15 @@ mod tests {
         // Verify directory is removed
         assert!(!conv_dir.exists(), "conversation directory should be removed");
 
-        // Verify ConversationDeleted event was broadcast
-        let event = rx.try_recv().unwrap();
+        // Verify events: PortalAttached (re-attach to General) then ConversationDeleted
+        let event1 = rx.try_recv().unwrap();
+        assert!(
+            matches!(event1, ConversationEvent::PortalAttached { .. }),
+            "expected PortalAttached for re-attached portal"
+        );
+        let event2 = rx.try_recv().unwrap();
         assert!(matches!(
-            event,
+            event2,
             ConversationEvent::ConversationDeleted { conversation_id } if conversation_id == coding_id
         ));
     }

@@ -280,7 +280,37 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
         }
     };
 
-    // 9. Run all tasks concurrently, shut down on signal or error
+    // 9a. Wire ConversationDeleted → scheduler cleanup listener
+    if let Some(sched_handle) = scheduler_cmd_handle.clone() {
+        let mut event_rx = engine.subscribe();
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    event = event_rx.recv() => {
+                        match event {
+                            Ok(threshold_conversation::ConversationEvent::ConversationDeleted { conversation_id }) => {
+                                if let Err(e) = sched_handle.remove_tasks_for_conversation(conversation_id) {
+                                    tracing::warn!(
+                                        "Failed to forward conversation deletion to scheduler: {}",
+                                        e
+                                    );
+                                }
+                            }
+                            Ok(_) => {} // ignore other events
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!("Scheduler deletion listener lagged by {} events", n);
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                    _ = cancel_clone.cancelled() => break,
+                }
+            }
+        });
+    }
+
+    // 9b. Run all tasks concurrently, shut down on signal or error
     tokio::select! {
         r = discord_handle => {
             if let Err(e) = r {
