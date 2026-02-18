@@ -16,6 +16,7 @@ threshold-tools = { path = "../tools" }
 threshold-scheduler = { path = "../scheduler" }
 threshold-gmail = { path = "../gmail" }
 threshold-imagegen = { path = "../imagegen" }
+threshold-web = { path = "../web" }
 
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
@@ -25,3 +26,4 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
+chrono = "0.4"

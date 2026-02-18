@@ -65,6 +65,7 @@ mod tests {
             tools: Default::default(),
             heartbeat: None,
             scheduler: None,
+            web: None,
         }
     }
 

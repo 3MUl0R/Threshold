@@ -918,6 +918,7 @@ mod tests {
             tools: ToolsConfig::default(),
             heartbeat: None,
             scheduler: None,
+            web: None,
         }
     }
 
@@ -1181,6 +1182,7 @@ mod tests {
             tools: ToolsConfig::default(),
             heartbeat: None,
             scheduler: None,
+            web: None,
         };
         let engine = Arc::new(ConversationEngine::new(&config, claude, None, None).await.unwrap());
         let rx = engine.subscribe();

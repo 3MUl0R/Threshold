@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+
+{% block title %}Error {{ status_code }} — Threshold{% endblock %}
+
+{% block content %}
+<h1>Error {{ status_code }}</h1>
+<p>{{ message }}</p>
+<p><a href="/">Back to Dashboard</a></p>
+{% endblock %}

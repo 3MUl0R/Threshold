@@ -536,6 +536,7 @@ mod tests {
             tools: ToolsConfig::default(),
             heartbeat: None,
             scheduler: None,
+            web: None,
         };
         let engine = Arc::new(
             ConversationEngine::new(&config, claude.clone(), None, None)

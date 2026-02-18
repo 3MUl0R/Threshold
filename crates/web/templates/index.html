@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard — Threshold{% endblock %}
+
+{% block content %}
+<h1>Dashboard</h1>
+
+<div class="grid">
+    <article>
+        <header>Uptime</header>
+        <p>{{ start_time | duration_short }}</p>
+    </article>
+    <article>
+        <header>Conversations</header>
+        <p>{{ conversation_count }}</p>
+    </article>
+    <article>
+        <header>Scheduled Tasks</header>
+        <p>{{ schedule_count }}</p>
+    </article>
+</div>
+
+<h2>Quick Links</h2>
+<div class="grid">
+    <a href="/conversations" role="button" class="outline">Conversations</a>
+    <a href="/schedules" role="button" class="outline">Schedules</a>
+    <a href="/audit" role="button" class="outline">Audit Logs</a>
+    <a href="/logs" role="button" class="outline">App Logs</a>
+    <a href="/config" role="button" class="outline">Configuration</a>
+    <a href="/config/credentials" role="button" class="outline">Credentials</a>
+</div>
+{% endblock %}

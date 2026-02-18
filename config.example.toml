@@ -116,6 +116,13 @@ enabled = true
 # [heartbeat]
 # default_interval_minutes = 30
 
+# ── Web Interface Configuration (Milestone 11) ──
+
+[web]
+enabled = true
+# bind = "127.0.0.1"   # Loopback only — no auth exists
+# port = 3000
+
 # ── Scheduler Configuration (Milestone 6) ──
 
 # [scheduler]

@@ -69,10 +69,15 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
     use tokio_util::sync::CancellationToken;
 
     // 1. Load config (from explicit path or default)
+    let config_path = match &args.config {
+        Some(path) => std::path::PathBuf::from(path),
+        None => ThresholdConfig::default_config_path()?,
+    };
     let config = match &args.config {
         Some(path) => ThresholdConfig::load_from(std::path::Path::new(path))?,
         None => ThresholdConfig::load()?,
     };
+    let config = Arc::new(config);
 
     // 2. Initialize logging (keep guard alive for entire program)
     let _log_guard = init_logging(
@@ -181,6 +186,7 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
         let cancel = cancel.clone();
         let discord_config_opt = config.discord.clone();
         let scheduler_handle_for_discord = scheduler_cmd_handle.clone();
+        let secrets = secrets.clone();
         async move {
             if let Some(discord_config) = discord_config_opt {
                 let token = secrets
@@ -310,7 +316,43 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
         });
     }
 
-    // 9b. Run all tasks concurrently, shut down on signal or error
+    // 9b. Web interface task
+    let web_handle = {
+        let web_enabled = config
+            .web
+            .as_ref()
+            .map(|w| w.enabled)
+            .unwrap_or(false);
+        let config = config.clone();
+        let engine = engine.clone();
+        let cancel = cancel.clone();
+        let data_dir = data_dir.clone();
+        let config_path = config_path.clone();
+        let secrets = secrets.clone();
+        let scheduler_cmd_handle = scheduler_cmd_handle.clone();
+        async move {
+            if !web_enabled {
+                cancel.cancelled().await;
+                return Ok::<(), anyhow::Error>(());
+            }
+            let templates = threshold_web::templates::build_template_env();
+            let state = threshold_web::AppState {
+                engine,
+                scheduler_handle: scheduler_cmd_handle,
+                secret_store: secrets,
+                config,
+                config_path,
+                data_dir,
+                cancel: cancel.clone(),
+                start_time: chrono::Utc::now(),
+                templates,
+            };
+            threshold_web::start_web_server(state).await?;
+            Ok(())
+        }
+    };
+
+    // 9c. Run all tasks concurrently, shut down on signal or error
     tokio::select! {
         r = discord_handle => {
             if let Err(e) = r {
@@ -320,6 +362,11 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
         r = scheduler_handle => {
             if let Err(e) = r {
                 tracing::error!("Scheduler error: {}", e);
+            }
+        }
+        r = web_handle => {
+            if let Err(e) = r {
+                tracing::error!("Web interface error: {}", e);
             }
         }
         _ = tokio::signal::ctrl_c() => {

@@ -1,7 +1,7 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ThresholdConfig {
     pub data_dir: Option<PathBuf>,
     pub log_level: Option<String>,
@@ -14,17 +14,18 @@ pub struct ThresholdConfig {
     pub tools: ToolsConfig,
     pub heartbeat: Option<HeartbeatConfig>,
     pub scheduler: Option<SchedulerConfig>,
+    pub web: Option<WebConfig>,
 }
 
 // ── CLI ──
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CliConfig {
     pub claude: ClaudeCliConfig,
     // Future: pub codex: Option<CodexCliConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ClaudeCliConfig {
     pub command: Option<String>,
     pub model: Option<String>,
@@ -36,7 +37,7 @@ pub struct ClaudeCliConfig {
 
 // ── Discord ──
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DiscordConfig {
     pub guild_id: u64,
     pub allowed_user_ids: Vec<u64>,
@@ -45,7 +46,7 @@ pub struct DiscordConfig {
 
 // ── Agents ──
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AgentConfigToml {
     pub id: String,
     pub name: String,
@@ -58,7 +59,7 @@ pub struct AgentConfigToml {
 
 // ── Tools ──
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct ToolsConfig {
     pub permission_mode: Option<String>,
     pub browser: Option<BrowserToolConfig>,
@@ -66,7 +67,7 @@ pub struct ToolsConfig {
     pub image_gen: Option<ImageGenToolConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct BrowserToolConfig {
     pub enabled: bool,
     pub headless: Option<bool>,
@@ -74,14 +75,14 @@ pub struct BrowserToolConfig {
     pub blocked_origins: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct GmailToolConfig {
     pub enabled: bool,
     pub inboxes: Option<Vec<String>>,
     pub allow_send: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ImageGenToolConfig {
     pub enabled: bool,
 }
@@ -91,7 +92,7 @@ pub struct ImageGenToolConfig {
 // Per-conversation heartbeats are now managed via `/heartbeat enable` in Discord.
 // This config section provides only default values for new heartbeats.
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct HeartbeatConfig {
     /// Default interval in minutes for new heartbeats (default: 30).
     pub default_interval_minutes: Option<u64>,
@@ -99,10 +100,21 @@ pub struct HeartbeatConfig {
 
 // ── Scheduler ──
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct SchedulerConfig {
     pub enabled: bool,
     pub store_path: Option<String>,
+}
+
+// ── Web Interface ──
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct WebConfig {
+    pub enabled: bool,
+    /// Bind address (default: "127.0.0.1"). Must be loopback — no auth exists.
+    pub bind: Option<String>,
+    /// Port (default: 3000).
+    pub port: Option<u16>,
 }
 
 // ── Loading ──
@@ -202,6 +214,21 @@ impl ThresholdConfig {
             }
         }
 
+        if let Some(web) = &self.web
+            && web.enabled
+        {
+            if let Some(bind) = &web.bind {
+                if !is_loopback_address(bind) {
+                    return Err(crate::ThresholdError::Config(format!(
+                        "web.bind '{bind}' is not a loopback address. \
+                         The web interface has no authentication — binding to a non-loopback \
+                         address would expose full admin access to the network. \
+                         Use 127.0.0.1 or ::1."
+                    )));
+                }
+            }
+        }
+
         if let Some(discord) = &self.discord
             && discord.allowed_user_ids.is_empty()
         {
@@ -212,6 +239,13 @@ impl ThresholdConfig {
 
         Ok(())
     }
+}
+
+/// Check if a bind address string refers to a loopback interface.
+pub fn is_loopback_address(addr: &str) -> bool {
+    addr == "::1"
+        || addr.starts_with("127.")
+        || addr == "localhost"
 }
 
 #[cfg(test)]
@@ -497,6 +531,95 @@ id = "a"
 name = "A"
 cli_provider = "claude"
 tools = "standard"
+"#;
+        let config: ThresholdConfig = toml::from_str(toml).unwrap();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn is_loopback_accepts_127_addresses() {
+        assert!(is_loopback_address("127.0.0.1"));
+        assert!(is_loopback_address("127.0.1.1"));
+        assert!(is_loopback_address("127.255.255.255"));
+    }
+
+    #[test]
+    fn is_loopback_accepts_ipv6_loopback() {
+        assert!(is_loopback_address("::1"));
+    }
+
+    #[test]
+    fn is_loopback_accepts_localhost() {
+        assert!(is_loopback_address("localhost"));
+    }
+
+    #[test]
+    fn is_loopback_rejects_non_loopback() {
+        assert!(!is_loopback_address("0.0.0.0"));
+        assert!(!is_loopback_address("::"));
+        assert!(!is_loopback_address("192.168.1.1"));
+        assert!(!is_loopback_address("10.0.0.1"));
+    }
+
+    #[test]
+    fn web_config_deserializes() {
+        let toml = r#"
+[cli.claude]
+
+[web]
+enabled = true
+bind = "127.0.0.1"
+port = 8080
+"#;
+        let config: ThresholdConfig = toml::from_str(toml).unwrap();
+        let web = config.web.unwrap();
+        assert!(web.enabled);
+        assert_eq!(web.bind.unwrap(), "127.0.0.1");
+        assert_eq!(web.port.unwrap(), 8080);
+    }
+
+    #[test]
+    fn web_config_absent_is_none() {
+        let toml = "[cli.claude]\n";
+        let config: ThresholdConfig = toml::from_str(toml).unwrap();
+        assert!(config.web.is_none());
+    }
+
+    #[test]
+    fn validate_rejects_non_loopback_web_bind() {
+        let toml = r#"
+[cli.claude]
+
+[web]
+enabled = true
+bind = "0.0.0.0"
+"#;
+        let config: ThresholdConfig = toml::from_str(toml).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("not a loopback address"));
+    }
+
+    #[test]
+    fn validate_accepts_loopback_web_bind() {
+        let toml = r#"
+[cli.claude]
+
+[web]
+enabled = true
+bind = "127.0.0.1"
+"#;
+        let config: ThresholdConfig = toml::from_str(toml).unwrap();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_disabled_web_with_non_loopback() {
+        let toml = r#"
+[cli.claude]
+
+[web]
+enabled = false
+bind = "0.0.0.0"
 "#;
         let config: ThresholdConfig = toml::from_str(toml).unwrap();
         assert!(config.validate().is_ok());

@@ -90,6 +90,7 @@ mod tests {
             tools: ToolsConfig::default(),
             heartbeat: None,
             scheduler: None,
+            web: None,
         }
     }
 

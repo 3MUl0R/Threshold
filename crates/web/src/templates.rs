@@ -1,0 +1,72 @@
+//! Template engine setup with embedded templates.
+
+use std::sync::Arc;
+
+use crate::helpers::time;
+
+/// Build the minijinja template environment with all templates embedded.
+///
+/// In debug builds, templates can optionally be loaded from disk for hot-reload.
+pub fn build_template_env() -> Arc<minijinja::Environment<'static>> {
+    let mut env = minijinja::Environment::new();
+
+    // Auto-escaping is enabled by default for HTML — prevents XSS
+    // from untrusted content (audit logs, conversation text, etc.)
+
+    // Register templates from embedded strings
+    env.add_template_owned("base.html".to_string(), include_str!("../templates/base.html").to_string())
+        .expect("base.html template");
+    env.add_template_owned("index.html".to_string(), include_str!("../templates/index.html").to_string())
+        .expect("index.html template");
+    env.add_template_owned("error.html".to_string(), include_str!("../templates/error.html").to_string())
+        .expect("error.html template");
+
+    // Register custom filters
+    env.add_filter("relative_time", relative_time_filter);
+    env.add_filter("duration_short", duration_short_filter);
+
+    Arc::new(env)
+}
+
+/// Custom filter: convert ISO timestamp to "5 minutes ago" etc.
+fn relative_time_filter(value: &str) -> String {
+    match value.parse::<chrono::DateTime<chrono::Utc>>() {
+        Ok(dt) => time::relative_time(&dt),
+        Err(_) => value.to_string(),
+    }
+}
+
+/// Custom filter: convert ISO timestamp to short uptime duration.
+fn duration_short_filter(value: &str) -> String {
+    match value.parse::<chrono::DateTime<chrono::Utc>>() {
+        Ok(dt) => time::format_duration_short(&dt),
+        Err(_) => value.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn template_env_builds_successfully() {
+        let env = build_template_env();
+        assert!(env.get_template("base.html").is_ok());
+        assert!(env.get_template("index.html").is_ok());
+        assert!(env.get_template("error.html").is_ok());
+    }
+
+    #[test]
+    fn auto_escaping_prevents_xss() {
+        let env = build_template_env();
+        let tmpl = env.get_template("error.html").unwrap();
+        let rendered = tmpl
+            .render(minijinja::context! {
+                status_code => 500,
+                message => "<script>alert('xss')</script>",
+            })
+            .unwrap();
+        assert!(rendered.contains("&lt;script&gt;"));
+        assert!(!rendered.contains("<script>alert"));
+    }
+}
