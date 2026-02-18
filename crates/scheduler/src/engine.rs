@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use threshold_cli_wrapper::ClaudeClient;
 use threshold_conversation::ConversationEngine;
-use threshold_core::{ResultSender, ThresholdError};
+use threshold_core::{ActiveConversations, ResultSender, ScheduledAction, ThresholdError};
 
 use crate::cron_utils;
 use crate::execution;
@@ -93,6 +93,8 @@ pub struct Scheduler {
     tasks: Vec<ScheduledTask>,
     /// IDs of tasks currently executing (for skip-if-running).
     running_tasks: Arc<RwLock<HashSet<Uuid>>>,
+    /// Shared tracker of conversations with active CLI invocations.
+    active_conversations: Arc<ActiveConversations>,
     /// Bounded concurrency for task execution (default: 4).
     task_semaphore: Arc<tokio::sync::Semaphore>,
     /// Path for persisting task state.
@@ -114,12 +116,15 @@ impl Scheduler {
     /// Create a new scheduler and its handle.
     ///
     /// Loads persisted tasks from `store_path` on startup.
+    /// `active_conversations` is shared with the conversation engine for
+    /// conversation-level skip-if-running checks on heartbeats.
     /// Returns `(Scheduler, SchedulerHandle)` — call `scheduler.run()` to start the loop.
     pub async fn new(
         store_path: PathBuf,
         claude: Arc<ClaudeClient>,
         engine: Arc<ConversationEngine>,
         result_sender: Option<Arc<dyn ResultSender>>,
+        active_conversations: Arc<ActiveConversations>,
         cancel: CancellationToken,
     ) -> (Self, SchedulerHandle) {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -142,6 +147,7 @@ impl Scheduler {
         let scheduler = Self {
             tasks,
             running_tasks: Arc::new(RwLock::new(HashSet::new())),
+            active_conversations,
             task_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             store_path,
             claude,
@@ -273,7 +279,7 @@ impl Scheduler {
         }
 
         for task_id in due_task_ids {
-            // Skip if already running
+            // Skip if already running (by task ID)
             {
                 let running = self.running_tasks.read().await;
                 if running.contains(&task_id) {
@@ -282,6 +288,26 @@ impl Scheduler {
                             tracing::info!(
                                 "Skipping task '{}': previous run still active",
                                 task.name
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // For heartbeat tasks, also skip if the conversation is already active
+            // (e.g., a user message is being processed)
+            if let Some(task) = self.tasks.iter().find(|t| t.id == task_id) {
+                if task.kind == crate::task::TaskKind::Heartbeat {
+                    if let ScheduledAction::ResumeConversation {
+                        conversation_id, ..
+                    } = &task.action
+                    {
+                        if self.active_conversations.contains(conversation_id).await {
+                            tracing::info!(
+                                "Skipping heartbeat '{}': conversation {} already active",
+                                task.name,
+                                conversation_id.0
                             );
                             continue;
                         }
@@ -302,6 +328,7 @@ impl Scheduler {
             // Spawn task execution with bounded concurrency
             let semaphore = self.task_semaphore.clone();
             let running_tasks = self.running_tasks.clone();
+            let active_conversations = self.active_conversations.clone();
             let claude = self.claude.clone();
             let engine = self.engine.clone();
             let result_sender = self.result_sender.clone();
@@ -313,6 +340,19 @@ impl Scheduler {
                 };
 
                 running_tasks.write().await.insert(task_snapshot.id);
+
+                // For ResumeConversation tasks, mark the conversation as active
+                let conversation_id = if let ScheduledAction::ResumeConversation {
+                    conversation_id,
+                    ..
+                } = &task_snapshot.action
+                {
+                    active_conversations.insert(*conversation_id).await;
+                    Some(*conversation_id)
+                } else {
+                    None
+                };
+
                 tracing::info!("Running scheduled task: {}", task_snapshot.name);
 
                 let result = execution::execute_task(&task_snapshot, &claude, &engine).await;
@@ -335,6 +375,10 @@ impl Scheduler {
                 // Send completion back to scheduler loop to update last_run/last_result
                 let _ = completion_tx.send((task_snapshot.id, result));
 
+                // Clean up tracking state
+                if let Some(cid) = conversation_id {
+                    active_conversations.remove(&cid).await;
+                }
                 running_tasks.write().await.remove(&task_snapshot.id);
             });
         }
@@ -403,7 +447,7 @@ mod tests {
             scheduler: None,
         };
         let engine = Arc::new(
-            ConversationEngine::new(&config, claude.clone(), None)
+            ConversationEngine::new(&config, claude.clone(), None, None)
                 .await
                 .unwrap(),
         );
@@ -412,6 +456,7 @@ mod tests {
             claude,
             engine,
             None,
+            Arc::new(ActiveConversations::new()),
             cancel,
         )
         .await

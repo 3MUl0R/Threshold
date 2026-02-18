@@ -1,3 +1,4 @@
+pub mod active_tracker;
 pub mod audit;
 pub mod config;
 pub mod error;
@@ -6,6 +7,7 @@ pub mod paths;
 pub mod secrets;
 pub mod types;
 
+pub use active_tracker::ActiveConversations;
 pub use audit::AuditTrail;
 pub use error::{Result, ThresholdError};
 pub use logging::init_logging;

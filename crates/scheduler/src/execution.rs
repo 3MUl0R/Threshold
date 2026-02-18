@@ -10,7 +10,7 @@ use threshold_cli_wrapper::ClaudeClient;
 use threshold_conversation::ConversationEngine;
 use threshold_core::{ResultSender, ScheduledAction, ThresholdError};
 
-use crate::task::{DeliveryTarget, ScheduledTask, TaskRunResult};
+use crate::task::{DeliveryTarget, ScheduledTask, TaskKind, TaskRunResult};
 
 /// Truncate a string to at most `max_len` bytes, appending "..." if truncated.
 ///
@@ -48,7 +48,15 @@ pub async fn execute_task(
         ScheduledAction::ResumeConversation {
             conversation_id,
             prompt,
-        } => exec_resume_conversation(engine, conversation_id, prompt).await,
+        } => {
+            // For heartbeat tasks, build a dynamic prompt with file paths
+            let effective_prompt = if task.kind == TaskKind::Heartbeat {
+                build_heartbeat_prompt(conversation_id, engine)
+            } else {
+                prompt.clone()
+            };
+            exec_resume_conversation(engine, conversation_id, &effective_prompt).await
+        }
         ScheduledAction::Script {
             command,
             working_dir,
@@ -112,6 +120,28 @@ pub async fn deliver_result(
             // Nothing to do — execution is already logged
         }
     }
+}
+
+/// Build a dynamic prompt for heartbeat tasks.
+///
+/// Points the agent to its heartbeat.md and memory.md files so it can
+/// read instructions, check status, and do work if needed.
+fn build_heartbeat_prompt(
+    conversation_id: &threshold_core::ConversationId,
+    engine: &Arc<ConversationEngine>,
+) -> String {
+    let data_dir = engine.data_dir();
+    let conv_dir = data_dir
+        .join("conversations")
+        .join(conversation_id.0.to_string());
+    let heartbeat_path = conv_dir.join("heartbeat.md");
+    let memory_path = conv_dir.join("memory.md");
+
+    format!(
+        "[Heartbeat] Check your heartbeat file at {} and your memory file at {}.",
+        heartbeat_path.display(),
+        memory_path.display()
+    )
 }
 
 /// Launch a fresh Claude conversation with the given prompt.

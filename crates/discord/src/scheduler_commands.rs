@@ -4,7 +4,8 @@
 //! with the unified scheduler via `SchedulerHandle`.
 
 use crate::bot::Context;
-use threshold_core::{ScheduledAction, ThresholdError};
+use crate::portals::resolve_or_create_portal;
+use threshold_core::{ConversationId, ScheduledAction, ThresholdError};
 use threshold_scheduler::task::{DeliveryTarget, ScheduledTask, TaskKind};
 
 type Result = std::result::Result<(), ThresholdError>;
@@ -119,11 +120,66 @@ pub async fn schedules(ctx: Context<'_>) -> Result {
     Ok(())
 }
 
-/// Heartbeat status and controls.
+/// Default content for a new heartbeat.md file.
+const DEFAULT_HEARTBEAT_CONTENT: &str = "\
+# Heartbeat Instructions
+
+This is a heartbeat wake-up. Review your memory file and this heartbeat file for context.
+
+If you find specific instructions or pending tasks below, follow them.
+Do not infer or repeat tasks that are already complete.
+
+If nothing needs attention, reply: \"Heartbeat OK — nothing requires attention.\"
+
+## Pending Tasks
+(none)
+
+## Status Log
+(Agent: update this section with timestamps when you complete work during heartbeats)
+";
+
+/// Build a cron expression for heartbeat with phase-shift jitter.
+///
+/// Uses the conversation ID as a deterministic jitter source to spread
+/// heartbeats across time and avoid simultaneous firing.
+fn heartbeat_cron(interval_minutes: u64, conversation_id: &ConversationId) -> String {
+    let jitter = (conversation_id.0.as_u128() % interval_minutes as u128) as u64;
+    if interval_minutes >= 60 && interval_minutes % 60 == 0 {
+        let hours = interval_minutes / 60;
+        // Hour-level intervals with jitter on the minute
+        format!("0 {} */{} * * * *", jitter % 60, hours)
+    } else {
+        // Minute-level intervals with phase-shifted start
+        format!("0 {}/{} * * * * *", jitter, interval_minutes)
+    }
+}
+
+/// Find the heartbeat task for a specific conversation.
+fn find_heartbeat_for_conversation(
+    tasks: &[ScheduledTask],
+    conversation_id: &ConversationId,
+) -> Option<ScheduledTask> {
+    tasks
+        .iter()
+        .find(|t| {
+            t.kind == TaskKind::Heartbeat
+                && matches!(
+                    &t.action,
+                    ScheduledAction::ResumeConversation { conversation_id: cid, .. }
+                    if *cid == *conversation_id
+                )
+        })
+        .cloned()
+}
+
+/// Per-conversation heartbeat controls.
+///
+/// Resolves the current channel's conversation and manages its heartbeat.
 #[poise::command(slash_command)]
 pub async fn heartbeat(
     ctx: Context<'_>,
-    #[description = "Action: status, pause, resume"] action: String,
+    #[description = "Action: enable, disable, status, pause, resume"] action: String,
+    #[description = "Interval in minutes (for enable, default: 30)"] interval: Option<u64>,
 ) -> Result {
     let scheduler = match &ctx.data().scheduler {
         Some(s) => s,
@@ -133,16 +189,93 @@ pub async fn heartbeat(
         }
     };
 
+    // Resolve this channel's conversation
+    let guild_id = ctx.guild_id().map(|g| g.get()).unwrap_or(0);
+    let channel_id = ctx.channel_id().get();
+    let portal_id = resolve_or_create_portal(&ctx.data().engine, guild_id, channel_id).await;
+    let conversation_id = ctx.data().engine.get_portal_conversation(&portal_id).await?;
+
     let tasks = scheduler.list_tasks().await?;
-    let heartbeat_task = tasks.iter().find(|t| t.kind == TaskKind::Heartbeat);
+    let heartbeat_task = find_heartbeat_for_conversation(&tasks, &conversation_id);
 
     match action.as_str() {
+        "enable" => {
+            if heartbeat_task.is_some() {
+                ctx.say("Heartbeat is already enabled for this conversation.")
+                    .await
+                    .ok();
+                return Ok(());
+            }
+
+            let interval_minutes = interval.unwrap_or(30);
+            let cron_expr = heartbeat_cron(interval_minutes, &conversation_id);
+
+            // Create heartbeat.md if it doesn't exist
+            let data_dir = ctx.data().engine.data_dir();
+            let conv_dir = data_dir
+                .join("conversations")
+                .join(conversation_id.0.to_string());
+            let heartbeat_path = conv_dir.join("heartbeat.md");
+            if !heartbeat_path.exists() {
+                if let Err(e) = std::fs::create_dir_all(&conv_dir) {
+                    tracing::warn!("Failed to create conversation dir: {}", e);
+                }
+                if let Err(e) = std::fs::write(&heartbeat_path, DEFAULT_HEARTBEAT_CONTENT) {
+                    tracing::warn!("Failed to write heartbeat.md: {}", e);
+                }
+            }
+
+            // Create heartbeat scheduled task
+            let action = ScheduledAction::ResumeConversation {
+                conversation_id,
+                prompt: String::new(), // replaced at fire time by dynamic prompt
+            };
+
+            let mut task =
+                ScheduledTask::new(format!("heartbeat-{}", &conversation_id.0), cron_expr.clone(), action)
+                    .map_err(|e| ThresholdError::InvalidInput {
+                        message: e.to_string(),
+                    })?;
+            task.kind = TaskKind::Heartbeat;
+            task.skip_if_running = true;
+            task.conversation_id = Some(conversation_id);
+
+            let next_run = task
+                .next_run
+                .map_or("unknown".to_string(), |t| t.to_rfc3339());
+
+            scheduler.add_task(task).await?;
+
+            ctx.say(format!(
+                "Heartbeat enabled for this conversation (every {} min).\nCron: `{}`\nNext run: {}",
+                interval_minutes, cron_expr, next_run,
+            ))
+            .await
+            .ok();
+        }
+        "disable" => {
+            if let Some(hb) = heartbeat_task {
+                scheduler.remove_task(hb.id).await?;
+                ctx.say("Heartbeat disabled for this conversation.")
+                    .await
+                    .ok();
+            } else {
+                ctx.say("No heartbeat is enabled for this conversation.")
+                    .await
+                    .ok();
+            }
+        }
         "status" => {
             if let Some(hb) = heartbeat_task {
                 ctx.say(format!(
-                    "**Heartbeat:** {}\nEnabled: {}\nLast run: {}\nNext run: {}",
-                    hb.name,
+                    "**Heartbeat** for conversation `{}`\n\
+                     Enabled: {}\n\
+                     Schedule: `{}`\n\
+                     Last run: {}\n\
+                     Next run: {}",
+                    conversation_id.0,
                     hb.enabled,
+                    hb.cron_expression,
                     hb.last_run
                         .map_or("never".to_string(), |t| t.to_rfc3339()),
                     hb.next_run
@@ -151,7 +284,12 @@ pub async fn heartbeat(
                 .await
                 .ok();
             } else {
-                ctx.say("No heartbeat configured.").await.ok();
+                ctx.say(format!(
+                    "No heartbeat for conversation `{}`. Use `/heartbeat enable` to set one up.",
+                    conversation_id.0,
+                ))
+                .await
+                .ok();
             }
         }
         "pause" => {
@@ -159,7 +297,9 @@ pub async fn heartbeat(
                 scheduler.toggle_task(hb.id, false).await?;
                 ctx.say("Heartbeat paused.").await.ok();
             } else {
-                ctx.say("No heartbeat configured.").await.ok();
+                ctx.say("No heartbeat is enabled for this conversation.")
+                    .await
+                    .ok();
             }
         }
         "resume" => {
@@ -167,11 +307,15 @@ pub async fn heartbeat(
                 scheduler.toggle_task(hb.id, true).await?;
                 ctx.say("Heartbeat resumed.").await.ok();
             } else {
-                ctx.say("No heartbeat configured.").await.ok();
+                ctx.say("No heartbeat is enabled for this conversation.")
+                    .await
+                    .ok();
             }
         }
         _ => {
-            ctx.say("Usage: /heartbeat status|pause|resume").await.ok();
+            ctx.say("Usage: `/heartbeat enable|disable|status|pause|resume`")
+                .await
+                .ok();
         }
     }
     Ok(())
@@ -190,5 +334,116 @@ mod tests {
             ScheduleActionChoice::Monitor,
         ];
         assert_eq!(choices.len(), 3);
+    }
+
+    #[test]
+    fn heartbeat_cron_30_minute_interval() {
+        let conv_id = ConversationId(uuid::Uuid::nil());
+        let cron = heartbeat_cron(30, &conv_id);
+        // nil UUID → 0 jitter → starts at minute 0
+        assert_eq!(cron, "0 0/30 * * * * *");
+    }
+
+    #[test]
+    fn heartbeat_cron_with_jitter() {
+        // Use a specific UUID that produces non-zero jitter
+        let uuid = uuid::Uuid::from_u128(17);
+        let conv_id = ConversationId(uuid);
+        let cron = heartbeat_cron(30, &conv_id);
+        // 17 % 30 = 17 → starts at minute 17
+        assert_eq!(cron, "0 17/30 * * * * *");
+    }
+
+    #[test]
+    fn heartbeat_cron_hourly() {
+        let conv_id = ConversationId(uuid::Uuid::nil());
+        let cron = heartbeat_cron(60, &conv_id);
+        // 60-min interval → hourly, 0 % 60 = 0
+        assert_eq!(cron, "0 0 */1 * * * *");
+    }
+
+    #[test]
+    fn heartbeat_cron_2_hours_with_jitter() {
+        let uuid = uuid::Uuid::from_u128(75);
+        let conv_id = ConversationId(uuid);
+        let cron = heartbeat_cron(120, &conv_id);
+        // 120-min interval → 2-hourly, 75 % 60 = 15
+        assert_eq!(cron, "0 15 */2 * * * *");
+    }
+
+    #[test]
+    fn heartbeat_cron_15_minute_interval() {
+        let uuid = uuid::Uuid::from_u128(7);
+        let conv_id = ConversationId(uuid);
+        let cron = heartbeat_cron(15, &conv_id);
+        // 7 % 15 = 7 → starts at minute 7
+        assert_eq!(cron, "0 7/15 * * * * *");
+    }
+
+    #[test]
+    fn find_heartbeat_for_conversation_found() {
+        let conv_id = ConversationId::new();
+        let mut task = ScheduledTask::new(
+            "heartbeat".into(),
+            "0 */30 * * * * *".into(),
+            ScheduledAction::ResumeConversation {
+                conversation_id: conv_id,
+                prompt: String::new(),
+            },
+        )
+        .unwrap();
+        task.kind = TaskKind::Heartbeat;
+
+        let tasks = vec![task.clone()];
+        let found = find_heartbeat_for_conversation(&tasks, &conv_id);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, task.id);
+    }
+
+    #[test]
+    fn find_heartbeat_for_conversation_wrong_id() {
+        let conv_id = ConversationId::new();
+        let other_id = ConversationId::new();
+        let mut task = ScheduledTask::new(
+            "heartbeat".into(),
+            "0 */30 * * * * *".into(),
+            ScheduledAction::ResumeConversation {
+                conversation_id: conv_id,
+                prompt: String::new(),
+            },
+        )
+        .unwrap();
+        task.kind = TaskKind::Heartbeat;
+
+        let tasks = vec![task];
+        let found = find_heartbeat_for_conversation(&tasks, &other_id);
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn find_heartbeat_for_conversation_ignores_cron_tasks() {
+        let conv_id = ConversationId::new();
+        // A cron task (not heartbeat) with the same conversation_id
+        let task = ScheduledTask::new(
+            "not-heartbeat".into(),
+            "0 */30 * * * * *".into(),
+            ScheduledAction::ResumeConversation {
+                conversation_id: conv_id,
+                prompt: "do stuff".into(),
+            },
+        )
+        .unwrap();
+        // kind defaults to Cron
+
+        let tasks = vec![task];
+        let found = find_heartbeat_for_conversation(&tasks, &conv_id);
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn default_heartbeat_content_has_required_sections() {
+        assert!(DEFAULT_HEARTBEAT_CONTENT.contains("# Heartbeat Instructions"));
+        assert!(DEFAULT_HEARTBEAT_CONTENT.contains("## Pending Tasks"));
+        assert!(DEFAULT_HEARTBEAT_CONTENT.contains("## Status Log"));
     }
 }

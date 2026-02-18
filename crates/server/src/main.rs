@@ -106,8 +106,15 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
         let prompt = threshold_tools::build_tool_prompt(&config);
         if prompt.is_empty() { None } else { Some(prompt) }
     };
+    let active_conversations = Arc::new(threshold_core::ActiveConversations::new());
     let engine = Arc::new(
-        ConversationEngine::new(&config, claude.clone(), tool_prompt).await?,
+        ConversationEngine::new(
+            &config,
+            claude.clone(),
+            tool_prompt,
+            Some(active_conversations.clone()),
+        )
+        .await?,
     );
     tracing::info!("Conversation engine initialized.");
 
@@ -132,6 +139,7 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
             claude.clone(),
             engine.clone(),
             None, // result sender wired after Discord starts
+            active_conversations.clone(),
             cancel.clone(),
         )
         .await;
@@ -183,10 +191,9 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
         }
     };
 
-    // Scheduler + Heartbeat + Daemon API task
+    // Scheduler + Daemon API task
     let scheduler_handle = {
         let cancel = cancel.clone();
-        let heartbeat_config = config.heartbeat.clone();
         let data_dir = data_dir.clone();
         let scheduler_cmd_handle = scheduler_cmd_handle.clone();
         let discord_outbound_for_scheduler = discord_outbound.clone();
@@ -205,8 +212,6 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
                 let outbound = discord_outbound_for_scheduler.clone();
                 let cancel_clone = cancel.clone();
                 tokio::spawn(async move {
-                    // This is handled by the Discord task; we just check periodically
-                    // The result_sender is set once Discord is ready
                     loop {
                         tokio::select! {
                             _ = cancel_clone.cancelled() => break,
@@ -222,33 +227,8 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
                 });
             }
 
-            // Add heartbeat task if configured (skip if one already exists from persistence)
-            if let Some(hb_config) = heartbeat_config {
-                if hb_config.enabled {
-                    // Check if a heartbeat task already exists from persisted state
-                    let existing_tasks = handle.list_tasks().await.unwrap_or_default();
-                    let has_heartbeat = existing_tasks
-                        .iter()
-                        .any(|t| t.kind == threshold_scheduler::task::TaskKind::Heartbeat);
-
-                    if has_heartbeat {
-                        tracing::info!("Heartbeat task already exists from persisted state, skipping creation");
-                    } else {
-                        match threshold_scheduler::heartbeat::heartbeat_task_from_config(
-                            &hb_config,
-                            &data_dir,
-                        ) {
-                            Ok(task) => {
-                                tracing::info!("Adding heartbeat task to scheduler");
-                                handle.add_task(task).await.ok();
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to create heartbeat task: {}", e);
-                            }
-                        }
-                    }
-                }
-            }
+            // Heartbeat tasks are now per-conversation, created via /heartbeat enable.
+            // No global heartbeat startup — see Phase 12B.
 
             // Start daemon API in parallel with scheduler
             let socket_path =

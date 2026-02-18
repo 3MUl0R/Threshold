@@ -13,8 +13,8 @@ use threshold_cli_wrapper::ClaudeClient;
 use threshold_cli_wrapper::response::Usage;
 use threshold_core::config::{AgentConfigToml, ThresholdConfig};
 use threshold_core::{
-    AgentConfig, CliProvider, Conversation, ConversationId, ConversationMode, PortalId, PortalType,
-    Result, ThresholdError, ToolProfile,
+    ActiveConversations, AgentConfig, CliProvider, Conversation, ConversationId, ConversationMode,
+    PortalId, PortalType, Result, ThresholdError, ToolProfile,
 };
 use tokio::sync::{RwLock, broadcast};
 
@@ -71,6 +71,8 @@ pub struct ConversationEngine {
     data_dir: PathBuf,
     /// Tool-availability section to prepend to system prompts (from build_tool_prompt).
     tool_prompt: Option<String>,
+    /// Shared tracker of conversations with active CLI invocations.
+    active_conversations: Arc<ActiveConversations>,
 }
 
 impl ConversationEngine {
@@ -78,10 +80,14 @@ impl ConversationEngine {
     ///
     /// `tool_prompt` is an optional tool-availability section (from `build_tool_prompt()`)
     /// that gets prepended to each agent's system prompt when launching Claude sessions.
+    ///
+    /// `active_conversations` is an optional shared tracker. When `None`, a private
+    /// instance is created (sufficient for tests where cross-component tracking isn't needed).
     pub async fn new(
         config: &ThresholdConfig,
         claude: Arc<ClaudeClient>,
         tool_prompt: Option<String>,
+        active_conversations: Option<Arc<ActiveConversations>>,
     ) -> Result<Self> {
         // Resolve data directory from config
         let data_dir = config.data_dir()?;
@@ -116,6 +122,8 @@ impl ConversationEngine {
             audit_dir,
             data_dir,
             tool_prompt,
+            active_conversations: active_conversations
+                .unwrap_or_else(|| Arc::new(ActiveConversations::new())),
         })
     }
 
@@ -287,7 +295,8 @@ impl ConversationEngine {
         )
         .await?;
 
-        // 5. Call Claude CLI
+        // 5. Call Claude CLI (track active conversation for heartbeat skip)
+        self.active_conversations.insert(conversation_id).await;
         let start = std::time::Instant::now();
         let result = self
             .claude
@@ -298,6 +307,7 @@ impl ConversationEngine {
                 Some(model),
             )
             .await;
+        self.active_conversations.remove(&conversation_id).await;
 
         match result {
             Ok(response) => {
@@ -476,6 +486,20 @@ impl ConversationEngine {
         self.portals.clone()
     }
 
+    /// Get the data directory path (for building file paths externally).
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// Get the conversation ID for a portal.
+    pub async fn get_portal_conversation(&self, portal_id: &PortalId) -> Result<ConversationId> {
+        let portals = self.portals.read().await;
+        portals
+            .get_conversation(portal_id)
+            .copied()
+            .ok_or(ThresholdError::PortalNotFound { id: portal_id.0 })
+    }
+
     /// Switch a portal to a different conversation mode
     pub async fn switch_mode(
         &self,
@@ -650,11 +674,14 @@ impl ConversationEngine {
             CliProvider::Claude { model } => (combined_prompt.as_deref(), model.as_str()),
         };
 
-        // Call Claude
+        // Call Claude (track active conversation for heartbeat skip)
+        self.active_conversations.insert(*conversation_id).await;
         let response = self
             .claude
             .send_message(conversation_id.0, content, system_prompt, Some(model))
-            .await?;
+            .await;
+        self.active_conversations.remove(conversation_id).await;
+        let response = response?;
 
         // Write to audit (no portal_id for system messages)
         self.write_audit_event(
@@ -855,7 +882,7 @@ mod tests {
             .unwrap(),
         );
 
-        let engine = ConversationEngine::new(&config, claude, None).await.unwrap();
+        let engine = ConversationEngine::new(&config, claude, None, None).await.unwrap();
 
         let agent = engine.resolve_agent_for_mode(&ConversationMode::Coding {
             project: "test".to_string(),
@@ -877,7 +904,7 @@ mod tests {
             .unwrap(),
         );
 
-        let engine = ConversationEngine::new(&config, claude, None).await.unwrap();
+        let engine = ConversationEngine::new(&config, claude, None, None).await.unwrap();
 
         let agent = engine.resolve_agent_for_mode(&ConversationMode::General);
 
