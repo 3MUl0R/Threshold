@@ -74,7 +74,7 @@ async fn main() {
     let state = AppState {
         engine,
         scheduler_handle: None,
-        secret_store: Arc::new(threshold_core::SecretStore::new()),
+        secret_store: Arc::new(threshold_core::SecretStore::new().unwrap()),
         config,
         config_path,
         data_dir,

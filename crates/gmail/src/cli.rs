@@ -107,7 +107,7 @@ pub async fn handle_gmail_command(
     }
 
     let audit = audit_path.map(|p| AuditTrail::new(p.to_path_buf()));
-    let secret_store = Arc::new(SecretStore::new());
+    let secret_store = Arc::new(SecretStore::new()?);
 
     match args.command {
         GmailCommands::Auth {

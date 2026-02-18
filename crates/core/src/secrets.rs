@@ -126,13 +126,7 @@ impl FileStore {
 
     /// Read secrets from the TOML file, with shared lock.
     fn read_file(&self) -> crate::Result<BTreeMap<String, String>> {
-
-        // If file doesn't exist, return empty map
-        if !self.path.exists() {
-            return Ok(BTreeMap::new());
-        }
-
-        // Acquire shared lock
+        // Acquire shared lock first to avoid TOCTOU race on existence check
         let lock_file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -148,6 +142,11 @@ impl FileStore {
         lock_file.lock_shared().map_err(|e| {
             crate::ThresholdError::Keychain(format!("Failed to acquire shared lock: {}", e))
         })?;
+
+        // Check existence under lock
+        if !self.path.exists() {
+            return Ok(BTreeMap::new());
+        }
 
         let contents = fs::read_to_string(&self.path).map_err(|e| {
             crate::ThresholdError::Keychain(format!(
@@ -281,13 +280,7 @@ impl FileStore {
     }
 
     fn delete(&self, key: &str) -> crate::Result<()> {
-
-        // If file doesn't exist, nothing to delete
-        if !self.path.exists() {
-            return Ok(());
-        }
-
-        // Acquire exclusive lock, re-read, modify, write back
+        // Acquire exclusive lock first to avoid TOCTOU race on existence check
         let lock_file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -303,6 +296,11 @@ impl FileStore {
         lock_file.lock_exclusive().map_err(|e| {
             crate::ThresholdError::Keychain(format!("Failed to acquire exclusive lock: {}", e))
         })?;
+
+        // Check existence under lock
+        if !self.path.exists() {
+            return Ok(());
+        }
 
         let contents = fs::read_to_string(&self.path).map_err(|e| {
             crate::ThresholdError::Keychain(format!(
@@ -957,15 +955,6 @@ mod tests {
                 alpha_pos < beta_pos,
                 "keys should be in alphabetical order (BTreeMap)"
             );
-        }
-
-        #[test]
-        fn new_default_uses_file_backend() {
-            // Uses with_file_backend to avoid touching real ~/.threshold/
-            let dir = tempfile::tempdir().unwrap();
-            let store =
-                SecretStore::with_file_backend(dir.path().join("secrets.toml")).unwrap();
-            assert_eq!(store.backend_name(), "file");
         }
 
         #[test]

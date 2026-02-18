@@ -90,7 +90,7 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
     tracing::info!("Threshold starting...");
 
     // 3. Initialize secret store
-    let secrets = Arc::new(SecretStore::new());
+    let secrets = Arc::new(SecretStore::new()?);
 
     // 4. Create Claude CLI client
     let claude = Arc::new(

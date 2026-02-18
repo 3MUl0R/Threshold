@@ -55,7 +55,7 @@ pub async fn handle_imagegen_command(
             negative_prompt,
             output_dir,
         } => {
-            let secret_store = Arc::new(SecretStore::new());
+            let secret_store = Arc::new(SecretStore::new()?);
             let client = ImageGenClient::new(secret_store);
 
             let options = ImageGenOptions {
