@@ -191,11 +191,16 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
         let secrets = secrets.clone();
         async move {
             if let Some(discord_config) = discord_config_opt {
-                let token = secrets
-                    .resolve("discord-bot-token", "DISCORD_BOT_TOKEN")?
-                    .ok_or(ThresholdError::SecretNotFound {
-                        key: "discord-bot-token".into(),
-                    })?;
+                // Wrap synchronous keychain access in spawn_blocking to avoid
+                // blocking the tokio runtime (macOS keychain can prompt/hang).
+                let token = tokio::task::spawn_blocking({
+                    let secrets = secrets.clone();
+                    move || secrets.resolve("discord-bot-token", "DISCORD_BOT_TOKEN")
+                })
+                .await??
+                .ok_or(ThresholdError::SecretNotFound {
+                    key: "discord-bot-token".into(),
+                })?;
 
                 tracing::info!("Starting Discord bot...");
 

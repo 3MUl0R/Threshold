@@ -54,6 +54,8 @@ pub fn build_template_env() -> Arc<minijinja::Environment<'static>> {
     // Register custom filters
     env.add_filter("relative_time", relative_time_filter);
     env.add_filter("duration_short", duration_short_filter);
+    env.add_filter("truncate", truncate_filter);
+    env.add_filter("tojson", tojson_filter);
 
     Arc::new(env)
 }
@@ -64,6 +66,31 @@ fn relative_time_filter(value: &str) -> String {
         Ok(dt) => time::relative_time(&dt),
         Err(_) => value.to_string(),
     }
+}
+
+/// Custom filter: truncate a string to `length` chars, appending `end` if truncated.
+/// Usage: {{ value|truncate(8, true, "") }} or {{ value|truncate(20) }}
+fn truncate_filter(value: &str, length: Option<usize>, _killwords: Option<bool>, end: Option<&str>) -> String {
+    let max = length.unwrap_or(255);
+    let suffix = end.unwrap_or("...");
+    if value.len() <= max {
+        value.to_string()
+    } else {
+        let truncated: String = value.chars().take(max).collect();
+        format!("{truncated}{suffix}")
+    }
+}
+
+/// Custom filter: serialize a value to pretty-printed JSON.
+/// Usage: {{ value|tojson(indent=2) }} or {{ value|tojson }}
+fn tojson_filter(value: minijinja::Value, kwargs: minijinja::value::Kwargs) -> Result<String, minijinja::Error> {
+    let _indent: Option<usize> = kwargs.get("indent")?;
+    kwargs.assert_all_used()?;
+    // Convert to serde_json::Value for pretty printing
+    let json_val = serde_json::to_value(&value)
+        .unwrap_or(serde_json::Value::Null);
+    Ok(serde_json::to_string_pretty(&json_val)
+        .unwrap_or_else(|_| value.to_string()))
 }
 
 /// Custom filter: convert ISO timestamp to short uptime duration.

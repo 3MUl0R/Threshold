@@ -121,12 +121,16 @@ async fn credentials(State(state): State<AppState>) -> Result<impl IntoResponse,
     ];
 
     for (key, label) in &core_keys {
-        let configured = tokio::task::spawn_blocking({
-            let store = state.secret_store.clone();
-            let key = key.to_string();
-            move || store.get(&key).ok().flatten().is_some()
-        })
+        let configured = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::task::spawn_blocking({
+                let store = state.secret_store.clone();
+                let key = key.to_string();
+                move || store.get(&key).ok().flatten().is_some()
+            }),
+        )
         .await
+        .unwrap_or(Ok(false))
         .unwrap_or(false);
 
         cred_entries.push(minijinja::context! {
@@ -142,12 +146,16 @@ async fn credentials(State(state): State<AppState>) -> Result<impl IntoResponse,
             for inbox in inboxes {
                 let key = format!("gmail-oauth-refresh-token-{inbox}");
                 let label = format!("Gmail Refresh Token ({inbox})");
-                let configured = tokio::task::spawn_blocking({
-                    let store = state.secret_store.clone();
-                    let key = key.clone();
-                    move || store.get(&key).ok().flatten().is_some()
-                })
+                let configured = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    tokio::task::spawn_blocking({
+                        let store = state.secret_store.clone();
+                        let key = key.clone();
+                        move || store.get(&key).ok().flatten().is_some()
+                    }),
+                )
                 .await
+                .unwrap_or(Ok(false))
                 .unwrap_or(false);
 
                 cred_entries.push(minijinja::context! {
@@ -205,13 +213,17 @@ async fn set_credential(
         return Err(WebError::BadRequest("Credential value cannot be empty".into()));
     }
 
-    tokio::task::spawn_blocking({
-        let store = state.secret_store.clone();
-        let key = key.clone();
-        let value = form.value.clone();
-        move || store.set(&key, &value)
-    })
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::task::spawn_blocking({
+            let store = state.secret_store.clone();
+            let key = key.clone();
+            let value = form.value.clone();
+            move || store.set(&key, &value)
+        }),
+    )
     .await
+    .map_err(|_| WebError::Internal("Keychain access timed out".into()))?
     .map_err(|e| WebError::Internal(format!("spawn_blocking error: {e}")))?
     .map_err(|e| WebError::Internal(format!("Failed to set credential: {e}")))?;
 
@@ -243,12 +255,16 @@ async fn delete_credential(
         return Err(WebError::BadRequest("Invalid credential key".into()));
     }
 
-    tokio::task::spawn_blocking({
-        let store = state.secret_store.clone();
-        let key = key.clone();
-        move || store.delete(&key)
-    })
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::task::spawn_blocking({
+            let store = state.secret_store.clone();
+            let key = key.clone();
+            move || store.delete(&key)
+        }),
+    )
     .await
+    .map_err(|_| WebError::Internal("Keychain access timed out".into()))?
     .map_err(|e| WebError::Internal(format!("spawn_blocking error: {e}")))?
     .map_err(|e| WebError::Internal(format!("Failed to delete credential: {e}")))?;
 
