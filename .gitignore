@@ -5,3 +5,5 @@
 .env
 # Test artifacts from audit trail (relative path defaults)
 .threshold/
+.playwright-cli/console-*
+.playwright-cli/page-*
