@@ -3,6 +3,7 @@
 {% block title %}Conversation {{ id|truncate(8, true, "") }} — Threshold{% endblock %}
 
 {% block content %}
+<p class="breadcrumb"><a href="/conversations">Conversations</a> / {{ id|truncate(8, true, "") }}</p>
 <hgroup>
     <h2>Conversation Detail</h2>
     <p><span class="badge badge-{{ mode_badge }}">{{ mode_label }}</span></p>
@@ -77,10 +78,8 @@
     <form method="post" action="/conversations/{{ id }}/delete"
           onsubmit="return confirm('Delete this conversation? This cannot be undone.')">
         <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-        <button type="submit" class="secondary outline">Delete Conversation</button>
+        <button type="submit" class="btn-danger">Delete Conversation</button>
     </form>
 </article>
 {% endif %}
-
-<p><a href="/conversations">&larr; Back to Conversations</a></p>
 {% endblock %}

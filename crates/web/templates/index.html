@@ -5,19 +5,52 @@
 {% block content %}
 <h1>Dashboard</h1>
 
-<div class="grid">
-    <article>
-        <header>Uptime</header>
-        <p>{{ start_time | duration_short }}</p>
-    </article>
-    <article>
-        <header>Conversations</header>
-        <p>{{ conversation_count }}</p>
-    </article>
-    <article>
-        <header>Scheduled Tasks</header>
-        <p>{{ schedule_count }}</p>
-    </article>
+<div id="status-cards" hx-get="/status" hx-trigger="every 10s" hx-swap="none">
+    <div class="grid">
+        <article>
+            <header>Uptime</header>
+            <p id="stat-uptime">{{ start_time | duration_short }}</p>
+        </article>
+        <article>
+            <header>Conversations</header>
+            <p><span id="stat-conversations">{{ conversation_count }}</span>
+            {% if recently_active > 0 %}
+                <br><small class="text-muted">{{ recently_active }} active in last hour</small>
+            {% endif %}
+            </p>
+        </article>
+        <article>
+            <header>Scheduled Tasks</header>
+            <p id="stat-schedules">{{ schedule_count }}</p>
+        </article>
+    </div>
+
+    <div class="grid">
+        <article>
+            <header>Scheduler</header>
+            <p>
+                {% if scheduler_running %}
+                    <span class="status-dot status-online"></span> Running
+                {% else %}
+                    <span class="status-dot status-offline"></span> Not configured
+                {% endif %}
+            </p>
+        </article>
+        <article>
+            <header>Discord</header>
+            <p>
+                {% if discord_connected %}
+                    <span class="status-dot status-online"></span> Connected
+                {% else %}
+                    <span class="status-dot status-offline"></span> No portals
+                {% endif %}
+            </p>
+        </article>
+        <article>
+            <header>Web Interface</header>
+            <p><span class="status-dot status-online"></span> Active</p>
+        </article>
+    </div>
 </div>
 
 <h2>Quick Links</h2>
@@ -29,4 +62,22 @@
     <a href="/config" role="button" class="outline">Configuration</a>
     <a href="/config/credentials" role="button" class="outline">Credentials</a>
 </div>
+
+<script>
+// Update status cards from JSON polling response
+document.body.addEventListener('htmx:afterRequest', function(evt) {
+    if (evt.detail.pathInfo && evt.detail.pathInfo.requestPath === '/status') {
+        try {
+            var data = JSON.parse(evt.detail.xhr.responseText);
+            var el;
+            el = document.getElementById('stat-uptime');
+            if (el && data.uptime) el.textContent = data.uptime;
+            el = document.getElementById('stat-conversations');
+            if (el && data.conversation_count !== undefined) el.textContent = data.conversation_count;
+            el = document.getElementById('stat-schedules');
+            if (el && data.schedule_count !== undefined) el.textContent = data.schedule_count;
+        } catch(e) {}
+    }
+});
+</script>
 {% endblock %}
