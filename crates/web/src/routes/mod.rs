@@ -1,6 +1,7 @@
 //! Route construction — mounts all route groups and static file serving.
 
 pub mod audit;
+pub mod config;
 pub mod conversations;
 pub mod index;
 pub mod logs;
@@ -22,6 +23,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(schedules::router())
         .merge(audit::router())
         .merge(logs::router())
+        .merge(config::router())
         .nest_service("/static", static_service)
         .with_state(state)
 }

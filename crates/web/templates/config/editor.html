@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+
+{% block title %}Config — Threshold{% endblock %}
+
+{% block content %}
+<h2>Configuration</h2>
+
+<article>
+    <header>
+        Config File: <code>{{ config_path }}</code>
+        <br><small style="color: var(--pico-muted-color)">Changes require a daemon restart to take effect.</small>
+    </header>
+
+    <form method="post" action="/config">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <textarea name="config_toml" rows="30" style="font-family: monospace; font-size: 0.85rem;">{{ config_toml }}</textarea>
+        <div class="grid">
+            <div>
+                <button type="submit">Save Config</button>
+            </div>
+            <div>
+                <a href="/config/credentials" role="button" class="outline">Manage Credentials</a>
+            </div>
+        </div>
+    </form>
+</article>
+{% endblock %}

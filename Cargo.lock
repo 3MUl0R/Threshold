@@ -2558,6 +2558,7 @@ dependencies = [
  "threshold-scheduler",
  "tokio",
  "tokio-util",
+ "toml",
  "tower",
  "tower-http",
  "tracing",

@@ -45,6 +45,12 @@ pub fn build_template_env() -> Arc<minijinja::Environment<'static>> {
     env.add_template_owned("logs/entries_partial.html".to_string(), include_str!("../templates/logs/entries_partial.html").to_string())
         .expect("logs/entries_partial.html template");
 
+    // Config templates
+    env.add_template_owned("config/editor.html".to_string(), include_str!("../templates/config/editor.html").to_string())
+        .expect("config/editor.html template");
+    env.add_template_owned("config/credentials.html".to_string(), include_str!("../templates/config/credentials.html").to_string())
+        .expect("config/credentials.html template");
+
     // Register custom filters
     env.add_filter("relative_time", relative_time_filter);
     env.add_filter("duration_short", duration_short_filter);

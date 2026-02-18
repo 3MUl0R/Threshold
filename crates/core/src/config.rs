@@ -167,7 +167,7 @@ impl ThresholdConfig {
     }
 
     /// Validate required fields and enum values.
-    fn validate(&self) -> crate::Result<()> {
+    pub fn validate(&self) -> crate::Result<()> {
         if let Some(level) = &self.log_level {
             match level.as_str() {
                 "trace" | "debug" | "info" | "warn" | "error" => {}
