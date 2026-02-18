@@ -138,24 +138,31 @@ If nothing needs attention, reply: \"Heartbeat OK — nothing requires attention
 (Agent: update this section with timestamps when you complete work during heartbeats)
 ";
 
+/// Valid minute-level intervals — divisors of 60 that produce even cadence.
+const VALID_MINUTE_INTERVALS: &[u64] = &[1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30];
+
 /// Build a cron expression for heartbeat with phase-shift jitter.
 ///
 /// Uses the conversation ID as a deterministic jitter source to spread
 /// heartbeats across time and avoid simultaneous firing.
 ///
-/// Panics are avoided: `interval_minutes` is clamped to a minimum of 1.
-fn heartbeat_cron(interval_minutes: u64, conversation_id: &ConversationId) -> String {
+/// Returns `None` for intervals that can't produce even cadence in cron:
+/// minute-level intervals must divide evenly into 60, and intervals >= 60
+/// must be exact multiples of 60.
+fn heartbeat_cron(interval_minutes: u64, conversation_id: &ConversationId) -> Option<String> {
     let interval = interval_minutes.max(1);
     if interval >= 60 && interval % 60 == 0 {
         let hours = interval / 60;
         // Hour-level intervals with jitter on the minute (0..59)
         let jitter = (conversation_id.0.as_u128() % 60) as u64;
-        format!("0 {} */{} * * * *", jitter, hours)
+        Some(format!("0 {} */{} * * * *", jitter, hours))
+    } else if VALID_MINUTE_INTERVALS.contains(&interval) {
+        // Minute-level intervals with phase-shifted start
+        let jitter = (conversation_id.0.as_u128() % interval as u128) as u64;
+        Some(format!("0 {}/{} * * * * *", jitter, interval))
     } else {
-        // Minute-level intervals: clamp jitter to valid range (0..min(interval, 60))
-        let jitter_range = interval.min(60);
-        let jitter = (conversation_id.0.as_u128() % jitter_range as u128) as u64;
-        format!("0 {}/{} * * * * *", jitter, interval)
+        // Non-divisor intervals produce irregular cadence at hour boundaries
+        None
     }
 }
 
@@ -217,7 +224,20 @@ pub async fn heartbeat(
                 ctx.say("Interval must be at least 1 minute.").await.ok();
                 return Ok(());
             }
-            let cron_expr = heartbeat_cron(interval_minutes, &conversation_id);
+            let cron_expr = match heartbeat_cron(interval_minutes, &conversation_id) {
+                Some(expr) => expr,
+                None => {
+                    ctx.say(format!(
+                        "Interval of {} minutes cannot be expressed as a cron schedule. \
+                         Use a value that divides evenly into 60 (e.g., 5, 10, 15, 30) \
+                         or a multiple of 60 (e.g., 60, 120, 180).",
+                        interval_minutes,
+                    ))
+                    .await
+                    .ok();
+                    return Ok(());
+                }
+            };
 
             // Create heartbeat.md if it doesn't exist
             let data_dir = ctx.data().engine.data_dir();
@@ -360,7 +380,7 @@ mod tests {
     #[test]
     fn heartbeat_cron_30_minute_interval() {
         let conv_id = ConversationId(uuid::Uuid::nil());
-        let cron = heartbeat_cron(30, &conv_id);
+        let cron = heartbeat_cron(30, &conv_id).unwrap();
         // nil UUID → 0 % 30 = 0 jitter → starts at minute 0
         assert_eq!(cron, "0 0/30 * * * * *");
     }
@@ -370,7 +390,7 @@ mod tests {
         // Use a specific UUID that produces non-zero jitter
         let uuid = uuid::Uuid::from_u128(17);
         let conv_id = ConversationId(uuid);
-        let cron = heartbeat_cron(30, &conv_id);
+        let cron = heartbeat_cron(30, &conv_id).unwrap();
         // 17 % 30 = 17 → starts at minute 17
         assert_eq!(cron, "0 17/30 * * * * *");
     }
@@ -378,7 +398,7 @@ mod tests {
     #[test]
     fn heartbeat_cron_hourly() {
         let conv_id = ConversationId(uuid::Uuid::nil());
-        let cron = heartbeat_cron(60, &conv_id);
+        let cron = heartbeat_cron(60, &conv_id).unwrap();
         // 60-min interval → hourly, 0 % 60 = 0
         assert_eq!(cron, "0 0 */1 * * * *");
     }
@@ -387,7 +407,7 @@ mod tests {
     fn heartbeat_cron_2_hours_with_jitter() {
         let uuid = uuid::Uuid::from_u128(75);
         let conv_id = ConversationId(uuid);
-        let cron = heartbeat_cron(120, &conv_id);
+        let cron = heartbeat_cron(120, &conv_id).unwrap();
         // 120-min interval → 2-hourly, 75 % 60 = 15
         assert_eq!(cron, "0 15 */2 * * * *");
     }
@@ -396,7 +416,7 @@ mod tests {
     fn heartbeat_cron_15_minute_interval() {
         let uuid = uuid::Uuid::from_u128(7);
         let conv_id = ConversationId(uuid);
-        let cron = heartbeat_cron(15, &conv_id);
+        let cron = heartbeat_cron(15, &conv_id).unwrap();
         // 7 % 15 = 7 → starts at minute 7
         assert_eq!(cron, "0 7/15 * * * * *");
     }
@@ -404,19 +424,28 @@ mod tests {
     #[test]
     fn heartbeat_cron_zero_interval_clamped_to_1() {
         let conv_id = ConversationId(uuid::Uuid::nil());
-        let cron = heartbeat_cron(0, &conv_id);
-        // 0 is clamped to 1, jitter range = min(1,60) = 1, 0 % 1 = 0
+        let cron = heartbeat_cron(0, &conv_id).unwrap();
+        // 0 is clamped to 1, jitter range = 1, 0 % 1 = 0
         assert_eq!(cron, "0 0/1 * * * * *");
     }
 
     #[test]
-    fn heartbeat_cron_non_divisor_90_minutes() {
-        let uuid = uuid::Uuid::from_u128(100);
-        let conv_id = ConversationId(uuid);
-        let cron = heartbeat_cron(90, &conv_id);
-        // 90 < 60? No. 90 % 60 != 0, so minute path.
-        // jitter_range = min(90, 60) = 60, 100 % 60 = 40
-        assert_eq!(cron, "0 40/90 * * * * *");
+    fn heartbeat_cron_non_expressible_returns_none() {
+        let conv_id = ConversationId(uuid::Uuid::nil());
+        // 90 minutes: > 59 and not a multiple of 60
+        assert!(heartbeat_cron(90, &conv_id).is_none());
+        // 45 minutes: doesn't divide evenly into 60 (irregular cadence)
+        assert!(heartbeat_cron(45, &conv_id).is_none());
+        // 75 minutes: > 59 and not a multiple of 60
+        assert!(heartbeat_cron(75, &conv_id).is_none());
+        // 7 minutes: not a divisor of 60
+        assert!(heartbeat_cron(7, &conv_id).is_none());
+        // Valid divisors of 60
+        assert!(heartbeat_cron(5, &conv_id).is_some());
+        assert!(heartbeat_cron(10, &conv_id).is_some());
+        assert!(heartbeat_cron(15, &conv_id).is_some());
+        assert!(heartbeat_cron(20, &conv_id).is_some());
+        assert!(heartbeat_cron(30, &conv_id).is_some());
     }
 
     #[test]
