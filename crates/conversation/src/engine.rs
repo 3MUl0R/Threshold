@@ -7,7 +7,7 @@ use crate::portals::PortalRegistry;
 use crate::store::ConversationStore;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use threshold_cli_wrapper::ClaudeClient;
 use threshold_cli_wrapper::response::Usage;
@@ -68,6 +68,7 @@ pub struct ConversationEngine {
     agents: HashMap<String, AgentConfig>,
     event_tx: broadcast::Sender<ConversationEvent>,
     audit_dir: PathBuf,
+    data_dir: PathBuf,
     /// Tool-availability section to prepend to system prompts (from build_tool_prompt).
     tool_prompt: Option<String>,
 }
@@ -113,6 +114,7 @@ impl ConversationEngine {
             agents,
             event_tx,
             audit_dir,
+            data_dir,
             tool_prompt,
         })
     }
@@ -163,6 +165,63 @@ impl ConversationEngine {
         }
     }
 
+    /// Build the memory prompt supplement for a conversation.
+    ///
+    /// Reads the conversation's `memory.md` file and formats it as a system
+    /// prompt supplement. Returns `None` if the file doesn't exist or is empty.
+    /// Truncates at 4KB with a notice if the file is larger.
+    fn build_memory_prompt(
+        conversation_id: &ConversationId,
+        data_dir: &Path,
+    ) -> Option<String> {
+        let memory_path = data_dir
+            .join("conversations")
+            .join(conversation_id.0.to_string())
+            .join("memory.md");
+
+        let memory_contents = std::fs::read_to_string(&memory_path).unwrap_or_default();
+        if memory_contents.is_empty() {
+            return None;
+        }
+
+        // Truncate if over 4KB (UTF-8 safe — find nearest char boundary)
+        let (contents, truncated) = if memory_contents.len() > 4096 {
+            let boundary = memory_contents.floor_char_boundary(4096);
+            (&memory_contents[..boundary], true)
+        } else {
+            (memory_contents.as_str(), false)
+        };
+
+        let mut prompt = format!(
+            "### Conversation Memory\n\
+             Your persistent memory file is at: {path}\n\
+             This file persists across session resets. Update it when you make important \
+             decisions, complete milestones, or need to preserve information across sessions.\n\n\
+             Current contents:\n{contents}",
+            path = memory_path.display(),
+            contents = contents,
+        );
+
+        if truncated {
+            prompt.push_str(&format!(
+                "\n\n[Memory truncated — full file at {}. Read it directly for complete context.]",
+                memory_path.display()
+            ));
+        }
+
+        Some(prompt)
+    }
+
+    /// Combine a base system prompt with a memory prompt supplement.
+    fn combine_prompts(base: Option<&str>, memory: Option<&str>) -> Option<String> {
+        match (base, memory) {
+            (Some(b), Some(m)) => Some(format!("{}\n\n{}", b, m)),
+            (Some(b), None) => Some(b.to_string()),
+            (None, Some(m)) => Some(m.to_string()),
+            (None, None) => None,
+        }
+    }
+
     /// Subscribe to conversation events
     pub fn subscribe(&self) -> broadcast::Receiver<ConversationEvent> {
         self.event_tx.subscribe()
@@ -195,8 +254,13 @@ impl ConversationEngine {
         })?;
 
         let effective_prompt = self.effective_system_prompt(agent);
+        let memory_prompt = Self::build_memory_prompt(&conversation_id, &self.data_dir);
+        let combined_prompt = Self::combine_prompts(
+            effective_prompt.as_deref(),
+            memory_prompt.as_deref(),
+        );
         let (system_prompt, model) = match &cli_provider {
-            CliProvider::Claude { model } => (effective_prompt.as_deref(), model.as_str()),
+            CliProvider::Claude { model } => (combined_prompt.as_deref(), model.as_str()),
         };
 
         // 4. Write user message to audit trail
@@ -561,8 +625,13 @@ impl ConversationEngine {
             .ok_or_else(|| ThresholdError::Config(format!("Agent '{}' not found", agent_id)))?;
 
         let effective_prompt = self.effective_system_prompt(agent);
+        let memory_prompt = Self::build_memory_prompt(conversation_id, &self.data_dir);
+        let combined_prompt = Self::combine_prompts(
+            effective_prompt.as_deref(),
+            memory_prompt.as_deref(),
+        );
         let (system_prompt, model) = match &cli_provider {
-            CliProvider::Claude { model } => (effective_prompt.as_deref(), model.as_str()),
+            CliProvider::Claude { model } => (combined_prompt.as_deref(), model.as_str()),
         };
 
         // Call Claude
@@ -797,5 +866,120 @@ mod tests {
         let agent = engine.resolve_agent_for_mode(&ConversationMode::General);
 
         assert_eq!(agent.id, "default");
+    }
+
+    #[tokio::test]
+    async fn build_memory_prompt_returns_none_for_missing_file() {
+        let dir = tempdir().unwrap();
+        let conv_id = ConversationId::new();
+
+        let result = ConversationEngine::build_memory_prompt(&conv_id, dir.path());
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn build_memory_prompt_returns_none_for_empty_file() {
+        let dir = tempdir().unwrap();
+        let conv_id = ConversationId::new();
+
+        let conv_dir = dir
+            .path()
+            .join("conversations")
+            .join(conv_id.0.to_string());
+        std::fs::create_dir_all(&conv_dir).unwrap();
+        std::fs::write(conv_dir.join("memory.md"), "").unwrap();
+
+        let result = ConversationEngine::build_memory_prompt(&conv_id, dir.path());
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn build_memory_prompt_includes_content() {
+        let dir = tempdir().unwrap();
+        let conv_id = ConversationId::new();
+
+        let conv_dir = dir
+            .path()
+            .join("conversations")
+            .join(conv_id.0.to_string());
+        std::fs::create_dir_all(&conv_dir).unwrap();
+        std::fs::write(conv_dir.join("memory.md"), "# My Memory\nSome notes here").unwrap();
+
+        let result = ConversationEngine::build_memory_prompt(&conv_id, dir.path()).unwrap();
+        assert!(result.contains("### Conversation Memory"));
+        assert!(result.contains("# My Memory"));
+        assert!(result.contains("Some notes here"));
+        assert!(result.contains("memory.md"));
+        // Should NOT contain truncation notice
+        assert!(!result.contains("Memory truncated"));
+    }
+
+    #[tokio::test]
+    async fn build_memory_prompt_truncates_at_4kb() {
+        let dir = tempdir().unwrap();
+        let conv_id = ConversationId::new();
+
+        let conv_dir = dir
+            .path()
+            .join("conversations")
+            .join(conv_id.0.to_string());
+        std::fs::create_dir_all(&conv_dir).unwrap();
+
+        // Write content larger than 4KB
+        let large_content = "x".repeat(5000);
+        std::fs::write(conv_dir.join("memory.md"), &large_content).unwrap();
+
+        let result = ConversationEngine::build_memory_prompt(&conv_id, dir.path()).unwrap();
+        // Should contain truncation notice
+        assert!(result.contains("Memory truncated"));
+        assert!(result.contains("Read it directly for complete context"));
+        // Should NOT contain all 5000 bytes of content
+        assert!(result.len() < 5000 + 500); // prompt overhead
+    }
+
+    #[tokio::test]
+    async fn build_memory_prompt_truncation_utf8_safe() {
+        let dir = tempdir().unwrap();
+        let conv_id = ConversationId::new();
+
+        let conv_dir = dir
+            .path()
+            .join("conversations")
+            .join(conv_id.0.to_string());
+        std::fs::create_dir_all(&conv_dir).unwrap();
+
+        // Write content with multibyte characters that would be split at 4096
+        // Each emoji is 4 bytes, so 1024 emojis = 4096 bytes exactly
+        // Add one more to go over the limit
+        let content = "\u{1F600}".repeat(1025); // 4100 bytes
+        std::fs::write(conv_dir.join("memory.md"), &content).unwrap();
+
+        // This should NOT panic even though 4096 falls on a char boundary issue
+        let result = ConversationEngine::build_memory_prompt(&conv_id, dir.path()).unwrap();
+        assert!(result.contains("Memory truncated"));
+    }
+
+    #[test]
+    fn combine_prompts_both_present() {
+        let result = ConversationEngine::combine_prompts(Some("base"), Some("memory"));
+        assert_eq!(result, Some("base\n\nmemory".to_string()));
+    }
+
+    #[test]
+    fn combine_prompts_base_only() {
+        let result = ConversationEngine::combine_prompts(Some("base"), None);
+        assert_eq!(result, Some("base".to_string()));
+    }
+
+    #[test]
+    fn combine_prompts_memory_only() {
+        let result = ConversationEngine::combine_prompts(None, Some("memory"));
+        assert_eq!(result, Some("memory".to_string()));
+    }
+
+    #[test]
+    fn combine_prompts_neither() {
+        let result = ConversationEngine::combine_prompts(None, None);
+        assert!(result.is_none());
     }
 }

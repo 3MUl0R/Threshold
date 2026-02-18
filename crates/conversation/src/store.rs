@@ -15,6 +15,7 @@ struct ConversationMap {
 pub struct ConversationStore {
     conversations: HashMap<ConversationId, Conversation>,
     state_path: PathBuf,
+    data_dir: PathBuf,
 }
 
 impl ConversationStore {
@@ -26,6 +27,7 @@ impl ConversationStore {
             return Ok(Self {
                 conversations: HashMap::new(),
                 state_path,
+                data_dir: data_dir.to_path_buf(),
             });
         }
 
@@ -54,6 +56,7 @@ impl ConversationStore {
         Ok(Self {
             conversations: map.conversations,
             state_path,
+            data_dir: data_dir.to_path_buf(),
         })
     }
 
@@ -87,7 +90,10 @@ impl ConversationStore {
         Ok(())
     }
 
-    /// Create a new conversation and return its ID
+    /// Create a new conversation and return its ID.
+    ///
+    /// Also creates the conversation directory (`conversations/{id}/`) and seeds
+    /// `memory.md` with mode-appropriate defaults.
     pub fn create(
         &mut self,
         mode: ConversationMode,
@@ -105,7 +111,12 @@ impl ConversationStore {
         };
 
         let id = conversation.id;
+        let conv_mode = conversation.mode.clone();
         self.conversations.insert(id, conversation);
+
+        // Create conversation directory and seed memory file
+        self.ensure_conversation_dir(&id, &conv_mode);
+
         id
     }
 
@@ -132,7 +143,9 @@ impl ConversationStore {
 
     /// Get or create the singleton General conversation
     ///
-    /// Returns (conversation_id, was_created) tuple
+    /// Returns (conversation_id, was_created) tuple.
+    /// Also ensures the conversation directory and memory file exist,
+    /// even for pre-existing General conversations from before Milestone 12.
     pub fn get_or_create_general(
         &mut self,
         agent_id: String,
@@ -140,12 +153,89 @@ impl ConversationStore {
     ) -> (ConversationId, bool) {
         // Check if General already exists
         if let Some(conv) = self.find_by_mode(&ConversationMode::General) {
-            return (conv.id, false);
+            let id = conv.id;
+            // Ensure directory exists (backfill for pre-existing conversations)
+            self.ensure_conversation_dir(&id, &ConversationMode::General);
+            return (id, false);
         }
 
-        // Create it
+        // Create it (create() handles directory + seeding)
         let id = self.create(ConversationMode::General, cli_provider, agent_id);
         (id, true)
+    }
+
+    /// Create the conversation directory and seed memory.md if it doesn't exist.
+    fn ensure_conversation_dir(&self, id: &ConversationId, mode: &ConversationMode) {
+        let conv_dir = self
+            .data_dir
+            .join("conversations")
+            .join(id.0.to_string());
+
+        if let Err(e) = std::fs::create_dir_all(&conv_dir) {
+            tracing::warn!(
+                conversation_id = %id.0,
+                error = %e,
+                "failed to create conversation directory"
+            );
+            return;
+        }
+
+        let memory_path = conv_dir.join("memory.md");
+        if !memory_path.exists() {
+            let content = Self::default_memory_content(mode);
+            if let Err(e) = std::fs::write(&memory_path, content) {
+                tracing::warn!(
+                    conversation_id = %id.0,
+                    error = %e,
+                    "failed to seed memory.md"
+                );
+            }
+        }
+    }
+
+    /// Generate default memory.md content based on conversation mode.
+    pub fn default_memory_content(mode: &ConversationMode) -> String {
+        match mode {
+            ConversationMode::Coding { project } => format!(
+                "# Conversation Memory\n\
+                 \n\
+                 ## Project\n\
+                 {project}\n\
+                 \n\
+                 ## Tools & Workflows\n\
+                 - **Codex CLI** — Use for all review cycles (planning, code, architecture). Run until all findings resolved.\n\
+                 \x20 ```bash\n\
+                 \x20 codex exec --full-auto \"your prompt\"\n\
+                 \x20 codex exec resume <session-id> --full-auto \"follow-up prompt\"\n\
+                 \x20 ```\n\
+                 - **Playwright CLI** — Use for browser access, end-to-end testing, and tasks beyond normal web tools.\n\
+                 \x20 ```bash\n\
+                 \x20 playwright-cli --help\n\
+                 \x20 ```\n\
+                 \n\
+                 ## Notes\n\
+                 (Agent: update this section as you work. Record decisions, progress, blockers, and anything important to remember across sessions.)\n"
+            ),
+            ConversationMode::Research { topic } => format!(
+                "# Conversation Memory\n\
+                 \n\
+                 ## Topic\n\
+                 {topic}\n\
+                 \n\
+                 ## Notes\n\
+                 (Agent: update this section as you work. Record findings, sources, key conclusions, and anything important to remember across sessions.)\n"
+            ),
+            ConversationMode::General => "# Conversation Memory\n\
+                 \n\
+                 ## Notes\n\
+                 (Agent: update this section as you work. Record anything important to remember across sessions.)\n"
+                .to_string(),
+        }
+    }
+
+    /// Get the data directory path
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
     }
 }
 
@@ -307,6 +397,188 @@ mod tests {
 
         let store = ConversationStore::load(dir.path()).await.unwrap();
         assert_eq!(store.list().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn create_creates_conversation_directory() {
+        let dir = tempdir().unwrap();
+        let mut store = ConversationStore::load(dir.path()).await.unwrap();
+
+        let id = store.create(
+            ConversationMode::General,
+            CliProvider::Claude {
+                model: "sonnet".to_string(),
+            },
+            "default".to_string(),
+        );
+
+        let conv_dir = dir.path().join("conversations").join(id.0.to_string());
+        assert!(conv_dir.exists(), "conversation directory should be created");
+        assert!(conv_dir.is_dir());
+    }
+
+    #[tokio::test]
+    async fn create_seeds_memory_file_general() {
+        let dir = tempdir().unwrap();
+        let mut store = ConversationStore::load(dir.path()).await.unwrap();
+
+        let id = store.create(
+            ConversationMode::General,
+            CliProvider::Claude {
+                model: "sonnet".to_string(),
+            },
+            "default".to_string(),
+        );
+
+        let memory_path = dir
+            .path()
+            .join("conversations")
+            .join(id.0.to_string())
+            .join("memory.md");
+        assert!(memory_path.exists(), "memory.md should be seeded");
+
+        let content = std::fs::read_to_string(&memory_path).unwrap();
+        assert!(content.contains("# Conversation Memory"));
+        assert!(content.contains("## Notes"));
+        // General mode should NOT have Project or Topic sections
+        assert!(!content.contains("## Project"));
+        assert!(!content.contains("## Topic"));
+    }
+
+    #[tokio::test]
+    async fn create_seeds_memory_file_coding() {
+        let dir = tempdir().unwrap();
+        let mut store = ConversationStore::load(dir.path()).await.unwrap();
+
+        let id = store.create(
+            ConversationMode::Coding {
+                project: "threshold".to_string(),
+            },
+            CliProvider::Claude {
+                model: "opus".to_string(),
+            },
+            "coder".to_string(),
+        );
+
+        let memory_path = dir
+            .path()
+            .join("conversations")
+            .join(id.0.to_string())
+            .join("memory.md");
+        let content = std::fs::read_to_string(&memory_path).unwrap();
+        assert!(content.contains("## Project"));
+        assert!(content.contains("threshold"));
+        assert!(content.contains("Codex CLI"));
+        assert!(content.contains("Playwright CLI"));
+    }
+
+    #[tokio::test]
+    async fn create_seeds_memory_file_research() {
+        let dir = tempdir().unwrap();
+        let mut store = ConversationStore::load(dir.path()).await.unwrap();
+
+        let id = store.create(
+            ConversationMode::Research {
+                topic: "quantum computing".to_string(),
+            },
+            CliProvider::Claude {
+                model: "sonnet".to_string(),
+            },
+            "default".to_string(),
+        );
+
+        let memory_path = dir
+            .path()
+            .join("conversations")
+            .join(id.0.to_string())
+            .join("memory.md");
+        let content = std::fs::read_to_string(&memory_path).unwrap();
+        assert!(content.contains("## Topic"));
+        assert!(content.contains("quantum computing"));
+    }
+
+    #[tokio::test]
+    async fn get_or_create_general_backfills_directory() {
+        let dir = tempdir().unwrap();
+        let mut store = ConversationStore::load(dir.path()).await.unwrap();
+
+        // First call creates
+        let (id, _) = store.get_or_create_general(
+            "default".to_string(),
+            CliProvider::Claude {
+                model: "sonnet".to_string(),
+            },
+        );
+
+        // Delete the directory to simulate pre-M12 conversation
+        let conv_dir = dir.path().join("conversations").join(id.0.to_string());
+        std::fs::remove_dir_all(&conv_dir).unwrap();
+        assert!(!conv_dir.exists());
+
+        // Second call should backfill
+        let (id2, was_created) = store.get_or_create_general(
+            "default".to_string(),
+            CliProvider::Claude {
+                model: "sonnet".to_string(),
+            },
+        );
+        assert!(!was_created);
+        assert_eq!(id, id2);
+        assert!(conv_dir.exists(), "directory should be backfilled");
+        assert!(conv_dir.join("memory.md").exists());
+    }
+
+    #[tokio::test]
+    async fn create_does_not_overwrite_existing_memory() {
+        let dir = tempdir().unwrap();
+        let mut store = ConversationStore::load(dir.path()).await.unwrap();
+
+        let id = store.create(
+            ConversationMode::General,
+            CliProvider::Claude {
+                model: "sonnet".to_string(),
+            },
+            "default".to_string(),
+        );
+
+        // Write custom content to memory file
+        let memory_path = dir
+            .path()
+            .join("conversations")
+            .join(id.0.to_string())
+            .join("memory.md");
+        std::fs::write(&memory_path, "# Custom memory content").unwrap();
+
+        // Calling get_or_create_general should NOT overwrite
+        let (_, _) = store.get_or_create_general(
+            "default".to_string(),
+            CliProvider::Claude {
+                model: "sonnet".to_string(),
+            },
+        );
+
+        let content = std::fs::read_to_string(&memory_path).unwrap();
+        assert_eq!(content, "# Custom memory content");
+    }
+
+    #[tokio::test]
+    async fn default_memory_content_coding_includes_project() {
+        let content = ConversationStore::default_memory_content(&ConversationMode::Coding {
+            project: "my-app".to_string(),
+        });
+        assert!(content.starts_with("# Conversation Memory"));
+        assert!(content.contains("my-app"));
+        assert!(content.contains("codex exec"));
+        assert!(content.contains("playwright-cli"));
+    }
+
+    #[tokio::test]
+    async fn default_memory_content_research_includes_topic() {
+        let content = ConversationStore::default_memory_content(&ConversationMode::Research {
+            topic: "AI safety".to_string(),
+        });
+        assert!(content.contains("AI safety"));
+        assert!(content.contains("## Topic"));
     }
 
     #[cfg(unix)]
