@@ -142,15 +142,20 @@ If nothing needs attention, reply: \"Heartbeat OK — nothing requires attention
 ///
 /// Uses the conversation ID as a deterministic jitter source to spread
 /// heartbeats across time and avoid simultaneous firing.
+///
+/// Panics are avoided: `interval_minutes` is clamped to a minimum of 1.
 fn heartbeat_cron(interval_minutes: u64, conversation_id: &ConversationId) -> String {
-    let jitter = (conversation_id.0.as_u128() % interval_minutes as u128) as u64;
-    if interval_minutes >= 60 && interval_minutes % 60 == 0 {
-        let hours = interval_minutes / 60;
-        // Hour-level intervals with jitter on the minute
-        format!("0 {} */{} * * * *", jitter % 60, hours)
+    let interval = interval_minutes.max(1);
+    if interval >= 60 && interval % 60 == 0 {
+        let hours = interval / 60;
+        // Hour-level intervals with jitter on the minute (0..59)
+        let jitter = (conversation_id.0.as_u128() % 60) as u64;
+        format!("0 {} */{} * * * *", jitter, hours)
     } else {
-        // Minute-level intervals with phase-shifted start
-        format!("0 {}/{} * * * * *", jitter, interval_minutes)
+        // Minute-level intervals: clamp jitter to valid range (0..min(interval, 60))
+        let jitter_range = interval.min(60);
+        let jitter = (conversation_id.0.as_u128() % jitter_range as u128) as u64;
+        format!("0 {}/{} * * * * *", jitter, interval)
     }
 }
 
@@ -208,6 +213,10 @@ pub async fn heartbeat(
             }
 
             let interval_minutes = interval.unwrap_or(30);
+            if interval_minutes == 0 {
+                ctx.say("Interval must be at least 1 minute.").await.ok();
+                return Ok(());
+            }
             let cron_expr = heartbeat_cron(interval_minutes, &conversation_id);
 
             // Create heartbeat.md if it doesn't exist
@@ -218,10 +227,22 @@ pub async fn heartbeat(
             let heartbeat_path = conv_dir.join("heartbeat.md");
             if !heartbeat_path.exists() {
                 if let Err(e) = std::fs::create_dir_all(&conv_dir) {
-                    tracing::warn!("Failed to create conversation dir: {}", e);
+                    ctx.say(format!("Failed to create conversation directory: {}", e))
+                        .await
+                        .ok();
+                    return Err(ThresholdError::IoError {
+                        path: conv_dir.display().to_string(),
+                        message: e.to_string(),
+                    });
                 }
                 if let Err(e) = std::fs::write(&heartbeat_path, DEFAULT_HEARTBEAT_CONTENT) {
-                    tracing::warn!("Failed to write heartbeat.md: {}", e);
+                    ctx.say(format!("Failed to write heartbeat.md: {}", e))
+                        .await
+                        .ok();
+                    return Err(ThresholdError::IoError {
+                        path: heartbeat_path.display().to_string(),
+                        message: e.to_string(),
+                    });
                 }
             }
 
@@ -340,7 +361,7 @@ mod tests {
     fn heartbeat_cron_30_minute_interval() {
         let conv_id = ConversationId(uuid::Uuid::nil());
         let cron = heartbeat_cron(30, &conv_id);
-        // nil UUID → 0 jitter → starts at minute 0
+        // nil UUID → 0 % 30 = 0 jitter → starts at minute 0
         assert_eq!(cron, "0 0/30 * * * * *");
     }
 
@@ -378,6 +399,24 @@ mod tests {
         let cron = heartbeat_cron(15, &conv_id);
         // 7 % 15 = 7 → starts at minute 7
         assert_eq!(cron, "0 7/15 * * * * *");
+    }
+
+    #[test]
+    fn heartbeat_cron_zero_interval_clamped_to_1() {
+        let conv_id = ConversationId(uuid::Uuid::nil());
+        let cron = heartbeat_cron(0, &conv_id);
+        // 0 is clamped to 1, jitter range = min(1,60) = 1, 0 % 1 = 0
+        assert_eq!(cron, "0 0/1 * * * * *");
+    }
+
+    #[test]
+    fn heartbeat_cron_non_divisor_90_minutes() {
+        let uuid = uuid::Uuid::from_u128(100);
+        let conv_id = ConversationId(uuid);
+        let cron = heartbeat_cron(90, &conv_id);
+        // 90 < 60? No. 90 % 60 != 0, so minute path.
+        // jitter_range = min(90, 60) = 60, 100 % 60 = 40
+        assert_eq!(cron, "0 40/90 * * * * *");
     }
 
     #[test]
