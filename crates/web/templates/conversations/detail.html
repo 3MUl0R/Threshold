@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+
+{% block title %}Conversation {{ id|truncate(8, true, "") }} — Threshold{% endblock %}
+
+{% block content %}
+<hgroup>
+    <h2>Conversation Detail</h2>
+    <p><span class="badge badge-{{ mode_badge }}">{{ mode_label }}</span></p>
+</hgroup>
+
+<article>
+    <header>Metadata</header>
+    <div class="grid">
+        <div>
+            <strong>ID:</strong><br>
+            <code>{{ id }}</code>
+        </div>
+        <div>
+            <strong>Agent:</strong><br>
+            {{ agent_id }}
+        </div>
+    </div>
+    <div class="grid">
+        <div>
+            <strong>Created:</strong><br>
+            {{ created_at|relative_time }}
+        </div>
+        <div>
+            <strong>Last Active:</strong><br>
+            {{ last_active|relative_time }}
+        </div>
+    </div>
+</article>
+
+{% if portals %}
+<article>
+    <header>Connected Portals ({{ portals|length }})</header>
+    <table>
+        <thead>
+            <tr>
+                <th>Type</th>
+                <th>Connected</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for portal in portals %}
+            <tr>
+                <td>{{ portal.portal_type }}</td>
+                <td>{{ portal.connected_at|relative_time }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</article>
+{% endif %}
+
+{% if memory_preview %}
+<article>
+    <header>Memory Preview</header>
+    <pre><code>{{ memory_preview }}</code></pre>
+</article>
+{% endif %}
+
+<article>
+    <header>Audit Trail</header>
+    <div id="audit-entries"
+         hx-get="/conversations/{{ id }}/audit?offset=0&limit=25"
+         hx-trigger="load"
+         hx-swap="innerHTML">
+        <p class="htmx-indicator" aria-busy="true">Loading audit trail...</p>
+    </div>
+</article>
+
+{% if not is_general %}
+<article>
+    <header>Danger Zone</header>
+    <form method="post" action="/conversations/{{ id }}/delete"
+          onsubmit="return confirm('Delete this conversation? This cannot be undone.')">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <button type="submit" class="secondary outline">Delete Conversation</button>
+    </form>
+</article>
+{% endif %}
+
+<p><a href="/conversations">&larr; Back to Conversations</a></p>
+{% endblock %}

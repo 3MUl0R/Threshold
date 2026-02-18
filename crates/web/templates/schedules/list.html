@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+
+{% block title %}Schedules — Threshold{% endblock %}
+
+{% block content %}
+<h2>Scheduled Tasks</h2>
+
+{% if tasks %}
+<figure>
+<table>
+    <thead>
+        <tr>
+            <th>Name</th>
+            <th>Kind</th>
+            <th>Schedule</th>
+            <th>Action</th>
+            <th>Enabled</th>
+            <th>Next Run</th>
+            <th>Last Run</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for task in tasks %}
+        <tr>
+            <td>
+                {{ task.name }}
+                {% if task.conversation_id %}
+                <br><small><a href="/conversations/{{ task.conversation_id }}">{{ task.conversation_id|truncate(8, true, "") }}</a></small>
+                {% endif %}
+            </td>
+            <td><span class="badge badge-{{ task.kind_badge }}">{{ task.kind_label }}</span></td>
+            <td><code>{{ task.cron_expression }}</code></td>
+            <td><small>{{ task.action_summary }}</small></td>
+            <td>
+                <form method="post" action="/schedules/{{ task.id }}/toggle" style="display:inline">
+                    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+                    <button type="submit" class="toggle-btn" title="Toggle enabled/disabled">
+                        {% if task.enabled %}&#9989;{% else %}&#10060;{% endif %}
+                    </button>
+                </form>
+            </td>
+            <td>{% if task.next_run %}{{ task.next_run|relative_time }}{% else %}&mdash;{% endif %}</td>
+            <td>
+                {% if task.last_run %}
+                    {{ task.last_run|relative_time }}
+                    {% if task.last_result_summary %}
+                    <br><small>{{ task.last_result_summary }}</small>
+                    {% endif %}
+                {% else %}
+                    &mdash;
+                {% endif %}
+            </td>
+            <td>
+                <form method="post" action="/schedules/{{ task.id }}/delete"
+                      onsubmit="return confirm('Delete this scheduled task?')"
+                      style="display:inline">
+                    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+                    <button type="submit" class="outline secondary" style="padding:0.2rem 0.5rem;font-size:0.8rem">Delete</button>
+                </form>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+</figure>
+{% else %}
+<div class="empty-state">
+    <p>No scheduled tasks configured.</p>
+    <p>Use Discord's <code>/schedule</code> command to create tasks.</p>
+</div>
+{% endif %}
+{% endblock %}

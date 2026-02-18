@@ -1,6 +1,8 @@
 //! Route construction — mounts all route groups and static file serving.
 
+pub mod conversations;
 pub mod index;
+pub mod schedules;
 
 use axum::Router;
 use tower_http::services::ServeDir;
@@ -14,6 +16,8 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .merge(index::router())
+        .merge(conversations::router())
+        .merge(schedules::router())
         .nest_service("/static", static_service)
         .with_state(state)
 }

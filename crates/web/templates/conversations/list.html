@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+
+{% block title %}Conversations — Threshold{% endblock %}
+
+{% block content %}
+<h2>Conversations</h2>
+
+{% if conversations %}
+<figure>
+<table>
+    <thead>
+        <tr>
+            <th>Mode</th>
+            <th>Agent</th>
+            <th>Created</th>
+            <th>Last Active</th>
+            <th>Portals</th>
+            <th></th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for conv in conversations %}
+        <tr>
+            <td><span class="badge badge-{{ conv.mode_badge }}">{{ conv.mode_label }}</span></td>
+            <td>{{ conv.agent_id }}</td>
+            <td>{{ conv.created_at|relative_time }}</td>
+            <td>{{ conv.last_active|relative_time }}</td>
+            <td>{{ conv.portal_count }}</td>
+            <td><a href="/conversations/{{ conv.id }}" role="button" class="outline secondary">View</a></td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+</figure>
+{% else %}
+<div class="empty-state">
+    <p>No conversations yet.</p>
+    <p>Start a conversation via Discord to see it here.</p>
+</div>
+{% endif %}
+{% endblock %}

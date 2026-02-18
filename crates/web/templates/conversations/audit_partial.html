@@ -1,0 +1,38 @@
+{% if entries %}
+<table>
+    <thead>
+        <tr>
+            <th>Time</th>
+            <th>Type</th>
+            <th>Details</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for entry in entries %}
+        <tr>
+            <td>{% if entry.timestamp %}{{ entry.timestamp|relative_time }}{% else %}&mdash;{% endif %}</td>
+            <td>{% if entry.type %}<code>{{ entry.type }}</code>{% else %}&mdash;{% endif %}</td>
+            <td>
+                <details>
+                    <summary>View JSON</summary>
+                    <pre><code>{{ entry|tojson(indent=2) }}</code></pre>
+                </details>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+{% if has_more %}
+<div style="text-align: center; margin-top: 1rem;">
+    <button hx-get="/conversations/{{ conversation_id }}/audit?offset={{ next_offset }}&limit=25"
+            hx-target="#audit-entries"
+            hx-swap="beforeend"
+            class="outline secondary">
+        Load More ({{ total - next_offset }} remaining)
+    </button>
+</div>
+{% endif %}
+{% else %}
+<p class="empty-state">No audit entries found.</p>
+{% endif %}

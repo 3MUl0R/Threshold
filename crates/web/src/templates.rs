@@ -21,6 +21,18 @@ pub fn build_template_env() -> Arc<minijinja::Environment<'static>> {
     env.add_template_owned("error.html".to_string(), include_str!("../templates/error.html").to_string())
         .expect("error.html template");
 
+    // Conversation templates
+    env.add_template_owned("conversations/list.html".to_string(), include_str!("../templates/conversations/list.html").to_string())
+        .expect("conversations/list.html template");
+    env.add_template_owned("conversations/detail.html".to_string(), include_str!("../templates/conversations/detail.html").to_string())
+        .expect("conversations/detail.html template");
+    env.add_template_owned("conversations/audit_partial.html".to_string(), include_str!("../templates/conversations/audit_partial.html").to_string())
+        .expect("conversations/audit_partial.html template");
+
+    // Schedule templates
+    env.add_template_owned("schedules/list.html".to_string(), include_str!("../templates/schedules/list.html").to_string())
+        .expect("schedules/list.html template");
+
     // Register custom filters
     env.add_filter("relative_time", relative_time_filter);
     env.add_filter("duration_short", duration_short_filter);
@@ -54,6 +66,9 @@ mod tests {
         assert!(env.get_template("base.html").is_ok());
         assert!(env.get_template("index.html").is_ok());
         assert!(env.get_template("error.html").is_ok());
+        assert!(env.get_template("conversations/list.html").is_ok());
+        assert!(env.get_template("conversations/detail.html").is_ok());
+        assert!(env.get_template("conversations/audit_partial.html").is_ok());
     }
 
     #[test]

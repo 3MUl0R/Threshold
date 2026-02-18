@@ -217,6 +217,56 @@ mod integration_tests {
         cancel.cancel();
     }
 
+    #[tokio::test]
+    async fn conversations_list_returns_200() {
+        let (addr, cancel) = start_test_server().await;
+        let resp = reqwest::get(format!("http://{addr}/conversations"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("Conversations"));
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn conversations_invalid_id_returns_404() {
+        let (addr, cancel) = start_test_server().await;
+        let resp = reqwest::get(format!("http://{addr}/conversations/not-a-uuid"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn conversations_nonexistent_id_returns_404() {
+        let (addr, cancel) = start_test_server().await;
+        let resp = reqwest::get(format!(
+            "http://{addr}/conversations/00000000-0000-0000-0000-000000000000"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 404);
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn delete_without_csrf_returns_403() {
+        let (addr, cancel) = start_test_server().await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!(
+                "http://{addr}/conversations/00000000-0000-0000-0000-000000000000/delete"
+            ))
+            .form(&[("_csrf", "invalid-token")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        cancel.cancel();
+    }
+
     #[test]
     fn non_loopback_bind_rejected() {
         assert!(!threshold_core::config::is_loopback_address("0.0.0.0"));
