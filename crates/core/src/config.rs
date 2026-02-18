@@ -87,17 +87,14 @@ pub struct ImageGenToolConfig {
 }
 
 // ── Heartbeat ──
+//
+// Per-conversation heartbeats are now managed via `/heartbeat enable` in Discord.
+// This config section provides only default values for new heartbeats.
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct HeartbeatConfig {
-    pub enabled: bool,
-    pub interval_minutes: Option<u64>,
-    pub instruction_file: Option<String>,
-    pub handoff_notes_path: Option<String>,
-    pub conversation_id: Option<String>,
-    #[serde(default)]
-    pub skip_if_running: Option<bool>,
-    pub notification_channel_id: Option<u64>,
+    /// Default interval in minutes for new heartbeats (default: 30).
+    pub default_interval_minutes: Option<u64>,
 }
 
 // ── Scheduler ──
@@ -249,8 +246,7 @@ enabled = false
 enabled = false
 
 [heartbeat]
-enabled = true
-interval_minutes = 30
+default_interval_minutes = 30
 
 [scheduler]
 enabled = true
@@ -284,8 +280,7 @@ tools = "coding"
         assert!(!config.tools.browser.as_ref().unwrap().enabled);
 
         let heartbeat = config.heartbeat.as_ref().unwrap();
-        assert!(heartbeat.enabled);
-        assert_eq!(heartbeat.interval_minutes, Some(30));
+        assert_eq!(heartbeat.default_interval_minutes, Some(30));
 
         assert!(config.scheduler.as_ref().unwrap().enabled);
 

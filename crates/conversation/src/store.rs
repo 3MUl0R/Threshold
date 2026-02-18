@@ -130,6 +130,14 @@ impl ConversationStore {
         self.conversations.get_mut(id)
     }
 
+    /// Remove a conversation from the store.
+    ///
+    /// Returns the removed conversation, or `None` if it didn't exist.
+    /// Does not delete the conversation directory — that is the engine's responsibility.
+    pub fn remove(&mut self, id: &ConversationId) -> Option<Conversation> {
+        self.conversations.remove(id)
+    }
+
     /// List all conversations
     pub fn list(&self) -> Vec<&Conversation> {
         self.conversations.values().collect()
@@ -582,6 +590,37 @@ mod tests {
         });
         assert!(content.contains("AI safety"));
         assert!(content.contains("## Topic"));
+    }
+
+    #[tokio::test]
+    async fn remove_returns_conversation_and_deletes_from_store() {
+        let dir = tempdir().unwrap();
+        let mut store = ConversationStore::load(dir.path()).await.unwrap();
+
+        let id = store.create(
+            ConversationMode::General,
+            CliProvider::Claude {
+                model: "sonnet".to_string(),
+            },
+            "default".to_string(),
+        );
+
+        assert_eq!(store.list().len(), 1);
+
+        let removed = store.remove(&id);
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().id, id);
+        assert_eq!(store.list().len(), 0);
+        assert!(store.get(&id).is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_nonexistent_returns_none() {
+        let dir = tempdir().unwrap();
+        let mut store = ConversationStore::load(dir.path()).await.unwrap();
+
+        let fake_id = threshold_core::ConversationId::new();
+        assert!(store.remove(&fake_id).is_none());
     }
 
     #[cfg(unix)]

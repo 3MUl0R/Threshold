@@ -118,6 +118,20 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
     );
     tracing::info!("Conversation engine initialized.");
 
+    // 5b. Startup migration warnings
+    {
+        let data_dir_path = config.data_dir()?;
+        // Warn if global heartbeat.md exists (legacy)
+        let global_heartbeat = data_dir_path.join("heartbeat.md");
+        if global_heartbeat.exists() {
+            tracing::warn!(
+                "Global heartbeat.md found at {}. Per-conversation heartbeats are now \
+                 configured via /heartbeat enable. See docs for migration.",
+                global_heartbeat.display()
+            );
+        }
+    }
+
     // 6. Shared cancellation token for graceful shutdown
     let cancel = CancellationToken::new();
 
@@ -134,7 +148,7 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
 
     // Create scheduler (loads persisted tasks) — result sender wired later
     let (scheduler_instance, scheduler_cmd_handle) = if scheduler_enabled {
-        let (sched, handle) = threshold_scheduler::Scheduler::new(
+        let (mut sched, handle) = threshold_scheduler::Scheduler::new(
             store_path,
             claude.clone(),
             engine.clone(),
@@ -143,6 +157,10 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
             cancel.clone(),
         )
         .await;
+
+        // Validate heartbeat tasks against conversation store (remove orphaned)
+        sched.validate_heartbeat_tasks().await;
+
         (Some(sched), Some(handle))
     } else {
         (None, None)

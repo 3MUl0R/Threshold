@@ -163,6 +163,42 @@ impl Scheduler {
         (scheduler, handle)
     }
 
+    /// Validate persisted heartbeat tasks against the conversation store.
+    ///
+    /// Removes heartbeat tasks whose conversation_id no longer exists in the
+    /// engine's conversation store (e.g., from legacy global heartbeat configs
+    /// that used randomly generated IDs, or deleted conversations).
+    pub async fn validate_heartbeat_tasks(&mut self) {
+        let conversations = self.engine.list_conversations().await;
+        let conv_ids: std::collections::HashSet<_> =
+            conversations.iter().map(|c| c.id).collect();
+
+        let before = self.tasks.len();
+        self.tasks.retain(|task| {
+            if task.kind != crate::task::TaskKind::Heartbeat {
+                return true; // keep non-heartbeat tasks
+            }
+            if let ScheduledAction::ResumeConversation { conversation_id, .. } = &task.action {
+                if conv_ids.contains(conversation_id) {
+                    return true; // conversation exists, keep
+                }
+                tracing::warn!(
+                    task_name = %task.name,
+                    conversation_id = %conversation_id.0,
+                    "Removing orphaned heartbeat task: conversation no longer exists"
+                );
+                return false; // orphaned, remove
+            }
+            true // non-ResumeConversation heartbeat (shouldn't happen), keep
+        });
+
+        let removed = before - self.tasks.len();
+        if removed > 0 {
+            tracing::info!("Removed {} orphaned heartbeat task(s)", removed);
+            self.persist().await;
+        }
+    }
+
     /// Set the result sender after construction.
     ///
     /// Used to wire the Discord outbound handle after Discord connects,
@@ -620,6 +656,91 @@ mod tests {
 
         cancel.cancel();
         scheduler_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn validate_heartbeat_tasks_removes_orphans() {
+        use crate::task::TaskKind;
+        use threshold_core::ConversationId;
+
+        let cancel = CancellationToken::new();
+        let (mut scheduler, _handle) = make_test_scheduler(cancel.clone()).await;
+
+        let orphan_conv_id = ConversationId::new();
+
+        // Create a heartbeat task pointing to a conversation that doesn't exist
+        let mut orphan_task = make_test_task("orphan-heartbeat", "0 */5 * * * * *");
+        orphan_task.kind = TaskKind::Heartbeat;
+        orphan_task.action = ScheduledAction::ResumeConversation {
+            conversation_id: orphan_conv_id,
+            prompt: "heartbeat check".into(),
+        };
+        scheduler.tasks.push(orphan_task);
+
+        // Create a non-heartbeat task (should always be kept)
+        let cron_task = make_test_task("normal-cron", "0 0 3 * * * *");
+        let cron_task_id = cron_task.id;
+        scheduler.tasks.push(cron_task);
+
+        assert_eq!(scheduler.tasks.len(), 2);
+
+        // Validate — since no conversations exist, the orphan should be removed
+        scheduler.validate_heartbeat_tasks().await;
+
+        assert_eq!(scheduler.tasks.len(), 1);
+        assert_eq!(scheduler.tasks[0].id, cron_task_id);
+    }
+
+    #[tokio::test]
+    async fn validate_heartbeat_tasks_keeps_valid() {
+        use crate::task::TaskKind;
+        use threshold_core::ConversationId;
+
+        let cancel = CancellationToken::new();
+        let (mut scheduler, _handle) = make_test_scheduler(cancel.clone()).await;
+
+        // Create General conversation via register_portal
+        let portal_id = scheduler
+            .engine
+            .register_portal(threshold_core::PortalType::Discord {
+                guild_id: 1,
+                channel_id: 100,
+            })
+            .await
+            .unwrap();
+
+        let conv_id = scheduler
+            .engine
+            .get_portal_conversation(&portal_id)
+            .await
+            .unwrap();
+
+        // Create a heartbeat task for the real conversation
+        let mut valid_task = make_test_task("valid-heartbeat", "0 */5 * * * * *");
+        valid_task.kind = TaskKind::Heartbeat;
+        valid_task.action = ScheduledAction::ResumeConversation {
+            conversation_id: conv_id,
+            prompt: "heartbeat check".into(),
+        };
+        let valid_id = valid_task.id;
+        scheduler.tasks.push(valid_task);
+
+        // Also add an orphan
+        let mut orphan_task = make_test_task("orphan-heartbeat", "0 */5 * * * * *");
+        orphan_task.kind = TaskKind::Heartbeat;
+        orphan_task.action = ScheduledAction::ResumeConversation {
+            conversation_id: ConversationId::new(),
+            prompt: "heartbeat check".into(),
+        };
+        scheduler.tasks.push(orphan_task);
+
+        assert_eq!(scheduler.tasks.len(), 2);
+
+        scheduler.validate_heartbeat_tasks().await;
+
+        // Only the valid task should remain
+        assert_eq!(scheduler.tasks.len(), 1);
+        assert_eq!(scheduler.tasks[0].id, valid_id);
     }
 
     #[tokio::test]

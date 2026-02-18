@@ -43,6 +43,9 @@ pub enum ConversationEvent {
         portal_id: PortalId,
         conversation_id: ConversationId,
     },
+    ConversationDeleted {
+        conversation_id: ConversationId,
+    },
 }
 
 /// File or binary artifact produced by tools
@@ -462,6 +465,86 @@ impl ConversationEngine {
     pub async fn list_conversations(&self) -> Vec<Conversation> {
         let conversations = self.conversations.read().await;
         conversations.list().into_iter().cloned().collect()
+    }
+
+    /// Delete a conversation and clean up all associated resources.
+    ///
+    /// - Rejects deletion of the General conversation (singleton fallback).
+    /// - Re-attaches all portals to the General conversation.
+    /// - Removes the conversation from the store.
+    /// - Deletes the conversation directory (memory.md, heartbeat.md).
+    /// - Broadcasts `ConversationDeleted` for listeners (scheduler, session cleanup).
+    pub async fn delete_conversation(&self, conversation_id: &ConversationId) -> Result<()> {
+        // 0. Look up conversation and reject General
+        let general_id = {
+            let conversations = self.conversations.read().await;
+            let conv = conversations
+                .get(conversation_id)
+                .ok_or(ThresholdError::ConversationNotFound {
+                    id: conversation_id.0,
+                })?;
+            if conv.mode == ConversationMode::General {
+                return Err(ThresholdError::InvalidInput {
+                    message: "Cannot delete the General conversation".into(),
+                });
+            }
+            // Find General's ID for portal re-attachment
+            conversations
+                .find_by_mode(&ConversationMode::General)
+                .map(|c| c.id)
+                .expect("General conversation must exist")
+        };
+
+        // 1. Re-attach all portals from this conversation to General
+        {
+            let portals_to_move = {
+                let portals = self.portals.read().await;
+                portals
+                    .get_portals_for_conversation(conversation_id)
+                    .into_iter()
+                    .map(|p| p.id)
+                    .collect::<Vec<_>>()
+            };
+            if !portals_to_move.is_empty() {
+                let mut portals = self.portals.write().await;
+                for portal_id in &portals_to_move {
+                    portals.attach(portal_id, general_id)?;
+                }
+                portals.save().await?;
+            }
+        }
+
+        // 2. Remove conversation from store
+        {
+            let mut conversations = self.conversations.write().await;
+            conversations.remove(conversation_id);
+            conversations.save().await?;
+        }
+
+        // 3. Remove conversation directory (memory.md, heartbeat.md)
+        let conv_dir = self
+            .data_dir
+            .join("conversations")
+            .join(conversation_id.0.to_string());
+        if conv_dir.exists() {
+            if let Err(e) = tokio::fs::remove_dir_all(&conv_dir).await {
+                tracing::warn!(
+                    conversation_id = %conversation_id.0,
+                    error = %e,
+                    "failed to remove conversation directory"
+                );
+            }
+        }
+
+        // 4. Broadcast deletion event — listeners handle:
+        //    - Scheduler: remove heartbeat task for this conversation
+        //    - Server: remove CLI session mapping
+        let _ = self.event_tx.send(ConversationEvent::ConversationDeleted {
+            conversation_id: *conversation_id,
+        });
+
+        tracing::info!(conversation_id = %conversation_id.0, "conversation deleted");
+        Ok(())
     }
 
     /// Save all state to disk (conversations and portals)
@@ -1031,5 +1114,205 @@ mod tests {
     fn combine_prompts_neither() {
         let result = ConversationEngine::combine_prompts(None, None);
         assert!(result.is_none());
+    }
+
+    async fn make_engine_with_dir(
+        dir: &std::path::Path,
+    ) -> (Arc<ConversationEngine>, broadcast::Receiver<ConversationEvent>) {
+        use threshold_core::config::{ClaudeCliConfig, CliConfig, ToolsConfig};
+
+        let claude = Arc::new(
+            threshold_cli_wrapper::ClaudeClient::new(
+                "claude".to_string(),
+                dir.join("cli"),
+                false,
+            )
+            .await
+            .unwrap(),
+        );
+        let config = ThresholdConfig {
+            data_dir: Some(dir.to_path_buf()),
+            log_level: None,
+            cli: CliConfig {
+                claude: ClaudeCliConfig {
+                    command: Some("claude".to_string()),
+                    model: Some("sonnet".to_string()),
+                    timeout_seconds: None,
+                    skip_permissions: Some(false),
+                    extra_flags: vec![],
+                },
+            },
+            discord: None,
+            agents: vec![
+                AgentConfigToml {
+                    id: "default".to_string(),
+                    name: "Default Agent".to_string(),
+                    cli_provider: "claude".to_string(),
+                    model: Some("sonnet".to_string()),
+                    system_prompt: Some("You are helpful.".to_string()),
+                    system_prompt_file: None,
+                    tools: Some("full".to_string()),
+                },
+                AgentConfigToml {
+                    id: "coder".to_string(),
+                    name: "Coding Agent".to_string(),
+                    cli_provider: "claude".to_string(),
+                    model: Some("opus".to_string()),
+                    system_prompt: Some("You write code.".to_string()),
+                    system_prompt_file: None,
+                    tools: Some("standard".to_string()),
+                },
+            ],
+            tools: ToolsConfig::default(),
+            heartbeat: None,
+            scheduler: None,
+        };
+        let engine = Arc::new(ConversationEngine::new(&config, claude, None, None).await.unwrap());
+        let rx = engine.subscribe();
+        (engine, rx)
+    }
+
+    #[tokio::test]
+    async fn delete_conversation_rejects_general() {
+        let dir = tempdir().unwrap();
+        let (engine, _rx) = make_engine_with_dir(dir.path()).await;
+
+        // Register a portal (creates General)
+        let _portal_id = engine
+            .register_portal(PortalType::Discord {
+                guild_id: 1,
+                channel_id: 1,
+            })
+            .await
+            .unwrap();
+
+        let conversations = engine.list_conversations().await;
+        let general = conversations
+            .iter()
+            .find(|c| c.mode == ConversationMode::General)
+            .unwrap();
+
+        let result = engine.delete_conversation(&general.id).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("Cannot delete the General conversation"),
+            "expected InvalidInput error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_conversation_removes_and_broadcasts() {
+        let dir = tempdir().unwrap();
+        let (engine, mut rx) = make_engine_with_dir(dir.path()).await;
+
+        // Register portal (creates General)
+        let portal_id = engine
+            .register_portal(PortalType::Discord {
+                guild_id: 1,
+                channel_id: 1,
+            })
+            .await
+            .unwrap();
+
+        // Drain creation/attach events
+        let _ = rx.try_recv();
+        let _ = rx.try_recv();
+
+        // Switch to a coding conversation
+        let coding_id = engine
+            .switch_mode(
+                &portal_id,
+                ConversationMode::Coding {
+                    project: "test-project".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Drain switch events
+        let _ = rx.try_recv(); // ConversationCreated
+        let _ = rx.try_recv(); // PortalDetached
+        let _ = rx.try_recv(); // PortalAttached
+
+        // Verify coding conversation directory exists
+        let conv_dir = dir
+            .path()
+            .join("conversations")
+            .join(coding_id.0.to_string());
+        assert!(conv_dir.exists());
+
+        // Delete the coding conversation
+        engine.delete_conversation(&coding_id).await.unwrap();
+
+        // Verify conversation is gone
+        let conversations = engine.list_conversations().await;
+        assert!(
+            !conversations.iter().any(|c| c.id == coding_id),
+            "coding conversation should be deleted"
+        );
+
+        // Verify directory is removed
+        assert!(!conv_dir.exists(), "conversation directory should be removed");
+
+        // Verify ConversationDeleted event was broadcast
+        let event = rx.try_recv().unwrap();
+        assert!(matches!(
+            event,
+            ConversationEvent::ConversationDeleted { conversation_id } if conversation_id == coding_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_conversation_reattaches_portals_to_general() {
+        let dir = tempdir().unwrap();
+        let (engine, _rx) = make_engine_with_dir(dir.path()).await;
+
+        // Register portal (creates General + attaches)
+        let portal_id = engine
+            .register_portal(PortalType::Discord {
+                guild_id: 1,
+                channel_id: 1,
+            })
+            .await
+            .unwrap();
+
+        // Switch to coding
+        let coding_id = engine
+            .switch_mode(
+                &portal_id,
+                ConversationMode::Coding {
+                    project: "test".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Verify portal is on coding conversation
+        let portal_conv = engine.get_portal_conversation(&portal_id).await.unwrap();
+        assert_eq!(portal_conv, coding_id);
+
+        // Delete coding conversation — portal should move to General
+        engine.delete_conversation(&coding_id).await.unwrap();
+
+        let portal_conv_after = engine.get_portal_conversation(&portal_id).await.unwrap();
+        // Should be on General now
+        let conversations = engine.list_conversations().await;
+        let general = conversations
+            .iter()
+            .find(|c| c.mode == ConversationMode::General)
+            .unwrap();
+        assert_eq!(portal_conv_after, general.id);
+    }
+
+    #[tokio::test]
+    async fn delete_nonexistent_conversation_returns_error() {
+        let dir = tempdir().unwrap();
+        let (engine, _rx) = make_engine_with_dir(dir.path()).await;
+
+        let fake_id = ConversationId::new();
+        let result = engine.delete_conversation(&fake_id).await;
+        assert!(result.is_err());
     }
 }

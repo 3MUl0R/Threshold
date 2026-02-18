@@ -109,15 +109,12 @@ enabled = false
 [tools.image_gen]
 enabled = true
 
-# ── Heartbeat Configuration (Milestone 6) ──
+# ── Heartbeat Configuration ──
+# Per-conversation heartbeats are managed via /heartbeat enable in Discord.
+# This section provides defaults for new heartbeats.
 
 # [heartbeat]
-# enabled = true
-# interval_minutes = 60
-# instruction_file = "heartbeat.md"
-# handoff_notes_path = "~/.threshold/state/heartbeat-notes.md"
-# skip_if_running = true
-# notification_channel_id = 1234567890123456789
+# default_interval_minutes = 30
 
 # ── Scheduler Configuration (Milestone 6) ──
 

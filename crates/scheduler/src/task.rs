@@ -2,7 +2,6 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use threshold_core::{ConversationId, PortalId, ScheduledAction};
 use uuid::Uuid;
 
@@ -39,9 +38,6 @@ pub struct ScheduledTask {
     /// If true, skip this firing when the previous execution is still running.
     #[serde(default)]
     pub skip_if_running: bool,
-    /// Path to handoff notes file (heartbeat tasks).
-    #[serde(default)]
-    pub handoff_notes_path: Option<PathBuf>,
 }
 
 /// Explicit task identity — distinguishes heartbeats from user-created cron jobs.
@@ -104,7 +100,6 @@ impl ScheduledTask {
             portal_id: None,
             created_by_agent: false,
             skip_if_running: false,
-            handoff_notes_path: None,
         })
     }
 
@@ -256,16 +251,11 @@ mod tests {
 
         task.kind = TaskKind::Heartbeat;
         task.skip_if_running = true;
-        task.handoff_notes_path = Some(PathBuf::from("/tmp/notes.md"));
 
         let json = serde_json::to_string(&task).unwrap();
         let restored: ScheduledTask = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.kind, TaskKind::Heartbeat);
         assert!(restored.skip_if_running);
-        assert_eq!(
-            restored.handoff_notes_path,
-            Some(PathBuf::from("/tmp/notes.md"))
-        );
     }
 
     #[test]
@@ -287,7 +277,6 @@ mod tests {
         let task: ScheduledTask = serde_json::from_str(json).unwrap();
         assert_eq!(task.kind, TaskKind::Cron); // default
         assert!(!task.skip_if_running); // default
-        assert!(task.handoff_notes_path.is_none()); // default
         assert!(!task.created_by_agent); // default
     }
 }
