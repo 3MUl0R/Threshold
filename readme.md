@@ -1,235 +1,186 @@
-# Threshold - Multi-Agent Conversation System
+# Threshold
 
-A Rust-based conversation orchestration system that enables Claude to persist across multiple interfaces (Discord, CLI, future: web, API) with intelligent routing and multi-agent support.
+A Rust-based AI conversation orchestration system. Threshold gives Claude persistent, multi-interface presence — Discord, a local web dashboard, scheduled tasks, and tool integrations — all managed through a single daemon.
 
-## Current Status: Milestone 4 Complete ✅
+## Features
 
-### What's Working
+### Conversation Engine
+- **Multi-agent support** with configurable profiles (model, system prompt, tools)
+- **Portal-based routing** — any interface channel maps to a conversation
+- **Persistent state** — conversations, portals, and audit trails survive restarts
+- **Per-conversation audit trails** in JSONL format
 
-#### ✅ Core Infrastructure
-- **Configuration**: TOML-based config with validation
-- **Logging**: Dual output (colored console + JSON file), daily rotation, 30-day retention
-- **Secret Management**: macOS Keychain integration for secure token storage
-- **State Persistence**: Conversations and portals saved to `~/.threshold/`
+### Discord Bot
+- Slash commands: `/general`, `/coding`, `/research`, `/conversations`, `/join`
+- Smart message chunking (2000-char limit, code-block aware)
+- Guild + user allowlist security
+- Typing indicators and graceful shutdown
 
-#### ✅ Conversation Engine
-- Multi-agent support (default, coder, researcher)
-- Per-agent Claude CLI configuration (model, prompts, tools)
-- Portal-based interface abstraction
-- Conversation lifecycle management
-- Per-conversation audit trails (JSONL format)
+### Web Management Interface
+- Local dashboard at `http://127.0.0.1:3000` (loopback-only, no auth needed)
+- Real-time status: uptime, conversations, scheduler, Discord connection
+- Conversation browser with full audit trail viewer
+- Log viewer with level filtering, search, and live tail
+- Config editor with TOML validation
+- Credential manager (keychain-backed)
+- Built with axum, minijinja, htmx, and Pico CSS
 
-#### ✅ Discord Integration
-- Bot framework with poise/serenity
-- Security middleware (guild + user allowlist)
-- Smart message chunking (2000 char limit, code block aware)
-- 5 slash commands: `/general`, `/coding`, `/research`, `/conversations`, `/join`
-- Dynamic portal listeners with conversation tracking
-- Graceful shutdown with state persistence
+### Task Scheduler
+- Cron-based scheduling with natural language task definitions
+- Per-conversation heartbeats (periodic check-ins)
+- Skip-if-running concurrency control
+- Persistent task store with daemon API (Unix socket)
 
-#### ✅ CLI Integration
-- Claude CLI wrapper with model aliases (sonnet/opus/haiku)
-- Session state management
-- Configurable timeouts and permissions
-- Health check mechanism
+### Tool Integrations
+- **Browser**: Headless/headed browsing via Playwright
+- **Gmail**: OAuth-based email access (read, search, send)
+- **Image Generation**: Google API image generation
+- Tools are injected into Claude's system prompt automatically
 
-### Test Results
-
-**138 passing tests** across all crates:
-- `threshold-core`: 58 passed, 15 ignored
-- `threshold-cli-wrapper`: 33 passed, 2 ignored
-- `threshold-conversation`: 27 passed
-- `threshold-discord`: 20 passed
-- All doctests: passing
-
-### Verified Functionality
-
-✅ **Startup Sequence**
-```bash
-$ cargo run --bin threshold
-# or
-$ ./target/release/threshold
-
-INFO threshold: Threshold starting...
-INFO threshold: Claude CLI client configured.
-INFO threshold: Conversation engine initialized.
-```
-
-✅ **Logging System**
-- Console: Pretty-formatted, colored output
-- File: JSON format at `~/.threshold/logs/threshold.log.YYYY-MM-DD`
-- Rotation: Automatic daily rotation at midnight
-- Cleanup: Old logs removed after 30 days
-
-✅ **Graceful Shutdown**
-```
-INFO threshold: Shutdown signal received.
-INFO threshold: Threshold shut down cleanly.
-```
-
-✅ **Configuration Validation**
-- Catches invalid `permission_mode` values
-- Validates agent configurations
-- Optional Discord config (can run without Discord for testing)
-
-### Directory Structure
-
-```
-~/.threshold/
-├── config.toml              # Main configuration
-├── logs/
-│   └── threshold.log.*      # Daily JSON logs (30-day retention)
-├── cli-sessions/            # Claude CLI session state
-├── audit/                   # Per-conversation audit trails
-│   └── {conversation-id}.jsonl
-├── conversations.json       # Conversation metadata
-└── portals.json            # Portal registry
-```
+### Infrastructure
+- **Secrets**: macOS Keychain integration (env var fallback)
+- **Logging**: Colored console + daily-rotated file logs, 30-day retention
+- **Config**: TOML-based with validation
+- **Graceful shutdown** with `CancellationToken` coordination
 
 ## Quick Start
 
-See [SETUP.md](SETUP.md) for detailed setup instructions.
+### Prerequisites
 
-### Minimal Setup
+- [Rust](https://rustup.rs) (stable, 2024 edition)
+- [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) (`npm install -g @anthropic-ai/claude-code`)
+
+### Install and Run
 
 ```bash
-# 1. Install Rust and Claude CLI
-# 2. Create config
+# Clone and build
+git clone <repo-url> threshold
+cd threshold
+cargo build --release
+
+# Create config
 mkdir -p ~/.threshold
 cp config.example.toml ~/.threshold/config.toml
+# Edit config.toml with your settings
 
-# 3. Build and run (Discord disabled for testing)
-cargo run --bin threshold
-
-# Or release build
-cargo build --release --bin threshold
-./target/release/threshold
+# Run the daemon
+./target/release/threshold daemon
 ```
 
-### With Discord
+The web interface starts automatically at http://127.0.0.1:3000 if `[web] enabled = true` is in your config.
+
+### Discord Setup
 
 ```bash
-# 1. Store Discord bot token
+# Store bot token in keychain
 ./scripts/setup-discord-token.sh
 
-# 2. Edit config: set guild_id and allowed_user_ids
-vim ~/.threshold/config.toml
+# Or use environment variable
+export DISCORD_BOT_TOKEN='your-token'
 
-# 3. Run
-cargo run --bin threshold
+# Set guild_id and allowed_user_ids in config.toml, then run
+./target/release/threshold daemon
 ```
+
+See [SETUP.md](SETUP.md) for detailed Discord bot creation and invitation steps.
+
+## Configuration
+
+Config lives at `~/.threshold/config.toml`. See [config.example.toml](config.example.toml) for all options.
+
+Key sections:
+- `[cli.claude]` — Claude CLI model, timeout, permissions
+- `[discord]` — Guild ID, allowed users
+- `[[agents]]` — Named agent profiles (model, system prompt, tools)
+- `[tools]` — Browser, Gmail, image gen settings
+- `[scheduler]` — Task scheduling
+- `[web]` — Web interface (bind address, port)
+
+Credentials (bot tokens, API keys, OAuth secrets) are stored in the macOS Keychain and managed via the web interface or CLI scripts.
 
 ## Architecture
 
-### Layered Design
-
 ```
 ┌─────────────────────────────────────────┐
-│  Interfaces (Discord, CLI, Web, API)    │
+│  Interfaces (Discord, Web, CLI)         │
 ├─────────────────────────────────────────┤
 │  Portal Layer (Channel Abstraction)     │
 ├─────────────────────────────────────────┤
 │  Conversation Engine (State Machine)    │
 ├─────────────────────────────────────────┤
-│  Claude CLI Wrapper                      │
+│  Claude CLI Wrapper + Tool Integrations │
 ├─────────────────────────────────────────┤
 │  Core (Config, Logging, Secrets, Types) │
 └─────────────────────────────────────────┘
 ```
 
-### Key Concepts
+### Crate Structure
 
-- **Portal**: Abstraction for any communication channel (Discord channel, CLI session, etc.)
-- **Conversation**: Stateful dialogue with specific mode (General/Coding/Research) and agent
-- **Agent**: Configuration profile for Claude (model, prompts, tools)
-- **Event Bus**: `broadcast` channel for engine → interface communication
+```
+crates/
+├── core/           # Config, secrets, audit, logging, shared types
+├── cli-wrapper/    # Claude CLI client and session management
+├── conversation/   # Conversation engine, portal routing, event bus
+├── discord/        # Discord bot (poise/serenity)
+├── gmail/          # Gmail OAuth + API client
+├── imagegen/       # Image generation API client
+├── scheduler/      # Cron scheduler + daemon API
+├── tools/          # Tool prompt builder
+├── web/            # Web management interface (axum + htmx)
+└── server/         # Main daemon binary
+```
 
-### Concurrency Model
+### Data Directory
 
-- Tokio async runtime with structured concurrency
-- `Arc<RwLock<>>` for shared state with careful lock ordering
-- `CancellationToken` for graceful shutdown coordination
-- Background portal listeners for async message handling
-
-## Testing
-
-```bash
-# All tests
-cargo test --workspace
-
-# Specific crate
-cargo test -p threshold-discord
-
-# With output
-cargo test -- --nocapture
-
-# Release mode
-cargo test --release
+```
+~/.threshold/
+├── config.toml           # Main configuration
+├── logs/                 # Daily rotated log files
+├── cli-sessions/         # Claude CLI session state
+├── audit/                # Per-conversation JSONL audit trails
+├── state/                # Scheduler task persistence
+├── conversations.json    # Conversation metadata
+├── portals.json          # Portal registry
+└── threshold.sock        # Daemon API socket
 ```
 
 ## Development
 
-### Code Structure
+```bash
+# Run all tests
+cargo test --workspace
 
-```
-threshold/
-├── crates/
-│   ├── core/              # Config, logging, secrets, types
-│   ├── cli-wrapper/       # Claude CLI integration
-│   ├── conversation/      # Engine, portals, state
-│   ├── discord/           # Discord bot implementation
-│   └── server/            # Main binary
-├── scripts/               # Setup and utility scripts
-├── config.example.toml    # Configuration template
-├── SETUP.md              # Setup guide
-└── MILESTONE-*.md        # Implementation plans
-```
+# Run specific crate tests
+cargo test -p threshold-web --lib
+cargo test -p threshold-conversation
 
-### Adding New Interfaces
+# Run with debug logging
+RUST_LOG=debug cargo run -p threshold -- daemon
 
-1. Implement interface handler (like `discord/`)
-2. Emit `PortalEvent` on user messages
-3. Subscribe to `ConversationEvent` for responses
-4. Handle `PortalAttached` events to track conversation changes
-
-### Lock Ordering
-
-**Always** acquire locks in this order to prevent deadlocks:
-1. `ConversationEngine.conversations`
-2. `ConversationEngine.portals`
-3. Individual conversation/portal locks
-
-**Pattern**: Store `Arc` before calling `.read()`/`.write()`:
-```rust
-let portals_arc = engine.portals();  // Store Arc first
-let portals = portals_arc.read().await;  // Then lock
+# Format and lint
+cargo fmt --all
+cargo clippy --workspace
 ```
 
-## What's Next
+### E2E Testing
 
-See [ENGINEERING-PLAN.md](ENGINEERING-PLAN.md) for roadmap:
-- **Milestone 5**: Web Dashboard (Next.js + tRPC)
-- **Milestone 6**: Heartbeat & Proactive Notifications
-- **Milestone 7**: Task Scheduler with Natural Language
-- **Milestone 8**: Voice Integration
-- **Milestone 9**: Memory Systems
+The web interface has a Playwright E2E test suite:
 
----
+```bash
+cd crates/web
+bash tests/e2e_playwright.sh
+```
 
-## Development Notes
-
-### Use OpenAI Codex for reviews on planning and staged code
-Loop staged code reviews until all are resolved.
+### Code Reviews
 
 ```bash
 # Start a new review session
 codex exec --full-auto "your prompt"
 
-# Continue/resume an existing session
-codex exec resume <session-id> --full-auto "follow-up prompt here"
+# Resume an existing session
+codex exec resume <session-id> --full-auto "follow-up prompt"
 ```
 
-### Use playwright-cli for end-to-end testing
-```bash
-playwright-cli --help
-```
+## License
+
+See [LICENSE](LICENSE) for details.
