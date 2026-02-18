@@ -165,7 +165,10 @@ impl ConversationStore {
     }
 
     /// Create the conversation directory and seed memory.md if it doesn't exist.
-    fn ensure_conversation_dir(&self, id: &ConversationId, mode: &ConversationMode) {
+    ///
+    /// Safe to call multiple times — only creates if missing.
+    /// Used for backfilling pre-Milestone-12 conversations that lack directories.
+    pub fn ensure_conversation_dir(&self, id: &ConversationId, mode: &ConversationMode) {
         let conv_dir = self
             .data_dir
             .join("conversations")

@@ -179,7 +179,19 @@ impl ConversationEngine {
             .join(conversation_id.0.to_string())
             .join("memory.md");
 
-        let memory_contents = std::fs::read_to_string(&memory_path).unwrap_or_default();
+        let memory_contents = match std::fs::read_to_string(&memory_path) {
+            Ok(contents) => contents,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                tracing::warn!(
+                    conversation_id = %conversation_id.0,
+                    error = %e,
+                    path = %memory_path.display(),
+                    "failed to read memory.md — memory will not be injected"
+                );
+                return None;
+            }
+        };
         if memory_contents.is_empty() {
             return None;
         }
@@ -484,7 +496,10 @@ impl ConversationEngine {
 
             // Try to find existing conversation by mode
             if let Some(conv) = conversations.find_by_mode(&mode) {
-                (conv.id, false)
+                let id = conv.id;
+                // Backfill directory for pre-M12 conversations
+                conversations.ensure_conversation_dir(&id, &mode);
+                (id, false)
             } else {
                 // Create new conversation
                 let agent = self.resolve_agent_for_mode(&mode);
@@ -948,15 +963,22 @@ mod tests {
             .join(conv_id.0.to_string());
         std::fs::create_dir_all(&conv_dir).unwrap();
 
-        // Write content with multibyte characters that would be split at 4096
-        // Each emoji is 4 bytes, so 1024 emojis = 4096 bytes exactly
-        // Add one more to go over the limit
-        let content = "\u{1F600}".repeat(1025); // 4100 bytes
+        // Create content where byte 4096 falls in the middle of a multibyte char.
+        // 'a' is 1 byte, '\u{1F600}' is 4 bytes.
+        // 4095 ASCII bytes + 1 emoji (4 bytes) = 4099 bytes total.
+        // Byte 4096 falls inside the emoji (byte 2 of 4), so naive slicing
+        // at [..4096] would panic. floor_char_boundary should back up to 4095.
+        let mut content = "a".repeat(4095);
+        content.push('\u{1F600}'); // 4-byte emoji
+        assert_eq!(content.len(), 4099);
         std::fs::write(conv_dir.join("memory.md"), &content).unwrap();
 
-        // This should NOT panic even though 4096 falls on a char boundary issue
+        // This should NOT panic — floor_char_boundary handles the mid-char cut
         let result = ConversationEngine::build_memory_prompt(&conv_id, dir.path()).unwrap();
         assert!(result.contains("Memory truncated"));
+        // The truncated content should contain 4095 'a's but NOT the emoji
+        assert!(result.contains(&"a".repeat(4095)));
+        assert!(!result.contains("\u{1F600}"));
     }
 
     #[test]
