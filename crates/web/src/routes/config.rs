@@ -196,8 +196,8 @@ async fn set_credential(
 ) -> Result<Response, WebError> {
     validate_csrf(&headers, &form._csrf)?;
 
-    // Validate the key is alphanumeric + dashes (no path traversal)
-    if !key.chars().all(|c| c.is_alphanumeric() || c == '-') {
+    // Validate the key: alphanumeric, dashes, dots, @ (for Gmail inbox-specific keys)
+    if !is_valid_credential_key(&key) {
         return Err(WebError::BadRequest("Invalid credential key".into()));
     }
 
@@ -239,7 +239,7 @@ async fn delete_credential(
     validate_csrf(&headers, &form._csrf)?;
 
     // Validate key format
-    if !key.chars().all(|c| c.is_alphanumeric() || c == '-') {
+    if !is_valid_credential_key(&key) {
         return Err(WebError::BadRequest("Invalid credential key".into()));
     }
 
@@ -269,6 +269,18 @@ async fn delete_credential(
 #[derive(Deserialize)]
 struct CsrfOnlyForm {
     _csrf: String,
+}
+
+/// Validate credential key: alphanumeric, dashes, dots, @ allowed.
+/// This covers both simple keys (e.g. `discord-bot-token`) and Gmail
+/// inbox-specific keys (e.g. `gmail-oauth-refresh-token-alice@gmail.com`).
+/// Rejects path separators and other special characters.
+fn is_valid_credential_key(key: &str) -> bool {
+    !key.is_empty()
+        && !key.contains('/')
+        && !key.contains('\\')
+        && !key.contains("..")
+        && key.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '.' | '@'))
 }
 
 fn validate_csrf(headers: &axum::http::HeaderMap, form_token: &str) -> Result<(), WebError> {

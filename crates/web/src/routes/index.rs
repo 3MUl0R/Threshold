@@ -39,16 +39,11 @@ async fn dashboard(
 
     // Check for Discord portals as a proxy for "Discord connected"
     let portals = state.engine.portals();
-    let portal_count = portals.read().await.get_portals_for_conversation(
-        &conversations.first().map(|c| c.id).unwrap_or(threshold_core::types::ConversationId(uuid::Uuid::nil())),
-    ).len();
-    let discord_connected = portal_count > 0 || {
-        // Check if any portals exist at all
-        let all_portals: bool = conversations.iter().any(|c| {
-            portals.try_read().map(|p| !p.get_portals_for_conversation(&c.id).is_empty()).unwrap_or(false)
-        });
-        all_portals
-    };
+    let portals_guard = portals.read().await;
+    let discord_connected = conversations
+        .iter()
+        .any(|c| !portals_guard.get_portals_for_conversation(&c.id).is_empty());
+    drop(portals_guard);
 
     // Read flash message
     let flash = read_flash(&headers);

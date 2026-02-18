@@ -14,9 +14,7 @@
         <article>
             <header>Conversations</header>
             <p><span id="stat-conversations">{{ conversation_count }}</span>
-            {% if recently_active > 0 %}
-                <br><small class="text-muted">{{ recently_active }} active in last hour</small>
-            {% endif %}
+                <br><small class="text-muted" id="stat-recently-active">{% if recently_active > 0 %}{{ recently_active }} active in last hour{% endif %}</small>
             </p>
         </article>
         <article>
@@ -28,7 +26,7 @@
     <div class="grid">
         <article>
             <header>Scheduler</header>
-            <p>
+            <p id="stat-scheduler">
                 {% if scheduler_running %}
                     <span class="status-dot status-online"></span> Running
                 {% else %}
@@ -74,8 +72,14 @@ document.body.addEventListener('htmx:afterRequest', function(evt) {
             if (el && data.uptime) el.textContent = data.uptime;
             el = document.getElementById('stat-conversations');
             if (el && data.conversation_count !== undefined) el.textContent = data.conversation_count;
+            el = document.getElementById('stat-recently-active');
+            if (el) el.textContent = data.recently_active > 0 ? data.recently_active + ' active in last hour' : '';
             el = document.getElementById('stat-schedules');
             if (el && data.schedule_count !== undefined) el.textContent = data.schedule_count;
+            el = document.getElementById('stat-scheduler');
+            if (el) el.innerHTML = data.scheduler_running
+                ? '<span class="status-dot status-online"></span> Running'
+                : '<span class="status-dot status-offline"></span> Not configured';
         } catch(e) {}
     }
 });
