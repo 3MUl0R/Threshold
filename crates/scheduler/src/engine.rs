@@ -799,6 +799,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_remove_by_conversation() {
+        use crate::task::TaskKind;
+        use threshold_core::ConversationId;
+
+        let cancel = CancellationToken::new();
+        let (mut scheduler, handle) = make_test_scheduler(cancel.clone()).await;
+
+        let scheduler_task = tokio::spawn(async move {
+            scheduler.run().await;
+        });
+
+        let conv_id = ConversationId::new();
+
+        // Task 1: heartbeat for the conversation (should be removed)
+        let mut heartbeat = make_test_task("heartbeat", "0 */5 * * * * *");
+        heartbeat.kind = TaskKind::Heartbeat;
+        heartbeat.action = ScheduledAction::ResumeConversation {
+            conversation_id: conv_id,
+            prompt: "heartbeat".into(),
+        };
+        handle.add_task(heartbeat).await.unwrap();
+
+        // Task 2: cron task with conversation_id set (should be removed)
+        let mut cron_conv = make_test_task("cron-conv", "0 0 3 * * * *");
+        cron_conv.conversation_id = Some(conv_id);
+        handle.add_task(cron_conv).await.unwrap();
+
+        // Task 3: unrelated cron task (should be kept)
+        let unrelated = make_test_task("unrelated", "0 0 6 * * * *");
+        let unrelated_id = unrelated.id;
+        handle.add_task(unrelated).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(handle.list_tasks().await.unwrap().len(), 3);
+
+        // Remove tasks for the conversation
+        handle.remove_tasks_for_conversation(conv_id).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let tasks = handle.list_tasks().await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, unrelated_id);
+
+        cancel.cancel();
+        scheduler_task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn multiple_tasks_managed() {
         let cancel = CancellationToken::new();
         let (mut scheduler, handle) = make_test_scheduler(cancel.clone()).await;

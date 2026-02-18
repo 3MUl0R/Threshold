@@ -500,8 +500,9 @@ impl ConversationEngine {
         // NOTE: There is a small TOCTOU window between snapshotting portal IDs and
         // re-attaching them. A concurrent switch_mode/join_conversation could re-attach
         // a portal back to the soon-to-be-deleted conversation. This is acceptable since
-        // deletion is a rare, user-initiated operation and the dangling reference is
-        // cleaned up on the next message (portal lookup fails → re-creation).
+        // deletion is a rare, user-initiated operation. If a race occurs, the affected
+        // portal's next message attempt will return ConversationNotFound, which Discord
+        // surfaces as an error. The user can then /general or /coding to re-attach.
         let portals_to_move = {
             let portals = self.portals.read().await;
             portals
