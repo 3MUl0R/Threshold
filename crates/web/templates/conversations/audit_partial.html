@@ -24,10 +24,10 @@
 </table>
 
 {% if has_more %}
-<div style="text-align: center; margin-top: 1rem;">
+<div id="audit-load-more" style="text-align: center; margin-top: 1rem;">
     <button hx-get="/conversations/{{ conversation_id }}/audit?offset={{ next_offset }}&limit=25"
-            hx-target="#audit-entries"
-            hx-swap="beforeend"
+            hx-target="#audit-load-more"
+            hx-swap="outerHTML"
             class="outline secondary">
         Load More ({{ total - next_offset }} remaining)
     </button>
