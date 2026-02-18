@@ -30,7 +30,7 @@ impl FlashMessage {
         }
     }
 
-    /// Encode as a cookie value (URL-safe JSON).
+    /// Encode as a cookie value (JSON string).
     pub fn to_cookie_value(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
     }

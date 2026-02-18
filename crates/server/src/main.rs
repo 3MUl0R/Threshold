@@ -71,7 +71,9 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
     // 1. Load config (from explicit path or default)
     let config_path = match &args.config {
         Some(path) => std::path::PathBuf::from(path),
-        None => ThresholdConfig::default_config_path()?,
+        None => std::env::var("THRESHOLD_CONFIG")
+            .map(std::path::PathBuf::from)
+            .unwrap_or(ThresholdConfig::default_config_path()?),
     };
     let config = match &args.config {
         Some(path) => ThresholdConfig::load_from(std::path::Path::new(path))?,

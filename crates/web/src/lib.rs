@@ -45,7 +45,15 @@ pub async fn start_web_server(state: AppState) -> anyhow::Result<()> {
         );
     }
 
-    let addr: SocketAddr = format!("{bind}:{port}").parse()?;
+    // Resolve bind address: localhost → 127.0.0.1, ::1 needs bracket notation
+    let addr: SocketAddr = if bind == "localhost" {
+        format!("127.0.0.1:{port}").parse()?
+    } else if bind.contains(':') {
+        // IPv6: needs [addr]:port notation
+        format!("[{bind}]:{port}").parse()?
+    } else {
+        format!("{bind}:{port}").parse()?
+    };
     tracing::info!("Web interface listening on http://{addr}");
 
     let app = routes::build_router(state.clone());
