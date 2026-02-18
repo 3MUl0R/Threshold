@@ -168,7 +168,7 @@ impl ConversationStore {
     ///
     /// Safe to call multiple times — only creates if missing.
     /// Used for backfilling pre-Milestone-12 conversations that lack directories.
-    pub fn ensure_conversation_dir(&self, id: &ConversationId, mode: &ConversationMode) {
+    pub(crate) fn ensure_conversation_dir(&self, id: &ConversationId, mode: &ConversationMode) {
         let conv_dir = self
             .data_dir
             .join("conversations")

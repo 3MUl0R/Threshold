@@ -571,14 +571,15 @@ impl ConversationEngine {
         portal_id: &PortalId,
         conversation_id: &ConversationId,
     ) -> Result<()> {
-        // Verify conversation exists
+        // Verify conversation exists and backfill directory if needed
         {
             let conversations = self.conversations.read().await;
-            conversations
+            let conv = conversations
                 .get(conversation_id)
                 .ok_or(ThresholdError::ConversationNotFound {
                     id: conversation_id.0,
                 })?;
+            conversations.ensure_conversation_dir(conversation_id, &conv.mode);
         }
 
         // Get current conversation
