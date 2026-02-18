@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+
+{% block title %}Audit Log — Threshold{% endblock %}
+
+{% block content %}
+<h2>Audit Log Browser</h2>
+
+{% if tabs %}
+<div role="group">
+    {% for tab in tabs %}
+    <button class="{% if loop.first %}contrast{% else %}outline{% endif %}"
+            hx-get="/audit/{{ tab.source }}?offset=0&limit=50"
+            hx-target="#audit-content"
+            hx-swap="innerHTML"
+            onclick="document.querySelectorAll('[role=group] button').forEach(b => b.className='outline'); this.className='contrast'">
+        {{ tab.label }}
+    </button>
+    {% endfor %}
+</div>
+
+<div id="audit-content"
+     {% if default_source %}
+     hx-get="/audit/{{ default_source }}?offset=0&limit=50"
+     hx-trigger="load"
+     hx-swap="innerHTML"
+     {% endif %}>
+    <p aria-busy="true">Loading audit entries...</p>
+</div>
+{% else %}
+<div class="empty-state">
+    <p>No audit log files found.</p>
+    <p>Audit entries are created when tools are used, emails are processed, etc.</p>
+</div>
+{% endif %}
+{% endblock %}

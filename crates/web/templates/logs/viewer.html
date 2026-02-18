@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+
+{% block title %}Logs — Threshold{% endblock %}
+
+{% block content %}
+<h2>Log Viewer</h2>
+
+{% if files %}
+<div class="grid">
+    <div>
+        <label for="log-file">Log File</label>
+        <select id="log-file" onchange="loadLogs()">
+            {% for f in files %}
+            <option value="{{ f }}">{{ f }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    <div>
+        <label for="log-level">Level Filter</label>
+        <select id="log-level" onchange="loadLogs()">
+            <option value="">All Levels</option>
+            <option value="ERROR">Error</option>
+            <option value="WARN">Warn</option>
+            <option value="INFO">Info</option>
+            <option value="DEBUG">Debug</option>
+            <option value="TRACE">Trace</option>
+            <option value="ERROR,WARN">Error + Warn</option>
+            <option value="ERROR,WARN,INFO">Error + Warn + Info</option>
+        </select>
+    </div>
+    <div>
+        <label for="log-search">Search</label>
+        <input type="search" id="log-search" placeholder="Filter by text..."
+               onchange="loadLogs()" oninput="clearTimeout(this._timer); this._timer = setTimeout(() => loadLogs(), 300)">
+    </div>
+</div>
+
+<div>
+    <label>
+        <input type="checkbox" id="live-tail" onchange="toggleLiveTail()">
+        Live Tail (auto-refresh every 5s)
+    </label>
+</div>
+
+<div id="log-entries" hx-swap="innerHTML">
+    <p aria-busy="true">Loading log entries...</p>
+</div>
+
+<script>
+function loadLogs() {
+    var file = document.getElementById('log-file').value;
+    var level = document.getElementById('log-level').value;
+    var search = document.getElementById('log-search').value;
+    var url = '/logs/entries?file=' + encodeURIComponent(file) + '&level=' + encodeURIComponent(level) + '&search=' + encodeURIComponent(search);
+    htmx.ajax('GET', url, {target: '#log-entries', swap: 'innerHTML'});
+}
+
+var liveTailInterval = null;
+function toggleLiveTail() {
+    if (document.getElementById('live-tail').checked) {
+        liveTailInterval = setInterval(loadLogs, 5000);
+    } else {
+        clearInterval(liveTailInterval);
+        liveTailInterval = null;
+    }
+}
+
+// Initial load
+document.addEventListener('DOMContentLoaded', loadLogs);
+</script>
+{% else %}
+<div class="empty-state">
+    <p>No log files found.</p>
+    <p>Log files will appear in <code>data_dir/logs/</code> when the daemon runs.</p>
+</div>
+{% endif %}
+{% endblock %}

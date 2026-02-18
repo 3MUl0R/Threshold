@@ -33,6 +33,18 @@ pub fn build_template_env() -> Arc<minijinja::Environment<'static>> {
     env.add_template_owned("schedules/list.html".to_string(), include_str!("../templates/schedules/list.html").to_string())
         .expect("schedules/list.html template");
 
+    // Audit templates
+    env.add_template_owned("audit/browser.html".to_string(), include_str!("../templates/audit/browser.html").to_string())
+        .expect("audit/browser.html template");
+    env.add_template_owned("audit/tab_partial.html".to_string(), include_str!("../templates/audit/tab_partial.html").to_string())
+        .expect("audit/tab_partial.html template");
+
+    // Log templates
+    env.add_template_owned("logs/viewer.html".to_string(), include_str!("../templates/logs/viewer.html").to_string())
+        .expect("logs/viewer.html template");
+    env.add_template_owned("logs/entries_partial.html".to_string(), include_str!("../templates/logs/entries_partial.html").to_string())
+        .expect("logs/entries_partial.html template");
+
     // Register custom filters
     env.add_filter("relative_time", relative_time_filter);
     env.add_filter("duration_short", duration_short_filter);

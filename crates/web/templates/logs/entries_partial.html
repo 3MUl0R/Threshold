@@ -1,0 +1,54 @@
+{% if entries %}
+<figure>
+<table>
+    <thead>
+        <tr>
+            <th>Time</th>
+            <th>Level</th>
+            <th>Target</th>
+            <th>Message</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for entry in entries %}
+        <tr>
+            <td><small>{% if entry.timestamp %}{{ entry.timestamp }}{% else %}&mdash;{% endif %}</small></td>
+            <td>
+                {% if entry.level == "ERROR" %}<span style="color:#ed4245">{{ entry.level }}</span>
+                {% elif entry.level == "WARN" %}<span style="color:#fee75c">{{ entry.level }}</span>
+                {% elif entry.level == "INFO" %}<span style="color:#57f287">{{ entry.level }}</span>
+                {% elif entry.level == "DEBUG" %}<span style="color:#5865f2">{{ entry.level }}</span>
+                {% else %}{{ entry.level }}{% endif %}
+            </td>
+            <td><small>{% if entry.target %}{{ entry.target }}{% endif %}</small></td>
+            <td>
+                {% if entry.fields and entry.fields.message %}
+                    {{ entry.fields.message }}
+                {% else %}
+                    <details>
+                        <summary>View JSON</summary>
+                        <pre><code>{{ entry|tojson(indent=2) }}</code></pre>
+                    </details>
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+</figure>
+
+<p><small>Showing {{ entries|length }} of {{ total }} matching entries</small></p>
+
+{% if has_more %}
+<div style="text-align: center;">
+    <button hx-get="/logs/entries?file={{ file }}&level={{ level }}&search={{ search }}&offset={{ next_offset }}"
+            hx-target="closest div"
+            hx-swap="outerHTML"
+            class="outline secondary">
+        Load More ({{ total - next_offset }} remaining)
+    </button>
+</div>
+{% endif %}
+{% else %}
+<p class="empty-state">No matching log entries.</p>
+{% endif %}
