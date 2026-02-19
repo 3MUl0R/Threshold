@@ -57,6 +57,52 @@ article header {
     border-bottom: 1px solid var(--pico-border-color);
 }
 
+/* Compact status bar */
+.status-bar {
+    padding: 0.6rem 1rem;
+    margin-bottom: 1.5rem;
+}
+
+.status-bar-items {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    flex-wrap: wrap;
+}
+
+.status-item {
+    display: flex;
+    align-items: baseline;
+    gap: 0.4rem;
+}
+
+.status-label {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--pico-muted-color);
+}
+
+.status-value {
+    font-size: 0.95rem;
+    color: var(--pico-color);
+}
+
+.status-sep {
+    width: 1px;
+    height: 1.2rem;
+    background: var(--pico-border-color);
+}
+
+@media (max-width: 768px) {
+    .status-bar-items {
+        gap: 0.5rem 1rem;
+    }
+    .status-sep {
+        display: none;
+    }
+}
+
 /* Mode badges */
 .badge {
     display: inline-block;
