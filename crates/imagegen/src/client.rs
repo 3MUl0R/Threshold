@@ -15,7 +15,7 @@ use threshold_core::SecretStore;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ImageGenError {
-    #[error("API key not found: configure 'google-api-key' in keychain or set GOOGLE_API_KEY")]
+    #[error("API key not found: configure 'google-api-key' in secret store or set GOOGLE_API_KEY")]
     SecretNotFound,
 
     #[error("API request failed: {0}")]
@@ -81,7 +81,7 @@ impl ImageGenClient {
         let api_key = self
             .secret_store
             .resolve("google-api-key", "GOOGLE_API_KEY")
-            .map_err(|e| ImageGenError::RequestFailed(format!("Keychain error: {}", e)))?
+            .map_err(|e| ImageGenError::RequestFailed(format!("Secret store error: {}", e)))?
             .ok_or(ImageGenError::SecretNotFound)?;
 
         let effective_prompt = build_effective_prompt(prompt, options);

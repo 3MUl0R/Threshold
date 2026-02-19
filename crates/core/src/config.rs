@@ -45,7 +45,7 @@ pub struct ClaudeCliConfig {
 pub struct DiscordConfig {
     pub guild_id: u64,
     pub allowed_user_ids: Vec<u64>,
-    // bot_token resolved from keychain, NEVER stored here
+    // bot_token resolved from secret store, NEVER stored here
 }
 
 // ── Agents ──

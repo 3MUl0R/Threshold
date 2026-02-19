@@ -11,7 +11,7 @@
 //!
 //! # Security
 //!
-//! - OAuth 2.0 with per-inbox tokens stored in OS keychain
+//! - OAuth 2.0 with per-inbox tokens stored in the secret store
 //! - Inbox allowlist enforcement via config
 //! - Send/reply gated by `allow_send` config flag
 

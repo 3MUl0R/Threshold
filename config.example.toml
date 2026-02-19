@@ -8,6 +8,11 @@
 # Can also be set via RUST_LOG environment variable
 log_level = "info"
 
+# Secret storage backend: "file" (default) or "keychain"
+# - file: stores secrets in <data_dir>/secrets.toml (chmod 600)
+# - keychain: uses OS keychain (macOS Keychain, Windows Credential Manager)
+# secret_backend = "file"
+
 # ── Claude CLI Configuration ──
 
 [cli.claude]
@@ -40,7 +45,7 @@ allowed_user_ids = [
     # Add more user IDs as needed
 ]
 
-# Note: Discord bot token is stored in keychain or DISCORD_BOT_TOKEN env var
+# Note: Discord bot token is stored in the secret store or DISCORD_BOT_TOKEN env var
 # Run: ./scripts/setup-discord-token.sh to set it up
 
 # ── Agent Configurations ──

@@ -43,6 +43,7 @@ pub async fn handle_imagegen_command(
     args: ImagegenArgs,
     config: &ImageGenToolConfig,
     audit_path: Option<&Path>,
+    secret_store: Arc<SecretStore>,
 ) -> anyhow::Result<()> {
     if !config.enabled {
         anyhow::bail!("Image generation is disabled. Set tools.image_gen.enabled = true in your config.");
@@ -55,7 +56,6 @@ pub async fn handle_imagegen_command(
             negative_prompt,
             output_dir,
         } => {
-            let secret_store = Arc::new(SecretStore::new()?);
             let client = ImageGenClient::new(secret_store);
 
             let options = ImageGenOptions {

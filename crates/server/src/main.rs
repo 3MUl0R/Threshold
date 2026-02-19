@@ -90,7 +90,21 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
     tracing::info!("Threshold starting...");
 
     // 3. Initialize secret store
-    let secrets = Arc::new(SecretStore::new()?);
+    let data_dir = config.data_dir()?;
+    let secrets = Arc::new(SecretStore::with_backend(
+        config.secret_backend(),
+        Some(data_dir.clone()),
+    )?);
+    tracing::info!("Secret store backend: {}", secrets.backend_name());
+    if secrets.backend_name() == "file" {
+        let secrets_path = data_dir.join("secrets.toml");
+        if !secrets_path.exists() {
+            tracing::info!(
+                "No secrets.toml found. Set credentials via the web UI at /config/credentials \
+                 or switch to keychain backend with secret_backend = \"keychain\" in config."
+            );
+        }
+    }
 
     // 4. Create Claude CLI client
     let claude = Arc::new(

@@ -223,7 +223,7 @@ async fn set_credential(
         }),
     )
     .await
-    .map_err(|_| WebError::Internal("Keychain access timed out".into()))?
+    .map_err(|_| WebError::Internal("Secret store access timed out".into()))?
     .map_err(|e| WebError::Internal(format!("spawn_blocking error: {e}")))?
     .map_err(|e| WebError::Internal(format!("Failed to set credential: {e}")))?;
 
@@ -264,7 +264,7 @@ async fn delete_credential(
         }),
     )
     .await
-    .map_err(|_| WebError::Internal("Keychain access timed out".into()))?
+    .map_err(|_| WebError::Internal("Secret store access timed out".into()))?
     .map_err(|e| WebError::Internal(format!("spawn_blocking error: {e}")))?
     .map_err(|e| WebError::Internal(format!("Failed to delete credential: {e}")))?;
 

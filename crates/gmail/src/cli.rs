@@ -97,6 +97,7 @@ pub async fn handle_gmail_command(
     args: GmailArgs,
     config: &GmailToolConfig,
     audit_path: Option<&Path>,
+    secret_store: Arc<SecretStore>,
 ) -> anyhow::Result<()> {
     if !config.enabled {
         let output = serde_json::json!({
@@ -107,7 +108,6 @@ pub async fn handle_gmail_command(
     }
 
     let audit = audit_path.map(|p| AuditTrail::new(p.to_path_buf()));
-    let secret_store = Arc::new(SecretStore::new()?);
 
     match args.command {
         GmailCommands::Auth {

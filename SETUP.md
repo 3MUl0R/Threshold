@@ -18,7 +18,7 @@ Run the setup script to store your Discord bot token securely:
 ./scripts/setup-discord-token.sh
 ```
 
-This will read the token from `.env` and store it in your macOS Keychain.
+This will read the token from `.env` and store it in the secret store.
 
 **Alternative**: Set environment variable:
 ```bash

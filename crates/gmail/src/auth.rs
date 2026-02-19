@@ -7,9 +7,9 @@
 //! 3. Local HTTP server receives callback with authorization code
 //! 4. State parameter is verified to prevent CSRF
 //! 5. Code is exchanged for access + refresh tokens (with PKCE verifier)
-//! 6. Tokens are stored in OS keychain, namespaced by inbox
+//! 6. Tokens are stored in the secret store, namespaced by inbox
 //!
-//! On subsequent API calls, access tokens are retrieved from keychain
+//! On subsequent API calls, access tokens are retrieved from the secret store
 //! and automatically refreshed when expired.
 
 use std::sync::Arc;
@@ -33,16 +33,16 @@ const REDIRECT_PORT: u16 = 8085;
 pub const SCOPE_READONLY: &str = "https://www.googleapis.com/auth/gmail.readonly";
 pub const SCOPE_SEND: &str = "https://www.googleapis.com/auth/gmail.send";
 
-/// Keychain key names.
+/// Secret store key names.
 const KEY_CLIENT_ID: &str = "gmail-oauth-client-id";
 const KEY_CLIENT_SECRET: &str = "gmail-oauth-client-secret";
 
-/// Build inbox-specific keychain key for access token.
+/// Build inbox-specific secret store key for access token.
 pub fn access_token_key(inbox: &str) -> String {
     format!("gmail-oauth-access-token-{}", inbox)
 }
 
-/// Build inbox-specific keychain key for refresh token.
+/// Build inbox-specific secret store key for refresh token.
 pub fn refresh_token_key(inbox: &str) -> String {
     format!("gmail-oauth-refresh-token-{}", inbox)
 }
@@ -68,13 +68,13 @@ impl GmailAuth {
 
     /// Run the interactive OAuth consent flow with PKCE and state.
     ///
-    /// 1. Resolves client ID and secret from keychain
+    /// 1. Resolves client ID and secret from the secret store
     /// 2. Generates PKCE code verifier/challenge and random state
     /// 3. Prints authorization URL for user to visit (to stderr)
     /// 4. Starts local HTTP server to receive callback
     /// 5. Verifies state parameter matches to prevent CSRF
     /// 6. Exchanges authorization code for tokens (with PKCE verifier)
-    /// 7. Stores tokens in keychain
+    /// 7. Stores tokens in the secret store
     pub async fn authorize(&self, include_send_scope: bool) -> Result<(), AuthError> {
         let client_id = self.resolve_client_id()?;
         let client_secret = self.resolve_client_secret()?;
@@ -209,7 +209,7 @@ impl GmailAuth {
             .ok_or_else(|| {
                 AuthError::MissingCredentials(
                     "Gmail OAuth client ID not configured. \
-                     Store it with: threshold-core keychain or set GMAIL_OAUTH_CLIENT_ID env var"
+                     Set it via the web UI at /config/credentials or set GMAIL_OAUTH_CLIENT_ID env var"
                         .into(),
                 )
             })
@@ -222,7 +222,7 @@ impl GmailAuth {
             .ok_or_else(|| {
                 AuthError::MissingCredentials(
                     "Gmail OAuth client secret not configured. \
-                     Store it with: threshold-core keychain or set GMAIL_OAUTH_CLIENT_SECRET env var"
+                     Set it via the web UI at /config/credentials or set GMAIL_OAUTH_CLIENT_SECRET env var"
                         .into(),
                 )
             })
@@ -481,7 +481,7 @@ pub enum AuthError {
     #[error("Token refresh failed: {0}")]
     TokenRefreshFailed(String),
 
-    #[error("Keychain error: {0}")]
+    #[error("Secret store error: {0}")]
     KeychainError(String),
 }
 

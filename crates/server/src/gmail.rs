@@ -2,7 +2,10 @@
 //!
 //! Thin wrapper that loads config and delegates to `threshold_gmail`.
 
+use std::sync::Arc;
+
 use threshold_core::config::ThresholdConfig;
+use threshold_core::{SecretBackend, SecretStore};
 
 /// Handle the `threshold gmail` command.
 pub async fn handle_gmail_command(args: threshold_gmail::GmailArgs) -> anyhow::Result<()> {
@@ -22,10 +25,13 @@ pub async fn handle_gmail_command(args: threshold_gmail::GmailArgs) -> anyhow::R
         }
     };
 
-    threshold_gmail::handle_gmail_command(
-        args,
-        gmail_config,
-        audit_path.as_deref(),
-    )
-    .await
+    let backend = config.secret_backend();
+    let data_dir = if backend == SecretBackend::File {
+        Some(config.data_dir()?)
+    } else {
+        None
+    };
+    let secrets = Arc::new(SecretStore::with_backend(backend, data_dir)?);
+
+    threshold_gmail::handle_gmail_command(args, gmail_config, audit_path.as_deref(), secrets).await
 }

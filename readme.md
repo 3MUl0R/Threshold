@@ -22,7 +22,7 @@ A Rust-based AI conversation orchestration system. Threshold gives Claude persis
 - Conversation browser with full audit trail viewer
 - Log viewer with level filtering, search, and live tail
 - Config editor with TOML validation
-- Credential manager (keychain-backed)
+- Credential manager (file-backed by default, keychain optional)
 - Built with axum, minijinja, htmx, and Pico CSS
 
 ### Task Scheduler
@@ -38,7 +38,7 @@ A Rust-based AI conversation orchestration system. Threshold gives Claude persis
 - Tools are injected into Claude's system prompt automatically
 
 ### Infrastructure
-- **Secrets**: macOS Keychain integration (env var fallback)
+- **Secrets**: File-based store (default) or OS keychain, with env var fallback
 - **Logging**: Colored console + daily-rotated file logs, 30-day retention
 - **Config**: TOML-based with validation
 - **Graceful shutdown** with `CancellationToken` coordination
@@ -72,7 +72,7 @@ The web interface starts automatically at http://127.0.0.1:3000 if `[web] enable
 ### Discord Setup
 
 ```bash
-# Store bot token in keychain
+# Store bot token in secret store
 ./scripts/setup-discord-token.sh
 
 # Or use environment variable
@@ -96,7 +96,7 @@ Key sections:
 - `[scheduler]` — Task scheduling
 - `[web]` — Web interface (bind address, port)
 
-Credentials (bot tokens, API keys, OAuth secrets) are stored in the macOS Keychain and managed via the web interface or CLI scripts.
+Credentials (bot tokens, API keys, OAuth secrets) are stored in the secret store (file-based by default, or OS keychain) and managed via the web interface or CLI scripts.
 
 ## Architecture
 

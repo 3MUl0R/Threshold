@@ -181,13 +181,13 @@ if [ "$CRED_CODE" = "200" ]; then
     sleep 0.5
     pw_test "Credentials page loads" "Credentials"
     pw_test "Breadcrumb shows Config link" "Config"
-    pw_test "Keychain note present" "keychain"
+    pw_test "Secret store note present" "secret store"
     pw_test "Credential status shown" "Not set"
 else
-    pw_skip "Credentials page" "keychain not accessible in test environment (HTTP $CRED_CODE)"
-    pw_skip "Breadcrumb" "skipped due to keychain"
-    pw_skip "Keychain note" "skipped due to keychain"
-    pw_skip "Credential status" "skipped due to keychain"
+    pw_skip "Credentials page" "secret store not accessible in test environment (HTTP $CRED_CODE)"
+    pw_skip "Breadcrumb" "skipped due to secret store"
+    pw_skip "Secret store note" "skipped due to secret store"
+    pw_skip "Credential status" "skipped due to secret store"
 fi
 echo ""
 
