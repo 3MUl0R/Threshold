@@ -76,6 +76,7 @@ mod tests {
         ThresholdConfig {
             data_dir: None,
             log_level: None,
+            secret_backend: None,
             cli: CliConfig {
                 claude: ClaudeCliConfig {
                     command: None,

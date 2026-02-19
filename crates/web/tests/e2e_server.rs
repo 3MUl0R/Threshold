@@ -19,6 +19,7 @@ async fn main() {
     let config = Arc::new(ThresholdConfig {
         data_dir: Some(data_dir.clone()),
         log_level: None,
+        secret_backend: None,
         cli: CliConfig {
             claude: ClaudeCliConfig {
                 command: Some("echo".into()),

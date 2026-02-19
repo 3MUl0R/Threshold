@@ -1,10 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::secrets::SecretBackend;
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ThresholdConfig {
     pub data_dir: Option<PathBuf>,
     pub log_level: Option<String>,
+    #[serde(default)]
+    pub secret_backend: Option<String>,
 
     pub cli: CliConfig,
     pub discord: Option<DiscordConfig>,
@@ -166,8 +170,27 @@ impl ThresholdConfig {
             })
     }
 
+    /// Returns the configured secret backend, defaulting to `File`.
+    pub fn secret_backend(&self) -> SecretBackend {
+        match self.secret_backend.as_deref() {
+            Some("keychain") => SecretBackend::Keychain,
+            _ => SecretBackend::File,
+        }
+    }
+
     /// Validate required fields and enum values.
     pub fn validate(&self) -> crate::Result<()> {
+        if let Some(backend) = &self.secret_backend {
+            match backend.as_str() {
+                "file" | "keychain" => {}
+                _ => {
+                    return Err(crate::ThresholdError::Config(format!(
+                        "invalid secret_backend '{backend}': expected file or keychain"
+                    )));
+                }
+            }
+        }
+
         if let Some(level) = &self.log_level {
             match level.as_str() {
                 "trace" | "debug" | "info" | "warn" | "error" => {}
@@ -645,5 +668,36 @@ bind = "0.0.0.0"
                 .to_string()
                 .contains("invalid log_level")
         );
+    }
+
+    #[test]
+    fn secret_backend_defaults_to_file() {
+        let toml = "[cli.claude]\n";
+        let config: ThresholdConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.secret_backend(), SecretBackend::File);
+    }
+
+    #[test]
+    fn secret_backend_file_accepted() {
+        let toml = "secret_backend = \"file\"\n\n[cli.claude]\n";
+        let config: ThresholdConfig = toml::from_str(toml).unwrap();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.secret_backend(), SecretBackend::File);
+    }
+
+    #[test]
+    fn secret_backend_keychain_accepted() {
+        let toml = "secret_backend = \"keychain\"\n\n[cli.claude]\n";
+        let config: ThresholdConfig = toml::from_str(toml).unwrap();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.secret_backend(), SecretBackend::Keychain);
+    }
+
+    #[test]
+    fn validate_rejects_invalid_secret_backend() {
+        let toml = "secret_backend = \"vault\"\n\n[cli.claude]\n";
+        let config: ThresholdConfig = toml::from_str(toml).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("invalid secret_backend"));
     }
 }

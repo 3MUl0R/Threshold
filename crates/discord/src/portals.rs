@@ -43,6 +43,7 @@ mod tests {
         ThresholdConfig {
             data_dir: Some(std::env::temp_dir()),
             log_level: None,
+            secret_backend: None,
             cli: CliConfig {
                 claude: ClaudeCliConfig {
                     command: Some("claude".to_string()),

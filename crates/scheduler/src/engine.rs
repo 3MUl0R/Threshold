@@ -514,6 +514,7 @@ mod tests {
         let config = ThresholdConfig {
             data_dir: Some(tmp.path().to_path_buf()),
             log_level: None,
+            secret_backend: None,
             cli: CliConfig {
                 claude: ClaudeCliConfig {
                     command: Some("claude".to_string()),

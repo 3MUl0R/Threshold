@@ -885,6 +885,7 @@ mod tests {
         ThresholdConfig {
             data_dir: Some(tempdir().unwrap().path().to_path_buf()),
             log_level: None,
+            secret_backend: None,
             cli: CliConfig {
                 claude: ClaudeCliConfig {
                     command: Some("claude".to_string()),
@@ -1149,6 +1150,7 @@ mod tests {
         let config = ThresholdConfig {
             data_dir: Some(dir.to_path_buf()),
             log_level: None,
+            secret_backend: None,
             cli: CliConfig {
                 claude: ClaudeCliConfig {
                     command: Some("claude".to_string()),
