@@ -758,8 +758,8 @@ mod tests {
                     "resolve() should propagate backend errors, not fall back to env"
                 );
                 assert!(
-                    result.unwrap_err().to_string().contains("Keychain"),
-                    "error should be a Keychain error: {:?}",
+                    result.unwrap_err().to_string().contains("Secret store"),
+                    "error should be a secret store error: {:?}",
                     e
                 );
             }

@@ -8,6 +8,11 @@ DATA_DIR="$HOME/.threshold"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --data-dir)
+            if [[ $# -lt 2 ]] || [[ -z "$2" ]]; then
+                echo "Error: --data-dir requires a non-empty value"
+                echo "Usage: $0 [--data-dir <path>]"
+                exit 1
+            fi
             DATA_DIR="$2"
             shift 2
             ;;
@@ -44,24 +49,47 @@ echo "Storing in secret store: $SECRETS_FILE"
 # Create data directory if needed
 mkdir -p "$DATA_DIR"
 
-# Read existing secrets or start fresh
-if [ -f "$SECRETS_FILE" ]; then
-    # Remove existing discord-bot-token line if present
-    EXISTING=$(grep -v '^discord-bot-token' "$SECRETS_FILE" || true)
-else
-    EXISTING="[secrets]"
-fi
-
-# Ensure [secrets] header exists
-if ! echo "$EXISTING" | grep -q '^\[secrets\]'; then
-    EXISTING="[secrets]
-$EXISTING"
-fi
-
-# Write updated file atomically
+# Build new secrets.toml preserving existing keys.
+# Uses a simple approach: read existing [secrets] key-value pairs,
+# replace or add discord-bot-token, write back under [secrets] only.
 TMP_FILE="$SECRETS_FILE.tmp"
-echo "$EXISTING" > "$TMP_FILE"
-echo "discord-bot-token = \"$TOKEN\"" >> "$TMP_FILE"
+
+{
+    echo "[secrets]"
+
+    # Copy existing key = value lines (except discord-bot-token) from [secrets] section
+    if [ -f "$SECRETS_FILE" ]; then
+        in_secrets=false
+        while IFS= read -r line; do
+            # Track which section we're in (allow leading whitespace, spaces, and quotes)
+            stripped="${line#"${line%%[![:space:]]*}"}"
+            if [[ "$stripped" =~ ^\[[[:space:]]*(secrets|\"secrets\"|\'secrets\')[[:space:]]*\][[:space:]]*(#.*)?$ ]]; then
+                in_secrets=true
+                continue
+            # Match other TOML sections: require alpha/underscore/quote after [
+            # to avoid matching array values like [3,4] in multiline arrays.
+            # Note: string arrays like ["a","b"] can still false-positive, but
+            # secrets.toml only contains simple key = "value" pairs, never arrays.
+            elif [[ "$stripped" =~ ^\[[[:space:]]*[[:alpha:]_\"\'].*\][[:space:]]*(#.*)?$ ]]; then
+                in_secrets=false
+                continue
+            fi
+            # Copy non-empty lines from [secrets] section, except discord-bot-token
+            # Handle bare key, single-quoted, and double-quoted TOML key forms
+            if $in_secrets && [[ -n "$line" ]] && \
+               [[ ! "$stripped" =~ ^discord-bot-token[[:space:]]*= ]] && \
+               [[ ! "$stripped" =~ ^\"discord-bot-token\"[[:space:]]*= ]] && \
+               [[ ! "$stripped" =~ ^\'discord-bot-token\'[[:space:]]*= ]]; then
+                echo "$line"
+            fi
+        done < "$SECRETS_FILE"
+    fi
+
+    # Escape any double-quotes in token value for valid TOML
+    ESCAPED_TOKEN="${TOKEN//\"/\\\"}"
+    echo "discord-bot-token = \"$ESCAPED_TOKEN\""
+} > "$TMP_FILE"
+
 chmod 600 "$TMP_FILE"
 mv "$TMP_FILE" "$SECRETS_FILE"
 

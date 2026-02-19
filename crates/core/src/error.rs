@@ -57,7 +57,7 @@ pub enum ThresholdError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("Keychain error: {0}")]
+    #[error("Secret store error: {0}")]
     Keychain(String),
 
     #[error("Unauthorized access attempt")]

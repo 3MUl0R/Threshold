@@ -700,4 +700,18 @@ bind = "0.0.0.0"
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("invalid secret_backend"));
     }
+
+    #[test]
+    fn load_rejects_invalid_secret_backend() {
+        let dir = std::env::temp_dir().join("threshold_test_secret_backend");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "secret_backend = \"vault\"\n\n[cli.claude]\n").unwrap();
+
+        let result = ThresholdConfig::load_from(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid secret_backend"));
+    }
 }
