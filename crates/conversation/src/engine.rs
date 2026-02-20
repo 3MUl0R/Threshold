@@ -14,7 +14,7 @@ use threshold_cli_wrapper::response::Usage;
 use threshold_core::config::{AgentConfigToml, ThresholdConfig};
 use threshold_core::{
     ActiveConversations, AgentConfig, CliProvider, Conversation, ConversationId, ConversationMode,
-    PortalId, PortalType, Result, ThresholdError, ToolProfile,
+    PortalId, PortalType, Result, RunId, ThresholdError, ToolProfile,
 };
 use tokio::sync::{RwLock, broadcast};
 
@@ -23,6 +23,7 @@ use tokio::sync::{RwLock, broadcast};
 pub enum ConversationEvent {
     AssistantMessage {
         conversation_id: ConversationId,
+        run_id: RunId,
         content: String,
         artifacts: Vec<Artifact>,
         usage: Option<Usage>,
@@ -30,6 +31,7 @@ pub enum ConversationEvent {
     },
     Error {
         conversation_id: ConversationId,
+        run_id: Option<RunId>,
         error: String,
     },
     ConversationCreated {
@@ -45,6 +47,24 @@ pub enum ConversationEvent {
     },
     ConversationDeleted {
         conversation_id: ConversationId,
+    },
+    /// Immediate acknowledgment (Phase 14C).
+    Acknowledgment {
+        conversation_id: ConversationId,
+        run_id: RunId,
+        content: String,
+    },
+    /// Periodic status update during processing (Phase 14D).
+    StatusUpdate {
+        conversation_id: ConversationId,
+        run_id: RunId,
+        summary: String,
+        elapsed_secs: u64,
+    },
+    /// Task was aborted by user.
+    Aborted {
+        conversation_id: ConversationId,
+        run_id: RunId,
     },
 }
 
@@ -250,8 +270,16 @@ impl ConversationEngine {
         self.event_tx.subscribe()
     }
 
-    /// Handle an incoming user message
+    /// Handle an incoming user message.
+    ///
+    /// Uses streaming mode to read Claude CLI output line-by-line. This avoids
+    /// the pipe buffer deadlock for long responses and enables live progress
+    /// tracking in future phases.
     pub async fn handle_message(&self, portal_id: &PortalId, content: &str) -> Result<()> {
+        use threshold_cli_wrapper::stream::StreamEvent;
+
+        let run_id = RunId::new();
+
         // 1. Look up portal → get conversation_id
         let conversation_id = {
             let portals = self.portals.read().await;
@@ -298,98 +326,191 @@ impl ConversationEngine {
         )
         .await?;
 
-        // 5. Call Claude CLI (track active conversation for heartbeat skip)
+        // 5. Acquire per-conversation lock (held for entire stream lifetime)
+        let _guard = self.claude.locks().lock(conversation_id.0).await;
+
+        // 6. Start streaming CLI invocation
         self.active_conversations.insert(conversation_id).await;
         let start = std::time::Instant::now();
-        let result = self
+
+        let stream_result = self
             .claude
-            .send_message(
-                conversation_id.0, // Use inner Uuid
+            .send_message_streaming(
+                conversation_id.0,
+                run_id,
                 content,
                 system_prompt,
                 Some(model),
             )
             .await;
-        self.active_conversations.remove(&conversation_id).await;
 
-        match result {
-            Ok(response) => {
-                let duration = start.elapsed();
-
-                // 6a. Write assistant response to audit
-                self.write_audit_event(
-                    &conversation_id,
-                    &ConversationAuditEvent::AssistantMessage {
-                        content: response.text.clone(),
-                        usage: response.usage.clone(),
-                        duration_ms: duration.as_millis() as u64,
-                        timestamp: Utc::now(),
-                    },
-                )
-                .await?;
-
-                // 6b. Update conversation.last_active
-                {
-                    let mut conversations = self.conversations.write().await;
-                    if let Some(conv) = conversations.get_mut(&conversation_id) {
-                        conv.last_active = Utc::now();
-                    }
-                    // Drop write lock before save
-                }
-
-                // Save outside the lock to avoid holding write lock across await
-                {
-                    let conversations = self.conversations.read().await;
-                    conversations.save().await?;
-                }
-
-                // 6c. Broadcast AssistantMessage event
-                match self.event_tx.send(ConversationEvent::AssistantMessage {
-                    conversation_id,
-                    content: response.text,
-                    artifacts: Vec::new(), // TODO: Phase 10 (images)
-                    usage: response.usage,
-                    timestamp: Utc::now(),
-                }) {
-                    Ok(receiver_count) => {
-                        tracing::debug!(receiver_count, "event broadcast");
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            "no receivers for event broadcast - all portals may be disconnected"
-                        );
-                    }
-                }
-
-                Ok(())
-            }
+        let mut stream_handle = match stream_result {
+            Ok(handle) => handle,
             Err(e) => {
-                // 7a. Write error to audit
-                self.write_audit_event(
-                    &conversation_id,
-                    &ConversationAuditEvent::Error {
-                        error: e.to_string(),
-                        timestamp: Utc::now(),
-                    },
-                )
-                .await?;
+                self.active_conversations.remove(&conversation_id).await;
+                self.claude.tracker().deregister(&run_id).await;
+                self.broadcast_error(&conversation_id, Some(run_id), &e).await;
+                return Err(e);
+            }
+        };
 
-                // 7b. Broadcast Error event
-                match self.event_tx.send(ConversationEvent::Error {
-                    conversation_id,
-                    error: e.to_string(),
-                }) {
-                    Ok(receiver_count) => {
-                        tracing::debug!(receiver_count, "error event broadcast");
-                    }
-                    Err(_) => {
-                        tracing::warn!("no receivers for error event broadcast");
-                    }
+        // 7. Consume stream events, build final response
+        let mut final_text = String::new();
+        let mut final_session_id = None;
+        let mut final_usage = None;
+        let mut saw_result = false;
+
+        while let Some(event) = stream_handle.event_rx.recv().await {
+            match event {
+                StreamEvent::Result {
+                    text,
+                    session_id,
+                    usage,
+                } => {
+                    final_text = text;
+                    final_session_id = session_id;
+                    final_usage = usage;
+                    saw_result = true;
+                    break;
                 }
-
-                Err(e)
+                StreamEvent::Error { message } => {
+                    // CLI error — treat as failure
+                    self.active_conversations.remove(&conversation_id).await;
+                    self.claude.tracker().deregister(&run_id).await;
+                    let err = ThresholdError::CliError {
+                        provider: "claude".into(),
+                        code: -1,
+                        stderr: message,
+                    };
+                    self.broadcast_error(&conversation_id, Some(run_id), &err)
+                        .await;
+                    return Err(err);
+                }
+                StreamEvent::TextDelta { text } => {
+                    // Accumulate text (used for status updates in Phase 14D)
+                    final_text.push_str(&text);
+                }
+                StreamEvent::ToolUse { tool_name, .. } => {
+                    tracing::debug!(
+                        conversation_id = ?conversation_id,
+                        run_id = %run_id,
+                        tool = %tool_name,
+                        "tool use detected"
+                    );
+                }
+                StreamEvent::ToolResult { .. } => {}
             }
         }
+
+        // Check abort flag from the streaming reader task (explicit signal,
+        // not string matching)
+        let was_aborted = stream_handle
+            .was_aborted
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        self.active_conversations.remove(&conversation_id).await;
+        self.claude.tracker().deregister(&run_id).await;
+
+        // 8. Handle abort
+        if was_aborted {
+            self.write_audit_event(
+                &conversation_id,
+                &ConversationAuditEvent::Error {
+                    error: "Task aborted by user".to_string(),
+                    timestamp: Utc::now(),
+                },
+            )
+            .await?;
+
+            let _ = self.event_tx.send(ConversationEvent::Aborted {
+                conversation_id,
+                run_id,
+            });
+
+            return Err(ThresholdError::Aborted);
+        }
+
+        // 9. Handle stream close without Result event (process crashed)
+        if !saw_result {
+            let err = ThresholdError::CliError {
+                provider: "claude".into(),
+                code: -1,
+                stderr: "CLI process exited without producing a result".into(),
+            };
+            self.broadcast_error(&conversation_id, Some(run_id), &err)
+                .await;
+            return Err(err);
+        }
+
+        let duration = start.elapsed();
+
+        // 10. Update session ID if returned
+        if let Some(session_id) = &final_session_id {
+            self.claude
+                .sessions()
+                .set(conversation_id.0, session_id.clone())
+                .await?;
+        }
+
+        // 11. Write assistant response to audit
+        self.write_audit_event(
+            &conversation_id,
+            &ConversationAuditEvent::AssistantMessage {
+                content: final_text.clone(),
+                usage: final_usage.clone(),
+                duration_ms: duration.as_millis() as u64,
+                timestamp: Utc::now(),
+            },
+        )
+        .await?;
+
+        // 12. Update conversation.last_active
+        {
+            let mut conversations = self.conversations.write().await;
+            if let Some(conv) = conversations.get_mut(&conversation_id) {
+                conv.last_active = Utc::now();
+            }
+        }
+        {
+            let conversations = self.conversations.read().await;
+            conversations.save().await?;
+        }
+
+        // 13. Broadcast AssistantMessage event
+        let _ = self.event_tx.send(ConversationEvent::AssistantMessage {
+            conversation_id,
+            run_id,
+            content: final_text,
+            artifacts: Vec::new(),
+            usage: final_usage,
+            timestamp: Utc::now(),
+        });
+
+        Ok(())
+    }
+
+    /// Broadcast an error event for a conversation.
+    async fn broadcast_error(
+        &self,
+        conversation_id: &ConversationId,
+        run_id: Option<RunId>,
+        error: &ThresholdError,
+    ) {
+        let _ = self
+            .write_audit_event(
+                conversation_id,
+                &ConversationAuditEvent::Error {
+                    error: error.to_string(),
+                    timestamp: Utc::now(),
+                },
+            )
+            .await;
+
+        let _ = self.event_tx.send(ConversationEvent::Error {
+            conversation_id: *conversation_id,
+            run_id,
+            error: error.to_string(),
+        });
     }
 
     /// Register a new portal (auto-attach to General)
@@ -582,6 +703,11 @@ impl ConversationEngine {
     /// Get access to portals (for portal listener management)
     pub fn portals(&self) -> Arc<RwLock<PortalRegistry>> {
         self.portals.clone()
+    }
+
+    /// Get access to the Claude client (for process tracker / abort).
+    pub fn claude(&self) -> &Arc<ClaudeClient> {
+        &self.claude
     }
 
     /// Get the data directory path (for building file paths externally).
@@ -797,6 +923,7 @@ impl ConversationEngine {
         // This is critical for heartbeat/cron messages to reach portals (Milestone 7)
         match self.event_tx.send(ConversationEvent::AssistantMessage {
             conversation_id: *conversation_id,
+            run_id: RunId(uuid::Uuid::new_v4()),
             content: response.text.clone(),
             artifacts: Vec::new(),
             usage: response.usage.clone(),
@@ -977,6 +1104,7 @@ mod tests {
             tmp.path().join("cli-sessions.json"),
         ));
         let locks = Arc::new(threshold_cli_wrapper::ConversationLockMap::new());
+        let tracker = Arc::new(threshold_cli_wrapper::ProcessTracker::new());
         let claude = Arc::new(
             threshold_cli_wrapper::ClaudeClient::new(
                 "claude".to_string(),
@@ -985,6 +1113,7 @@ mod tests {
                 300,
                 sessions,
                 locks,
+                tracker,
             )
             .await
             .unwrap(),
@@ -1007,6 +1136,7 @@ mod tests {
             tmp.path().join("cli-sessions.json"),
         ));
         let locks = Arc::new(threshold_cli_wrapper::ConversationLockMap::new());
+        let tracker = Arc::new(threshold_cli_wrapper::ProcessTracker::new());
         let claude = Arc::new(
             threshold_cli_wrapper::ClaudeClient::new(
                 "claude".to_string(),
@@ -1015,6 +1145,7 @@ mod tests {
                 300,
                 sessions,
                 locks,
+                tracker,
             )
             .await
             .unwrap(),
@@ -1158,6 +1289,7 @@ mod tests {
             dir.join("cli").join("cli-sessions.json"),
         ));
         let locks = Arc::new(threshold_cli_wrapper::ConversationLockMap::new());
+        let tracker = Arc::new(threshold_cli_wrapper::ProcessTracker::new());
         let claude = Arc::new(
             threshold_cli_wrapper::ClaudeClient::new(
                 "claude".to_string(),
@@ -1166,6 +1298,7 @@ mod tests {
                 300,
                 sessions,
                 locks,
+                tracker,
             )
             .await
             .unwrap(),

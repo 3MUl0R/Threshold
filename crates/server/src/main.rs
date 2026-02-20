@@ -115,6 +115,7 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
         ),
     );
     let conversation_locks = Arc::new(threshold_cli_wrapper::ConversationLockMap::new());
+    let process_tracker = Arc::new(threshold_cli_wrapper::ProcessTracker::new());
     let timeout_secs = config.cli.claude.timeout_seconds.unwrap_or(21600);
     let claude = Arc::new(
         ClaudeClient::new(
@@ -129,6 +130,7 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
             timeout_secs,
             session_manager.clone(),
             conversation_locks.clone(),
+            process_tracker.clone(),
         )
         .await?,
     );

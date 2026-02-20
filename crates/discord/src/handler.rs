@@ -77,11 +77,18 @@ async fn handle_message(
         // for the entire duration of the CLI invocation.
         let _typing = channel_id.start_typing(&http);
         if let Err(e) = engine.handle_message(&portal_id, &content).await {
-            tracing::error!(
-                error = %e,
-                portal_id = ?portal_id,
-                "Background message handling failed"
-            );
+            if matches!(e, threshold_core::ThresholdError::Aborted) {
+                tracing::info!(
+                    portal_id = ?portal_id,
+                    "Task aborted by user"
+                );
+            } else {
+                tracing::error!(
+                    error = %e,
+                    portal_id = ?portal_id,
+                    "Background message handling failed"
+                );
+            }
         }
     });
 
@@ -222,6 +229,7 @@ async fn portal_listener(
             ConversationEvent::Error {
                 conversation_id: cid,
                 error,
+                ..
             } if cid == conversation_id => {
                 let error_msg = format!("❌ Error: {}", error);
                 if let Err(e) = channel_id.say(&http, &error_msg).await {
@@ -229,6 +237,20 @@ async fn portal_listener(
                         error = %e,
                         portal_id = ?portal_id,
                         "Failed to send error message"
+                    );
+                }
+            }
+
+            // Handle abort notification
+            ConversationEvent::Aborted {
+                conversation_id: cid,
+                ..
+            } if cid == conversation_id => {
+                if let Err(e) = channel_id.say(&http, "Task aborted.").await {
+                    tracing::error!(
+                        error = %e,
+                        portal_id = ?portal_id,
+                        "Failed to send abort message"
                     );
                 }
             }

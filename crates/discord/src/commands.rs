@@ -88,6 +88,39 @@ pub async fn conversations(ctx: Context<'_>) -> Result {
     Ok(())
 }
 
+/// Abort the running task for this channel's conversation.
+#[poise::command(slash_command, prefix_command)]
+pub async fn abort(ctx: Context<'_>) -> Result {
+    let portal_id = resolve_portal(ctx).await;
+    let conversation_id = ctx
+        .data()
+        .engine
+        .get_portal_conversation(&portal_id)
+        .await?;
+
+    match ctx
+        .data()
+        .engine
+        .claude()
+        .tracker()
+        .abort_conversation(&conversation_id)
+        .await
+    {
+        Ok(run_id) => {
+            ctx.say(format!("Aborting task {}...", run_id))
+                .await
+                .ok();
+        }
+        Err(_) => {
+            ctx.say("Nothing to abort — no task is running for this conversation.")
+                .await
+                .ok();
+        }
+    }
+
+    Ok(())
+}
+
 /// Join a specific conversation by ID.
 #[poise::command(slash_command, prefix_command)]
 pub async fn join(

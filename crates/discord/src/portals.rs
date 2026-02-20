@@ -79,6 +79,7 @@ mod tests {
             ),
         );
         let locks = Arc::new(threshold_cli_wrapper::ConversationLockMap::new());
+        let tracker = Arc::new(threshold_cli_wrapper::ProcessTracker::new());
         let claude = Arc::new(
             ClaudeClient::new(
                 config.cli.claude.command.clone().unwrap_or_else(|| "claude".to_string()),
@@ -87,6 +88,7 @@ mod tests {
                 300,
                 sessions,
                 locks,
+                tracker,
             )
             .await
             .unwrap(),
@@ -111,6 +113,7 @@ mod tests {
             ),
         );
         let locks = Arc::new(threshold_cli_wrapper::ConversationLockMap::new());
+        let tracker = Arc::new(threshold_cli_wrapper::ProcessTracker::new());
         let claude = Arc::new(
             ClaudeClient::new(
                 config.cli.claude.command.clone().unwrap_or_else(|| "claude".to_string()),
@@ -119,6 +122,7 @@ mod tests {
                 300,
                 sessions,
                 locks,
+                tracker,
             )
             .await
             .unwrap(),

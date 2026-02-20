@@ -4,12 +4,13 @@
 
 use crate::locks::ConversationLockMap;
 use crate::models::resolve_model_alias;
-use crate::process::CliProcess;
+use crate::process::{CliProcess, StreamHandle};
 use crate::response::ClaudeResponse;
 use crate::session::SessionManager;
+use crate::tracker::ProcessTracker;
 use std::path::PathBuf;
 use std::sync::Arc;
-use threshold_core::{Result, ThresholdError};
+use threshold_core::{ConversationId, Result, RunId, ThresholdError};
 use uuid::Uuid;
 
 // Note: SessionManager is wrapped in Arc because we need to share it
@@ -20,6 +21,7 @@ pub struct ClaudeClient {
     process: CliProcess,
     sessions: Arc<SessionManager>,
     locks: Arc<ConversationLockMap>,
+    tracker: Arc<ProcessTracker>,
     skip_permissions: bool,
 }
 
@@ -40,6 +42,7 @@ impl ClaudeClient {
         timeout_secs: u64,
         sessions: Arc<SessionManager>,
         locks: Arc<ConversationLockMap>,
+        tracker: Arc<ProcessTracker>,
     ) -> Result<Self> {
         // Load existing sessions
         sessions.load().await?;
@@ -48,6 +51,7 @@ impl ClaudeClient {
             process: CliProcess::new(command).with_timeout(timeout_secs),
             sessions,
             locks,
+            tracker,
             skip_permissions,
         })
     }
@@ -60,6 +64,76 @@ impl ClaudeClient {
     /// Access the per-conversation lock map
     pub fn locks(&self) -> &Arc<ConversationLockMap> {
         &self.locks
+    }
+
+    /// Access the process tracker
+    pub fn tracker(&self) -> &Arc<ProcessTracker> {
+        &self.tracker
+    }
+
+    /// Send a message to Claude using streaming mode.
+    ///
+    /// **Important:** The caller must acquire the per-conversation lock before
+    /// calling this method and hold it until the stream is fully consumed.
+    /// This prevents overlapping runs in the same conversation.
+    ///
+    /// Session persistence is deferred to the caller (engine) — only after a
+    /// successful `Result` event should the session be saved.
+    ///
+    /// The `run_id` is registered with the `ProcessTracker` so `/abort` can
+    /// cancel the invocation.
+    pub async fn send_message_streaming(
+        &self,
+        conversation_id: Uuid,
+        run_id: RunId,
+        message: &str,
+        system_prompt: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<StreamHandle> {
+        // Check for existing session
+        let existing_session = self.sessions.get(conversation_id).await;
+
+        let args = if let Some(session_id) = existing_session {
+            tracing::debug!(
+                conversation_id = %conversation_id,
+                session_id = %session_id,
+                "resuming streaming CLI session"
+            );
+            self.build_resume_streaming_args(&session_id, message)
+        } else {
+            let session_id = Uuid::new_v4();
+            let resolved_model = model
+                .map(|m| resolve_model_alias(m).into_owned())
+                .unwrap_or_else(|| "sonnet".to_string());
+
+            tracing::debug!(
+                conversation_id = %conversation_id,
+                session_id = %session_id,
+                model = %resolved_model,
+                "starting new streaming CLI session"
+            );
+
+            self.build_new_session_streaming_args(
+                session_id,
+                message,
+                system_prompt,
+                &resolved_model,
+            )
+        };
+
+        // Register with process tracker
+        let abort_token = self
+            .tracker
+            .register(run_id, ConversationId(conversation_id))
+            .await;
+
+        // Spawn streaming process
+        let handle = self
+            .process
+            .run_streaming(&args, None, None, abort_token)
+            .await?;
+
+        Ok(handle)
     }
 
     /// Send a message to Claude
@@ -203,6 +277,56 @@ impl ClaudeClient {
         Ok(())
     }
 
+    fn build_new_session_streaming_args(
+        &self,
+        session_id: Uuid,
+        message: &str,
+        system_prompt: Option<&str>,
+        model: &str,
+    ) -> Vec<String> {
+        let mut args = vec![
+            "-p".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+        ];
+
+        if self.skip_permissions {
+            args.push("--dangerously-skip-permissions".to_string());
+        }
+
+        args.push("--session-id".to_string());
+        args.push(session_id.to_string());
+
+        args.push("--model".to_string());
+        args.push(model.to_string());
+
+        if let Some(prompt) = system_prompt {
+            args.push("--append-system-prompt".to_string());
+            args.push(prompt.to_string());
+        }
+
+        args.push(message.to_string());
+        args
+    }
+
+    fn build_resume_streaming_args(&self, session_id: &str, message: &str) -> Vec<String> {
+        let mut args = vec![
+            "-p".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+        ];
+
+        if self.skip_permissions {
+            args.push("--dangerously-skip-permissions".to_string());
+        }
+
+        args.push("--resume".to_string());
+        args.push(session_id.to_string());
+
+        args.push(message.to_string());
+        args
+    }
+
     fn build_new_session_args(
         &self,
         session_id: Uuid,
@@ -264,6 +388,7 @@ mod tests {
     async fn test_client(dir: &std::path::Path, skip_perms: bool) -> ClaudeClient {
         let sessions = Arc::new(SessionManager::new(dir.join("cli-sessions.json")));
         let locks = Arc::new(ConversationLockMap::new());
+        let tracker = Arc::new(ProcessTracker::new());
         ClaudeClient::new(
             "claude".to_string(),
             dir.to_path_buf(),
@@ -271,6 +396,7 @@ mod tests {
             300,
             sessions,
             locks,
+            tracker,
         )
         .await
         .unwrap()

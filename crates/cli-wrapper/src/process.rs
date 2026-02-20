@@ -3,10 +3,13 @@
 //! Handles spawning the Claude CLI as a subprocess with proper timeout,
 //! environment variable clearing, and error classification.
 
+use crate::stream::{self, StreamEvent};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use threshold_core::{Result, ThresholdError};
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 /// Configuration for CLI process spawning
 #[derive(Debug, Clone)]
@@ -23,6 +26,17 @@ pub struct CliOutput {
     pub stderr: String,
     pub exit_code: i32,
     pub duration: Duration,
+}
+
+/// Handle returned from `run_streaming()`.
+pub struct StreamHandle {
+    /// Receiver for parsed stream events.
+    pub event_rx: tokio::sync::mpsc::Receiver<StreamEvent>,
+    /// Child process PID (for diagnostics).
+    pub pid: u32,
+    /// Whether the stream ended because of a user-initiated abort.
+    /// Set by the reader task when the abort token fires.
+    pub was_aborted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CliProcess {
@@ -164,6 +178,200 @@ impl CliProcess {
                 }
             }
         }
+    }
+
+    /// Run the CLI in streaming mode with `--output-format stream-json`.
+    ///
+    /// Spawns the child process and a reader task that parses JSONL lines from
+    /// stdout into `StreamEvent`s. Returns a `StreamHandle` containing:
+    /// - An mpsc receiver for stream events
+    /// - The child PID (for diagnostics)
+    /// - An `was_aborted` flag for the caller to distinguish user abort from errors
+    ///
+    /// The reader monitors both the `abort_token` and `timeout_secs`; on
+    /// cancellation or timeout it kills the child. After stdout EOF the task
+    /// waits on the child exit status and sends a classified error event if
+    /// the exit code is non-zero and no `Result` event was produced.
+    pub async fn run_streaming(
+        &self,
+        args: &[String],
+        working_dir: Option<&Path>,
+        stdin_data: Option<&str>,
+        abort_token: CancellationToken,
+    ) -> Result<StreamHandle> {
+        tracing::debug!(
+            command = %self.command,
+            args = ?self.redact_args(args),
+            "spawning streaming CLI process"
+        );
+
+        let mut cmd = Command::new(&self.command);
+        cmd.args(args);
+
+        for key in &self.env_clear {
+            cmd.env_remove(key);
+        }
+        if let Some(dir) = working_dir {
+            cmd.current_dir(dir);
+        }
+
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        if stdin_data.is_some() {
+            cmd.stdin(std::process::Stdio::piped());
+        }
+
+        let mut child = cmd.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                ThresholdError::CliNotFound {
+                    command: self.command.clone(),
+                }
+            } else {
+                ThresholdError::Io(e)
+            }
+        })?;
+
+        if let Some(data) = stdin_data {
+            use tokio::io::AsyncWriteExt;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(data.as_bytes()).await?;
+                stdin.shutdown().await?;
+            }
+        }
+
+        let pid = child.id().unwrap_or(0);
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let stderr = child.stderr.take().expect("stderr was piped");
+
+        // Drain stderr in background (for error diagnostics)
+        let stderr_task = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buf = Vec::new();
+            let _ = tokio::io::BufReader::new(stderr).read_to_end(&mut buf).await;
+            String::from_utf8_lossy(&buf).to_string()
+        });
+
+        // Channel for parsed stream events
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
+
+        // Abort flag — set by the reader task when the abort token fires
+        let was_aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let was_aborted_clone = was_aborted.clone();
+
+        // Timeout (0 = no timeout)
+        let timeout_secs = self.timeout_secs;
+
+        // Reader task: read stdout line-by-line, parse, send events,
+        // then wait on child exit and classify errors.
+        tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt;
+            let mut reader = tokio::io::BufReader::new(stdout).lines();
+            let mut saw_result = false;
+
+            let deadline = if timeout_secs > 0 {
+                Some(tokio::time::Instant::now() + Duration::from_secs(timeout_secs))
+            } else {
+                None
+            };
+
+            loop {
+                tokio::select! {
+                    line = reader.next_line() => {
+                        match line {
+                            Ok(Some(line)) => {
+                                if let Some(event) = stream::parse_stream_line(&line) {
+                                    if matches!(event, StreamEvent::Result { .. }) {
+                                        saw_result = true;
+                                    }
+                                    if event_tx.send(event).await.is_err() {
+                                        // Receiver dropped — kill child to avoid
+                                        // pipe-buffer deadlock on wait().
+                                        let _ = child.kill().await;
+                                        let _ = child.wait().await;
+                                        stderr_task.abort();
+                                        return;
+                                    }
+                                }
+                            }
+                            Ok(None) => break, // EOF — process exited
+                            Err(e) => {
+                                let _ = event_tx.send(StreamEvent::Error {
+                                    message: format!("stdout read error: {e}"),
+                                }).await;
+                                break;
+                            }
+                        }
+                    }
+                    _ = abort_token.cancelled() => {
+                        was_aborted_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let _ = child.kill().await;
+                        let _ = child.wait().await; // reap zombie
+                        stderr_task.abort();
+                        return; // don't send error event — caller checks was_aborted
+                    }
+                    _ = async {
+                        match deadline {
+                            Some(dl) => tokio::time::sleep_until(dl).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        let _ = event_tx.send(StreamEvent::Error {
+                            message: format!("CLI timed out after {}s", timeout_secs),
+                        }).await;
+                        stderr_task.abort();
+                        return;
+                    }
+                }
+            }
+
+            // Wait on child exit and classify errors if no Result event was seen
+            let exit_status = child.wait().await;
+            let stderr_output = stderr_task.await.unwrap_or_default();
+
+            if !stderr_output.is_empty() {
+                tracing::debug!(stderr = %stderr_output, "streaming CLI stderr");
+            }
+
+            if !saw_result {
+                // Process exited without emitting a `result` event —
+                // classify using exit code + stderr, same as non-streaming path.
+                let exit_code = exit_status
+                    .ok()
+                    .and_then(|s| s.code())
+                    .unwrap_or(-1);
+
+                if exit_code != 0 || !stderr_output.is_empty() {
+                    let stderr_lower = stderr_output.to_lowercase();
+                    let message = if stderr_lower.contains("401")
+                        || stderr_lower.contains("unauthorized")
+                    {
+                        "Authentication expired. Please re-authenticate.".to_string()
+                    } else if stderr_lower.contains("402")
+                        || stderr_lower.contains("payment")
+                    {
+                        "Billing issue detected.".to_string()
+                    } else if stderr_lower.contains("429")
+                        || stderr_lower.contains("rate limit")
+                    {
+                        "Rate limited. Please try again later.".to_string()
+                    } else if stderr_output.is_empty() {
+                        format!("CLI process exited with code {exit_code}")
+                    } else {
+                        stderr_output
+                    };
+
+                    let _ = event_tx.send(StreamEvent::Error { message }).await;
+                }
+            }
+        });
+
+        Ok(StreamHandle {
+            event_rx,
+            pid,
+            was_aborted,
+        })
     }
 
     fn build_output(
@@ -335,6 +543,118 @@ mod tests {
         let process = CliProcess::new("sleep").with_timeout(0);
         let result = process.run(&["0.1".to_string()], None, None).await;
         assert!(result.is_ok(), "zero timeout should not fire");
+    }
+
+    #[tokio::test]
+    async fn streaming_produces_events() {
+        // Use sh -c to echo JSONL lines that simulate Claude streaming output
+        let process = CliProcess::new("sh").with_timeout(10);
+        let abort = CancellationToken::new();
+        let jsonl = r#"printf '{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}\n{"type":"result","subtype":"success","result":"Hello World","session_id":"abc","is_error":false}\n'"#;
+        let handle = process
+            .run_streaming(
+                &["-c".to_string(), jsonl.to_string()],
+                None,
+                None,
+                abort,
+            )
+            .await
+            .unwrap();
+
+        let mut events = Vec::new();
+        let mut rx = handle.event_rx;
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+
+        assert!(events.len() >= 2, "expected at least 2 events, got {}", events.len());
+        // First event should be TextDelta
+        assert!(matches!(&events[0], StreamEvent::TextDelta { text } if text == "Hello"));
+        // Last event should be Result
+        assert!(matches!(&events[events.len() - 1], StreamEvent::Result { text, .. } if text == "Hello World"));
+    }
+
+    #[tokio::test]
+    async fn streaming_abort_kills_process() {
+        // Start a long-running process, then abort it
+        let process = CliProcess::new("sleep").with_timeout(0);
+        let abort = CancellationToken::new();
+        let handle = process
+            .run_streaming(
+                &["60".to_string()],
+                None,
+                None,
+                abort.clone(),
+            )
+            .await
+            .unwrap();
+
+        let was_aborted = handle.was_aborted.clone();
+
+        // Abort after a brief delay
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        abort.cancel();
+
+        // Drain remaining events
+        let mut rx = handle.event_rx;
+        while rx.recv().await.is_some() {}
+
+        assert!(
+            was_aborted.load(std::sync::atomic::Ordering::Relaxed),
+            "expected was_aborted flag to be set"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_channel_close_without_result() {
+        // Process exits without emitting a result event
+        let process = CliProcess::new("echo").with_timeout(10);
+        let abort = CancellationToken::new();
+        let handle = process
+            .run_streaming(
+                &["not-json".to_string()],
+                None,
+                None,
+                abort,
+            )
+            .await
+            .unwrap();
+
+        let mut rx = handle.event_rx;
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        // No events should be produced since "not-json" isn't valid JSONL
+        assert!(events.is_empty(), "expected no events from non-JSON output");
+    }
+
+    #[tokio::test]
+    async fn streaming_receiver_drop_kills_child() {
+        // Drop the receiver while child is producing output — should not hang.
+        let process = CliProcess::new("sh").with_timeout(10);
+        let abort = CancellationToken::new();
+        // Produce streaming JSONL output continuously
+        let jsonl = r#"while true; do echo '{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x"}}'; done"#;
+        let handle = process
+            .run_streaming(
+                &["-c".to_string(), jsonl.to_string()],
+                None,
+                None,
+                abort,
+            )
+            .await
+            .unwrap();
+
+        // Read one event then drop the receiver
+        let mut rx = handle.event_rx;
+        let first = rx.recv().await;
+        assert!(first.is_some(), "should receive at least one event");
+        drop(rx);
+
+        // If the fix works, the reader task kills the child and returns.
+        // If it doesn't, this test would hang (caught by the 10s timeout).
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
     #[test]

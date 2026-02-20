@@ -46,6 +46,7 @@ pub async fn build_and_start(
                 commands::research(),
                 commands::conversations(),
                 commands::join(),
+                commands::abort(),
                 scheduler_commands::schedule(),
                 scheduler_commands::schedules(),
                 scheduler_commands::heartbeat(),

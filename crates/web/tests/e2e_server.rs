@@ -53,6 +53,7 @@ async fn main() {
         data_dir.join("cli-sessions").join("cli-sessions.json"),
     ));
     let locks = Arc::new(threshold_cli_wrapper::ConversationLockMap::new());
+    let tracker = Arc::new(threshold_cli_wrapper::ProcessTracker::new());
     let claude = Arc::new(
         threshold_cli_wrapper::ClaudeClient::new(
             "echo".into(),
@@ -61,6 +62,7 @@ async fn main() {
             300,
             sessions,
             locks,
+            tracker,
         )
         .await
         .unwrap(),

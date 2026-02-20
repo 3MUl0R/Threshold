@@ -119,6 +119,7 @@ mod integration_tests {
             data_dir.join("cli-sessions").join("cli-sessions.json"),
         ));
         let locks = Arc::new(threshold_cli_wrapper::ConversationLockMap::new());
+        let tracker = Arc::new(threshold_cli_wrapper::ProcessTracker::new());
         let claude = Arc::new(
             threshold_cli_wrapper::ClaudeClient::new(
                 "echo".into(),
@@ -127,6 +128,7 @@ mod integration_tests {
                 300,
                 sessions,
                 locks,
+                tracker,
             )
             .await
             .unwrap(),
