@@ -1,8 +1,13 @@
 //! Streaming event model for Claude CLI `--output-format stream-json`.
 //!
-//! The Claude CLI with `--output-format stream-json` emits JSONL events on
-//! stdout. Each line is a JSON object with a `type` field. We parse these
-//! into a simplified `StreamEvent` enum for consumption by the engine.
+//! The Claude CLI emits JSONL on stdout with these event types:
+//!   - `system`: init (session info, tools, model)
+//!   - `assistant`: a full turn response with content blocks (text, tool_use)
+//!   - `result`: final summary with aggregated usage
+//!
+//! Each `assistant` event contains a `message.content` array with content
+//! blocks. We expand these into individual `StreamEvent` variants so the
+//! engine can track tool use and text output for status updates.
 
 use crate::response::Usage;
 use serde_json::Value;
@@ -10,7 +15,7 @@ use serde_json::Value;
 /// Events parsed from Claude CLI streaming output.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
-    /// Partial text content from the assistant.
+    /// Text content from the assistant (may be a full block, not a delta).
     TextDelta { text: String },
 
     /// The assistant is using a tool.
@@ -37,69 +42,86 @@ pub enum StreamEvent {
     Error { message: String },
 }
 
-/// Parse a single JSONL line into a `StreamEvent`.
+/// Parse a single JSONL line into zero or more `StreamEvent`s.
 ///
-/// Returns `None` for lines that don't map to a meaningful event
-/// (e.g., `system`, `message_start`, `content_block_stop`, etc.).
-pub fn parse_stream_line(line: &str) -> Option<StreamEvent> {
-    let json: Value = serde_json::from_str(line).ok()?;
-    let event_type = json.get("type")?.as_str()?;
+/// Returns an empty vec for lines that don't map to meaningful events
+/// (e.g., `system` init). An `assistant` event can produce multiple
+/// events (one per content block).
+pub fn parse_stream_line(line: &str) -> Vec<StreamEvent> {
+    let json: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let event_type = match json.get("type").and_then(|v| v.as_str()) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
 
     match event_type {
-        "content_block_delta" => parse_content_delta(&json),
-        "content_block_start" => parse_content_block_start(&json),
-        "result" => Some(parse_result(&json)),
-        _ => None, // system, assistant, message_stop, content_block_stop, etc.
+        "assistant" => parse_assistant_event(&json),
+        "result" => vec![parse_result(&json)],
+        _ => Vec::new(), // system, etc.
     }
 }
 
-/// Parse a content_block_delta event (text or tool input).
-fn parse_content_delta(json: &Value) -> Option<StreamEvent> {
-    let delta = json.get("delta")?;
-    let delta_type = delta.get("type")?.as_str()?;
+/// Parse an `assistant` event — walk the content blocks and emit
+/// TextDelta / ToolUse events for each one.
+fn parse_assistant_event(json: &Value) -> Vec<StreamEvent> {
+    let mut events = Vec::new();
+    let content = match json
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    {
+        Some(arr) => arr,
+        None => return events,
+    };
 
-    match delta_type {
-        "text_delta" => {
-            let text = delta.get("text")?.as_str()?.to_string();
-            Some(StreamEvent::TextDelta { text })
+    for block in content {
+        let block_type = match block.get("type").and_then(|t| t.as_str()) {
+            Some(t) => t,
+            None => continue,
+        };
+        match block_type {
+            "text" => {
+                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                    if !text.is_empty() {
+                        events.push(StreamEvent::TextDelta {
+                            text: text.to_string(),
+                        });
+                    }
+                }
+            }
+            "tool_use" => {
+                let tool_name = block
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                // input_preview is available but currently unused by the engine
+                // (only tool_name is logged). Skip serialization to avoid
+                // allocating large strings for big tool inputs.
+                let input_preview = None;
+                events.push(StreamEvent::ToolUse {
+                    tool_name,
+                    input_preview,
+                });
+            }
+            "tool_result" => {
+                let is_error = block
+                    .get("is_error")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                events.push(StreamEvent::ToolResult {
+                    tool_name: "tool".to_string(),
+                    is_error,
+                });
+            }
+            _ => {} // server_tool_use, etc.
         }
-        // Input JSON deltas for tool use — skip (we capture tool name at start)
-        _ => None,
     }
-}
 
-/// Parse a content_block_start event (text block or tool use).
-fn parse_content_block_start(json: &Value) -> Option<StreamEvent> {
-    let block = json.get("content_block")?;
-    let block_type = block.get("type")?.as_str()?;
-
-    match block_type {
-        "tool_use" => {
-            let tool_name = block
-                .get("name")
-                .and_then(|n| n.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            Some(StreamEvent::ToolUse {
-                tool_name,
-                input_preview: None,
-            })
-        }
-        "tool_result" => {
-            // Tool results appear as content blocks; extract error status
-            let is_error = block
-                .get("is_error")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            // Tool name isn't in the result block; use placeholder
-            Some(StreamEvent::ToolResult {
-                tool_name: "tool".to_string(),
-                is_error,
-            })
-        }
-        // "text" content_block_start is just a container — no data yet
-        _ => None,
-    }
+    events
 }
 
 /// Parse a result event (final output from the CLI).
@@ -147,41 +169,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_text_delta() {
-        let line = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello "}}"#;
-        let event = parse_stream_line(line).unwrap();
-        match event {
-            StreamEvent::TextDelta { text } => assert_eq!(text, "Hello "),
-            _ => panic!("expected TextDelta, got {:?}", event),
+    fn parse_assistant_text_only() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello World"}]}}"#;
+        let events = parse_stream_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            StreamEvent::TextDelta { text } => assert_eq!(text, "Hello World"),
+            other => panic!("expected TextDelta, got {:?}", other),
         }
     }
 
     #[test]
-    fn parse_tool_use() {
-        let line = r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01","name":"Read","input":{}}}"#;
-        let event = parse_stream_line(line).unwrap();
-        match event {
-            StreamEvent::ToolUse { tool_name, .. } => assert_eq!(tool_name, "Read"),
-            _ => panic!("expected ToolUse, got {:?}", event),
+    fn parse_assistant_tool_use() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_01","name":"Read","input":{"path":"/tmp/test"}}]}}"#;
+        let events = parse_stream_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            StreamEvent::ToolUse {
+                tool_name,
+                input_preview,
+            } => {
+                assert_eq!(tool_name, "Read");
+                // input_preview is intentionally None (unused, avoids large allocs)
+                assert!(input_preview.is_none());
+            }
+            other => panic!("expected ToolUse, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn parse_assistant_mixed_content() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Let me read that file."},{"type":"tool_use","id":"toolu_01","name":"Read","input":{}}]}}"#;
+        let events = parse_stream_line(line);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], StreamEvent::TextDelta { .. }));
+        assert!(matches!(&events[1], StreamEvent::ToolUse { .. }));
     }
 
     #[test]
     fn parse_result_success() {
         let line = r#"{"type":"result","subtype":"success","result":"Hello World","session_id":"abc-123","is_error":false,"usage":{"input_tokens":100,"output_tokens":50}}"#;
-        let event = parse_stream_line(line).unwrap();
-        match event {
+        let events = parse_stream_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
             StreamEvent::Result {
                 text,
                 session_id,
                 usage,
             } => {
                 assert_eq!(text, "Hello World");
-                assert_eq!(session_id, Some("abc-123".to_string()));
+                assert_eq!(session_id, &Some("abc-123".to_string()));
                 assert!(usage.is_some());
-                assert_eq!(usage.unwrap().input_tokens, Some(100));
+                assert_eq!(usage.as_ref().unwrap().input_tokens, Some(100));
             }
-            _ => panic!("expected Result, got {:?}", event),
+            other => panic!("expected Result, got {:?}", other),
         }
     }
 
@@ -189,52 +230,98 @@ mod tests {
     fn parse_result_error() {
         let line =
             r#"{"type":"result","is_error":true,"error":"Rate limited","session_id":"abc"}"#;
-        let event = parse_stream_line(line).unwrap();
-        match event {
+        let events = parse_stream_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
             StreamEvent::Error { message } => assert_eq!(message, "Rate limited"),
-            _ => panic!("expected Error, got {:?}", event),
+            other => panic!("expected Error, got {:?}", other),
         }
     }
 
     #[test]
-    fn parse_unknown_type_ignored() {
+    fn parse_assistant_tool_result() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"file contents","is_error":false}]}}"#;
+        let events = parse_stream_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            StreamEvent::ToolResult { is_error, .. } => assert!(!*is_error),
+            other => panic!("expected ToolResult, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_assistant_tool_result_error() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"error output","is_error":true}]}}"#;
+        let events = parse_stream_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            StreamEvent::ToolResult { is_error, .. } => assert!(*is_error),
+            other => panic!("expected ToolResult, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_system_init_ignored() {
         let line = r#"{"type":"system","subtype":"init","session_id":"abc"}"#;
-        assert!(parse_stream_line(line).is_none());
+        assert!(parse_stream_line(line).is_empty());
     }
 
     #[test]
-    fn parse_message_stop_ignored() {
-        let line = r#"{"type":"message_stop"}"#;
-        assert!(parse_stream_line(line).is_none());
-    }
-
-    #[test]
-    fn parse_invalid_json_returns_none() {
-        assert!(parse_stream_line("not json").is_none());
-        assert!(parse_stream_line("").is_none());
-    }
-
-    #[test]
-    fn parse_tool_result_block() {
-        let line = r#"{"type":"content_block_start","index":2,"content_block":{"type":"tool_result","tool_use_id":"toolu_01","content":"file contents"}}"#;
-        let event = parse_stream_line(line).unwrap();
-        match event {
-            StreamEvent::ToolResult { is_error, .. } => assert!(!is_error),
-            _ => panic!("expected ToolResult, got {:?}", event),
-        }
+    fn parse_invalid_json_returns_empty() {
+        assert!(parse_stream_line("not json").is_empty());
+        assert!(parse_stream_line("").is_empty());
     }
 
     #[test]
     fn parse_result_without_usage() {
         let line =
             r#"{"type":"result","subtype":"success","result":"Done","is_error":false}"#;
-        let event = parse_stream_line(line).unwrap();
-        match event {
+        let events = parse_stream_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
             StreamEvent::Result { text, usage, .. } => {
                 assert_eq!(text, "Done");
                 assert!(usage.is_none());
             }
-            _ => panic!("expected Result"),
+            other => panic!("expected Result, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_assistant_empty_text_skipped() {
+        let line =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":""}]}}"#;
+        let events = parse_stream_line(line);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_use_input_preview_always_none() {
+        // input_preview is always None to avoid serializing large tool inputs
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"cmd":"echo hello"}}]}}"#;
+        let events = parse_stream_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            StreamEvent::ToolUse {
+                tool_name,
+                input_preview,
+            } => {
+                assert_eq!(tool_name, "Bash");
+                assert!(input_preview.is_none());
+            }
+            other => panic!("expected ToolUse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_real_cli_output() {
+        // Actual format from Claude CLI --verbose --output-format stream-json
+        let line = r#"{"type":"assistant","message":{"model":"claude-opus-4-6","id":"msg_01","type":"message","role":"assistant","content":[{"type":"text","text":"Hello to you!"}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":3,"output_tokens":2}},"session_id":"abc-123"}"#;
+        let events = parse_stream_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            StreamEvent::TextDelta { text } => assert_eq!(text, "Hello to you!"),
+            other => panic!("expected TextDelta, got {:?}", other),
         }
     }
 }

@@ -282,7 +282,8 @@ impl CliProcess {
                     line = reader.next_line() => {
                         match line {
                             Ok(Some(line)) => {
-                                if let Some(event) = stream::parse_stream_line(&line) {
+                                let events = stream::parse_stream_line(&line);
+                                for event in events {
                                     if matches!(event, StreamEvent::Result { .. }) {
                                         saw_result = true;
                                     }
@@ -550,10 +551,11 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_produces_events() {
-        // Use sh -c to echo JSONL lines that simulate Claude streaming output
+        // Use sh -c to echo JSONL lines that simulate Claude CLI stream-json output.
+        // The CLI emits: system → assistant (per turn) → result.
         let process = CliProcess::new("sh").with_timeout(10);
         let abort = CancellationToken::new();
-        let jsonl = r#"printf '{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}\n{"type":"result","subtype":"success","result":"Hello World","session_id":"abc","is_error":false}\n'"#;
+        let jsonl = r#"printf '{"type":"assistant","message":{"content":[{"type":"text","text":"Hello"}]}}\n{"type":"result","subtype":"success","result":"Hello World","session_id":"abc","is_error":false}\n'"#;
         let handle = process
             .run_streaming(
                 &["-c".to_string(), jsonl.to_string()],
@@ -571,7 +573,7 @@ mod tests {
         }
 
         assert!(events.len() >= 2, "expected at least 2 events, got {}", events.len());
-        // First event should be TextDelta
+        // First event should be TextDelta (from assistant message content)
         assert!(matches!(&events[0], StreamEvent::TextDelta { text } if text == "Hello"));
         // Last event should be Result
         assert!(matches!(&events[events.len() - 1], StreamEvent::Result { text, .. } if text == "Hello World"));
@@ -637,8 +639,8 @@ mod tests {
         // Drop the receiver while child is producing output — should not hang.
         let process = CliProcess::new("sh").with_timeout(10);
         let abort = CancellationToken::new();
-        // Produce streaming JSONL output continuously
-        let jsonl = r#"while true; do echo '{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x"}}'; done"#;
+        // Produce streaming JSONL output continuously (assistant events with text)
+        let jsonl = r#"while true; do echo '{"type":"assistant","message":{"content":[{"type":"text","text":"x"}]}}'; done"#;
         let handle = process
             .run_streaming(
                 &["-c".to_string(), jsonl.to_string()],
