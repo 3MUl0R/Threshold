@@ -286,6 +286,7 @@ impl ClaudeClient {
     ) -> Vec<String> {
         let mut args = vec![
             "-p".to_string(),
+            "--verbose".to_string(),
             "--output-format".to_string(),
             "stream-json".to_string(),
         ];
@@ -312,6 +313,7 @@ impl ClaudeClient {
     fn build_resume_streaming_args(&self, session_id: &str, message: &str) -> Vec<String> {
         let mut args = vec![
             "-p".to_string(),
+            "--verbose".to_string(),
             "--output-format".to_string(),
             "stream-json".to_string(),
         ];
