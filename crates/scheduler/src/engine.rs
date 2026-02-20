@@ -18,7 +18,6 @@ use threshold_cli_wrapper::ClaudeClient;
 use threshold_conversation::ConversationEngine;
 use threshold_core::{ActiveConversations, ResultSender, ScheduledAction, ThresholdError};
 
-use crate::cron_utils;
 use crate::execution;
 use crate::store;
 use crate::task::{ScheduledTask, TaskRunResult};
@@ -408,7 +407,7 @@ impl Scheduler {
 
             // Update next_run immediately (don't wait for execution)
             if let Some(task) = self.tasks.iter_mut().find(|t| t.id == task_id) {
-                task.next_run = cron_utils::compute_next_run(&task.cron_expression);
+                task.refresh_next_run();
             }
 
             let task_snapshot = match self.tasks.iter().find(|t| t.id == task_id).cloned() {

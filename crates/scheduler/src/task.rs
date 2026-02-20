@@ -38,6 +38,12 @@ pub struct ScheduledTask {
     /// If true, skip this firing when the previous execution is still running.
     #[serde(default)]
     pub skip_if_running: bool,
+
+    /// Optional IANA timezone for the cron expression (e.g., `America/Los_Angeles`).
+    /// When set, the cron expression is evaluated in this timezone and `next_run`
+    /// is stored as UTC, correctly handling DST transitions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
 }
 
 /// Explicit task identity — distinguishes heartbeats from user-created cron jobs.
@@ -100,12 +106,63 @@ impl ScheduledTask {
             portal_id: None,
             created_by_agent: false,
             skip_if_running: false,
+            timezone: None,
         })
     }
 
-    /// Recompute `next_run` from the current time using the stored cron expression.
+    /// Create a new scheduled task with timezone-aware scheduling.
+    ///
+    /// The cron expression is evaluated in the given IANA timezone (e.g.,
+    /// `America/Los_Angeles`), and `next_run` is stored as UTC.
+    pub fn new_with_timezone(
+        name: String,
+        cron_expression: String,
+        action: ScheduledAction,
+        timezone: String,
+    ) -> Result<Self, String> {
+        cron_utils::validate_cron(&cron_expression)?;
+        let tz = cron_utils::parse_timezone(&timezone)?;
+        let next_run = cron_utils::compute_next_run_tz(&cron_expression, &tz);
+
+        Ok(Self {
+            id: Uuid::new_v4(),
+            name,
+            cron_expression,
+            action,
+            enabled: true,
+            created_at: Utc::now(),
+            last_run: None,
+            last_result: None,
+            next_run,
+            kind: TaskKind::Cron,
+            delivery: DeliveryTarget::AuditLogOnly,
+            conversation_id: None,
+            portal_id: None,
+            created_by_agent: false,
+            skip_if_running: false,
+            timezone: Some(timezone),
+        })
+    }
+
+    /// Recompute `next_run` from the current time using the stored cron expression
+    /// and timezone (if set).
     pub fn refresh_next_run(&mut self) {
-        self.next_run = cron_utils::compute_next_run(&self.cron_expression);
+        self.next_run = if let Some(tz_str) = &self.timezone {
+            match cron_utils::parse_timezone(tz_str) {
+                Ok(tz) => cron_utils::compute_next_run_tz(&self.cron_expression, &tz),
+                Err(_) => {
+                    tracing::warn!(
+                        task_id = %self.id,
+                        task_name = %self.name,
+                        timezone = %tz_str,
+                        "Invalid timezone in persisted task, falling back to UTC"
+                    );
+                    cron_utils::compute_next_run(&self.cron_expression)
+                }
+            }
+        } else {
+            cron_utils::compute_next_run(&self.cron_expression)
+        };
     }
 }
 

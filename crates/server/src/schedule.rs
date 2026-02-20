@@ -2,8 +2,8 @@
 //!
 //! These commands communicate with the running daemon via Unix socket.
 
-use threshold_core::ScheduledAction;
-use threshold_scheduler::task::ScheduledTask;
+use threshold_core::{ConversationId, ScheduledAction};
+use threshold_scheduler::task::{DeliveryTarget, ScheduledTask};
 
 use crate::daemon_client::{DaemonClient, DaemonCommand};
 use crate::output::OutputFormat;
@@ -16,7 +16,7 @@ pub enum ScheduleCommands {
         /// Task name
         #[arg(short, long)]
         name: String,
-        /// Cron expression (e.g., "0 0 3 * * *" for 3 AM daily)
+        /// Cron expression (e.g., "0 0 12 * * *" for noon daily)
         #[arg(short, long)]
         cron: String,
         /// Prompt to send to Claude
@@ -25,6 +25,15 @@ pub enum ScheduleCommands {
         /// Model override (optional)
         #[arg(short, long)]
         model: Option<String>,
+        /// IANA timezone (e.g., "America/Los_Angeles"). Cron is evaluated in this timezone.
+        #[arg(long)]
+        timezone: Option<String>,
+        /// Deliver results to a Discord channel (channel ID)
+        #[arg(long)]
+        discord_channel: Option<u64>,
+        /// Deliver results as a Discord DM (user ID)
+        #[arg(long)]
+        discord_dm: Option<u64>,
         /// Output format
         #[arg(short = 'f', long, value_enum, default_value_t = OutputFormat::default())]
         format: OutputFormat,
@@ -43,6 +52,15 @@ pub enum ScheduleCommands {
         /// Working directory (optional)
         #[arg(short, long)]
         working_dir: Option<String>,
+        /// IANA timezone (e.g., "America/Los_Angeles"). Cron is evaluated in this timezone.
+        #[arg(long)]
+        timezone: Option<String>,
+        /// Deliver results to a Discord channel (channel ID)
+        #[arg(long)]
+        discord_channel: Option<u64>,
+        /// Deliver results as a Discord DM (user ID)
+        #[arg(long)]
+        discord_dm: Option<u64>,
         /// Output format
         #[arg(short = 'f', long, value_enum, default_value_t = OutputFormat::default())]
         format: OutputFormat,
@@ -64,6 +82,36 @@ pub enum ScheduleCommands {
         /// Model override (optional)
         #[arg(short = 'o', long)]
         model: Option<String>,
+        /// IANA timezone (e.g., "America/Los_Angeles"). Cron is evaluated in this timezone.
+        #[arg(long)]
+        timezone: Option<String>,
+        /// Deliver results to a Discord channel (channel ID)
+        #[arg(long)]
+        discord_channel: Option<u64>,
+        /// Deliver results as a Discord DM (user ID)
+        #[arg(long)]
+        discord_dm: Option<u64>,
+        /// Output format
+        #[arg(short = 'f', long, value_enum, default_value_t = OutputFormat::default())]
+        format: OutputFormat,
+    },
+    /// Schedule a recurring message to an existing conversation
+    Resume {
+        /// Task name
+        #[arg(short, long)]
+        name: String,
+        /// Cron expression
+        #[arg(short, long)]
+        cron: String,
+        /// Conversation ID to resume
+        #[arg(long)]
+        conversation_id: String,
+        /// Prompt to send to the conversation
+        #[arg(short, long)]
+        prompt: String,
+        /// IANA timezone (e.g., "America/Los_Angeles"). Cron is evaluated in this timezone.
+        #[arg(long)]
+        timezone: Option<String>,
         /// Output format
         #[arg(short = 'f', long, value_enum, default_value_t = OutputFormat::default())]
         format: OutputFormat,
@@ -110,16 +158,21 @@ pub async fn handle_schedule_command(command: ScheduleCommands) -> anyhow::Resul
             cron,
             prompt,
             model,
+            timezone,
+            discord_channel,
+            discord_dm,
             ..
         } => {
-            let task = build_task(
+            let mut task = build_task(
                 name.clone(),
                 cron.clone(),
                 ScheduledAction::NewConversation {
                     prompt: prompt.clone(),
                     model: model.clone(),
                 },
+                timezone.clone(),
             )?;
+            task.delivery = resolve_delivery(*discord_channel, *discord_dm);
             DaemonCommand::ScheduleCreate(task)
         }
         ScheduleCommands::Script {
@@ -127,16 +180,21 @@ pub async fn handle_schedule_command(command: ScheduleCommands) -> anyhow::Resul
             cron,
             command: cmd,
             working_dir,
+            timezone,
+            discord_channel,
+            discord_dm,
             ..
         } => {
-            let task = build_task(
+            let mut task = build_task(
                 name.clone(),
                 cron.clone(),
                 ScheduledAction::Script {
                     command: cmd.clone(),
                     working_dir: working_dir.clone(),
                 },
+                timezone.clone(),
             )?;
+            task.delivery = resolve_delivery(*discord_channel, *discord_dm);
             DaemonCommand::ScheduleCreate(task)
         }
         ScheduleCommands::Monitor {
@@ -145,9 +203,12 @@ pub async fn handle_schedule_command(command: ScheduleCommands) -> anyhow::Resul
             command: cmd,
             prompt_template,
             model,
+            timezone,
+            discord_channel,
+            discord_dm,
             ..
         } => {
-            let task = build_task(
+            let mut task = build_task(
                 name.clone(),
                 cron.clone(),
                 ScheduledAction::ScriptThenConversation {
@@ -155,7 +216,35 @@ pub async fn handle_schedule_command(command: ScheduleCommands) -> anyhow::Resul
                     prompt_template: prompt_template.clone(),
                     model: model.clone(),
                 },
+                timezone.clone(),
             )?;
+            task.delivery = resolve_delivery(*discord_channel, *discord_dm);
+            DaemonCommand::ScheduleCreate(task)
+        }
+        ScheduleCommands::Resume {
+            name,
+            cron,
+            conversation_id,
+            prompt,
+            timezone,
+            ..
+        } => {
+            let conv_id = ConversationId(
+                uuid::Uuid::parse_str(conversation_id)
+                    .map_err(|e| anyhow::anyhow!("Invalid conversation ID: {}", e))?,
+            );
+            let mut task = build_task(
+                name.clone(),
+                cron.clone(),
+                ScheduledAction::ResumeConversation {
+                    conversation_id: conv_id,
+                    prompt: prompt.clone(),
+                },
+                timezone.clone(),
+            )?;
+            // Mark as conversation-attached so deliver_result() skips
+            // duplicate delivery — output goes through the portal system.
+            task.conversation_id = Some(conv_id);
             DaemonCommand::ScheduleCreate(task)
         }
         ScheduleCommands::List { .. } => DaemonCommand::ScheduleList,
@@ -177,6 +266,7 @@ pub async fn handle_schedule_command(command: ScheduleCommands) -> anyhow::Resul
         ScheduleCommands::Conversation { format, .. }
         | ScheduleCommands::Script { format, .. }
         | ScheduleCommands::Monitor { format, .. }
+        | ScheduleCommands::Resume { format, .. }
         | ScheduleCommands::List { format, .. }
         | ScheduleCommands::Delete { format, .. }
         | ScheduleCommands::Enable { format, .. }
@@ -188,13 +278,27 @@ pub async fn handle_schedule_command(command: ScheduleCommands) -> anyhow::Resul
     Ok(())
 }
 
-/// Build a `ScheduledTask` from CLI arguments.
-///
-/// Validates the cron expression and computes the initial `next_run`.
+/// Build a `ScheduledTask` from CLI arguments, optionally timezone-aware.
 fn build_task(
     name: String,
     cron: String,
     action: ScheduledAction,
+    timezone: Option<String>,
 ) -> anyhow::Result<ScheduledTask> {
-    ScheduledTask::new(name, cron, action).map_err(|e| anyhow::anyhow!("{}", e))
+    match timezone {
+        Some(tz) => ScheduledTask::new_with_timezone(name, cron, action, tz)
+            .map_err(|e| anyhow::anyhow!("{}", e)),
+        None => ScheduledTask::new(name, cron, action).map_err(|e| anyhow::anyhow!("{}", e)),
+    }
+}
+
+/// Resolve delivery target from CLI flags. Prefers channel over DM.
+fn resolve_delivery(discord_channel: Option<u64>, discord_dm: Option<u64>) -> DeliveryTarget {
+    if let Some(channel_id) = discord_channel {
+        DeliveryTarget::DiscordChannel { channel_id }
+    } else if let Some(user_id) = discord_dm {
+        DeliveryTarget::DiscordDm { user_id }
+    } else {
+        DeliveryTarget::AuditLogOnly
+    }
 }

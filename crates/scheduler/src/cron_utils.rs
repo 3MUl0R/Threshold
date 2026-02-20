@@ -11,9 +11,12 @@
 //! For convenience, 6-field expressions (without year) are accepted and
 //! automatically normalized by appending `*` for the year field.
 //!
-//! **All times are UTC.**
+//! Times are UTC by default. An optional IANA timezone (e.g., `America/Los_Angeles`)
+//! can be provided for timezone-aware scheduling — the cron expression is evaluated
+//! in local time and the resulting `next_run` is stored as UTC.
 
 use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use std::str::FromStr;
 
 /// Normalize a cron expression to 7 fields.
@@ -44,6 +47,40 @@ pub fn compute_next_run_after(cron_expr: &str, after: DateTime<Utc>) -> Option<D
     let normalized = normalize_cron(cron_expr);
     let schedule = cron::Schedule::from_str(&normalized).ok()?;
     schedule.after(&after).next()
+}
+
+/// Compute the next run time for a timezone-aware cron expression.
+///
+/// The cron expression is evaluated in the given IANA timezone (e.g.,
+/// `America/Los_Angeles`), and the result is converted to UTC. This means
+/// "noon daily" in Pacific time will correctly shift between 20:00 UTC (PST)
+/// and 19:00 UTC (PDT) across daylight saving transitions.
+///
+/// Returns `None` if the expression is invalid or has no upcoming occurrence.
+pub fn compute_next_run_tz(cron_expr: &str, tz: &Tz) -> Option<DateTime<Utc>> {
+    compute_next_run_after_tz(cron_expr, Utc::now(), tz)
+}
+
+/// Compute the next run time for a timezone-aware cron expression after a given time.
+pub fn compute_next_run_after_tz(
+    cron_expr: &str,
+    after: DateTime<Utc>,
+    tz: &Tz,
+) -> Option<DateTime<Utc>> {
+    let normalized = normalize_cron(cron_expr);
+    let schedule = cron::Schedule::from_str(&normalized).ok()?;
+    let after_local = after.with_timezone(tz);
+    let next_local = schedule.after(&after_local).next()?;
+    Some(next_local.with_timezone(&Utc))
+}
+
+/// Parse and validate an IANA timezone string.
+///
+/// Returns the parsed `Tz` or an error message.
+pub fn parse_timezone(tz_str: &str) -> Result<Tz, String> {
+    tz_str
+        .parse::<Tz>()
+        .map_err(|_| format!("Unknown timezone: '{}'. Use an IANA timezone like 'America/Los_Angeles' or 'US/Pacific'.", tz_str))
 }
 
 /// Validate a cron expression without computing a next run time.
@@ -141,5 +178,105 @@ mod tests {
         let next = next.unwrap();
         assert_eq!(next.day(), 16);
         assert_eq!(next.hour(), 3);
+    }
+
+    #[test]
+    fn parse_timezone_valid() {
+        let tz = parse_timezone("America/Los_Angeles");
+        assert!(tz.is_ok());
+        assert_eq!(tz.unwrap(), chrono_tz::America::Los_Angeles);
+    }
+
+    #[test]
+    fn parse_timezone_us_pacific() {
+        assert!(parse_timezone("US/Pacific").is_ok());
+    }
+
+    #[test]
+    fn parse_timezone_invalid() {
+        let result = parse_timezone("Mars/Olympus_Mons");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unknown timezone"));
+    }
+
+    #[test]
+    fn compute_next_run_tz_noon_pacific_during_pst() {
+        // Jan 15, 2026 at 10:00 UTC (2:00 AM PST) — noon PST = 20:00 UTC
+        let after = Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap();
+        let tz = chrono_tz::America::Los_Angeles;
+        let next = compute_next_run_after_tz("0 0 12 * * * *", after, &tz);
+        assert!(next.is_some());
+        let next = next.unwrap();
+        assert_eq!(next.hour(), 20); // noon PST = 20:00 UTC (UTC-8)
+        assert_eq!(next.day(), 15);
+    }
+
+    #[test]
+    fn compute_next_run_tz_noon_pacific_during_pdt() {
+        // Jul 15, 2026 at 10:00 UTC (3:00 AM PDT) — noon PDT = 19:00 UTC
+        let after = Utc.with_ymd_and_hms(2026, 7, 15, 10, 0, 0).unwrap();
+        let tz = chrono_tz::America::Los_Angeles;
+        let next = compute_next_run_after_tz("0 0 12 * * * *", after, &tz);
+        assert!(next.is_some());
+        let next = next.unwrap();
+        assert_eq!(next.hour(), 19); // noon PDT = 19:00 UTC (UTC-7)
+        assert_eq!(next.day(), 15);
+    }
+
+    #[test]
+    fn compute_next_run_tz_crosses_dst_boundary() {
+        // March 7, 2026 (before spring-forward on Mar 8, 2026)
+        // At 6 AM UTC on Mar 7 — should get noon PST on Mar 7 (20:00 UTC)
+        let after = Utc.with_ymd_and_hms(2026, 3, 7, 6, 0, 0).unwrap();
+        let tz = chrono_tz::America::Los_Angeles;
+        let next = compute_next_run_after_tz("0 0 12 * * * *", after, &tz);
+        let next = next.unwrap();
+        assert_eq!(next.day(), 7);
+        assert_eq!(next.hour(), 20); // PST, UTC-8
+
+        // After that, next firing on Mar 8 (PDT) should be 19:00 UTC
+        let next2 = compute_next_run_after_tz("0 0 12 * * * *", next, &tz);
+        let next2 = next2.unwrap();
+        assert_eq!(next2.day(), 8);
+        assert_eq!(next2.hour(), 19); // PDT, UTC-7
+    }
+
+    #[test]
+    fn dst_spring_forward_gap_skips_nonexistent_time() {
+        // 2026 spring forward: Mar 8 at 2:00 AM PST → 3:00 AM PDT
+        // A task scheduled for 2:30 AM local time falls in the gap.
+        // The cron library should advance to the next valid occurrence.
+        let tz = chrono_tz::America::Los_Angeles;
+
+        // Start just before the gap: Mar 8 at 1:00 AM PST = 09:00 UTC
+        let before_gap = Utc.with_ymd_and_hms(2026, 3, 8, 9, 0, 0).unwrap();
+        let next = compute_next_run_after_tz("0 30 2 * * * *", before_gap, &tz);
+        let next = next.unwrap();
+
+        // 2:30 AM doesn't exist on Mar 8 — should skip to Mar 9
+        // Mar 9 2:30 AM PDT = 09:30 UTC (UTC-7)
+        assert_eq!(next.month(), 3);
+        assert_eq!(next.day(), 9);
+        assert_eq!(next.hour(), 9);
+        assert_eq!(next.minute(), 30);
+    }
+
+    #[test]
+    fn dst_fall_back_overlap_fires_first_occurrence() {
+        // 2026 fall back: Nov 1 at 2:00 AM PDT → 1:00 AM PST
+        // A task scheduled for 1:30 AM local time occurs twice.
+        // The cron library should fire on the first occurrence (PDT).
+        let tz = chrono_tz::America::Los_Angeles;
+
+        // Start at midnight Nov 1 PDT = 07:00 UTC
+        let before_overlap = Utc.with_ymd_and_hms(2026, 11, 1, 7, 0, 0).unwrap();
+        let next = compute_next_run_after_tz("0 30 1 * * * *", before_overlap, &tz);
+        let next = next.unwrap();
+
+        // First 1:30 AM is during PDT: 1:30 AM PDT = 08:30 UTC (UTC-7)
+        assert_eq!(next.month(), 11);
+        assert_eq!(next.day(), 1);
+        assert_eq!(next.hour(), 8);
+        assert_eq!(next.minute(), 30);
     }
 }

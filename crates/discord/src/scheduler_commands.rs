@@ -15,6 +15,8 @@ type Result = std::result::Result<(), ThresholdError>;
 pub enum ScheduleActionChoice {
     /// Launch a new Claude conversation
     Conversation,
+    /// Resume an existing conversation with a prompt
+    Resume,
     /// Run a shell command
     Script,
     /// Run a command, then analyze output with Claude
@@ -26,12 +28,14 @@ pub enum ScheduleActionChoice {
 pub async fn schedule(
     ctx: Context<'_>,
     #[description = "Task name"] name: String,
-    #[description = "Cron expression (e.g. '0 0 3 * * *' for 3 AM daily)"] cron: String,
+    #[description = "Cron expression (e.g. '0 0 12 * * *' for noon daily)"] cron: String,
     #[description = "Action type"]
     #[rename = "action"]
     action_type: ScheduleActionChoice,
     #[description = "Prompt text or shell command"] value: String,
     #[description = "Model override (optional)"] model: Option<String>,
+    #[description = "Conversation ID (for Resume action)"] conversation_id: Option<String>,
+    #[description = "IANA timezone (e.g. 'America/Los_Angeles')"] timezone: Option<String>,
 ) -> Result {
     let scheduler = match &ctx.data().scheduler {
         Some(s) => s,
@@ -48,6 +52,26 @@ pub async fn schedule(
             prompt: value,
             model,
         },
+        ScheduleActionChoice::Resume => {
+            let conv_id_str = match &conversation_id {
+                Some(id) => id,
+                None => {
+                    ctx.say("Resume action requires a conversation_id parameter.")
+                        .await
+                        .ok();
+                    return Ok(());
+                }
+            };
+            let conv_id = ConversationId(
+                uuid::Uuid::parse_str(conv_id_str).map_err(|e| ThresholdError::InvalidInput {
+                    message: format!("Invalid conversation ID: {}", e),
+                })?,
+            );
+            ScheduledAction::ResumeConversation {
+                conversation_id: conv_id,
+                prompt: value,
+            }
+        }
         ScheduleActionChoice::Script => ScheduledAction::Script {
             command: value,
             working_dir: None,
@@ -60,22 +84,45 @@ pub async fn schedule(
         },
     };
 
-    let mut task = ScheduledTask::new(name.clone(), cron.clone(), action).map_err(|e| {
-        ThresholdError::InvalidInput {
-            message: e.to_string(),
-        }
-    })?;
-    task.delivery = DeliveryTarget::DiscordChannel { channel_id };
+    // Extract conversation_id from the action before moving it into the task
+    let resume_conv_id = match &action {
+        ScheduledAction::ResumeConversation { conversation_id: cid, .. } => Some(*cid),
+        _ => None,
+    };
+
+    let mut task = match &timezone {
+        Some(tz) => ScheduledTask::new_with_timezone(name.clone(), cron.clone(), action, tz.clone())
+            .map_err(|e| ThresholdError::InvalidInput {
+                message: e.to_string(),
+            })?,
+        None => ScheduledTask::new(name.clone(), cron.clone(), action).map_err(|e| {
+            ThresholdError::InvalidInput {
+                message: e.to_string(),
+            }
+        })?,
+    };
+
+    // Resume tasks deliver via the portal system, so mark as conversation-attached
+    // to prevent duplicate delivery in deliver_result().
+    if let Some(conv_id) = resume_conv_id {
+        task.conversation_id = Some(conv_id);
+    } else {
+        task.delivery = DeliveryTarget::DiscordChannel { channel_id };
+    }
 
     let next_run = task
         .next_run
         .map_or("unknown".to_string(), |t| t.to_rfc3339());
 
+    let tz_info = timezone
+        .as_deref()
+        .map_or(String::new(), |tz| format!("\nTimezone: {}", tz));
+
     scheduler.add_task(task).await?;
 
     ctx.say(format!(
-        "Created scheduled task **{}** (`{}`)\nNext run: {}",
-        name, cron, next_run,
+        "Created scheduled task **{}** (`{}`){}\nNext run: {}",
+        name, cron, tz_info, next_run,
     ))
     .await
     .ok();
@@ -106,11 +153,16 @@ pub async fn schedules(ctx: Context<'_>) -> Result {
             TaskKind::Heartbeat => " [heartbeat]",
             TaskKind::Cron => "",
         };
+        let tz_label = task
+            .timezone
+            .as_deref()
+            .map_or(String::new(), |tz| format!(" ({})", tz));
         response.push_str(&format!(
-            "- **{}**{} | `{}` | {} | Next: {}\n",
+            "- **{}**{} | `{}`{} | {} | Next: {}\n",
             task.name,
             kind_label,
             task.cron_expression,
+            tz_label,
             if task.enabled { "enabled" } else { "disabled" },
             task.next_run
                 .map_or("unknown".to_string(), |t| t.to_rfc3339()),
@@ -371,10 +423,11 @@ mod tests {
         // Verify the enum variants match expected Discord choices
         let choices = vec![
             ScheduleActionChoice::Conversation,
+            ScheduleActionChoice::Resume,
             ScheduleActionChoice::Script,
             ScheduleActionChoice::Monitor,
         ];
-        assert_eq!(choices.len(), 3);
+        assert_eq!(choices.len(), 4);
     }
 
     #[test]

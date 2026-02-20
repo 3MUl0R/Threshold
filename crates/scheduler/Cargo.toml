@@ -10,6 +10,7 @@ threshold-conversation = { path = "../conversation" }
 
 cron = "0.13"
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
