@@ -92,6 +92,7 @@ mod integration_tests {
                     model: None,
                     timeout_seconds: None,
                     skip_permissions: None,
+                    ack_enabled: None,
                     extra_flags: vec![],
                 },
             },
@@ -138,6 +139,7 @@ mod integration_tests {
             threshold_conversation::ConversationEngine::new(
                 &config,
                 claude,
+                None,
                 None,
                 None,
             )

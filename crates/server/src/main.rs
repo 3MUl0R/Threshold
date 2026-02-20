@@ -144,6 +144,21 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
         let prompt = threshold_tools::build_tool_prompt(&config);
         if prompt.is_empty() { None } else { Some(prompt) }
     };
+    let ack_enabled = config.cli.claude.ack_enabled.unwrap_or(true);
+    let haiku = if ack_enabled {
+        let command = config
+            .cli
+            .claude
+            .command
+            .clone()
+            .unwrap_or_else(|| "claude".to_string());
+        Some(Arc::new(threshold_cli_wrapper::HaikuClient::new(command)))
+    } else {
+        None
+    };
+    if ack_enabled {
+        tracing::info!("Haiku acknowledgment enabled.");
+    }
     let active_conversations = Arc::new(threshold_core::ActiveConversations::new());
     let engine = Arc::new(
         ConversationEngine::new(
@@ -151,6 +166,7 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
             claude.clone(),
             tool_prompt,
             Some(active_conversations.clone()),
+            haiku,
         )
         .await?,
     );

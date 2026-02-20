@@ -528,6 +528,7 @@ mod tests {
                     model: Some("sonnet".to_string()),
                     timeout_seconds: None,
                     skip_permissions: Some(false),
+                    ack_enabled: None,
                     extra_flags: vec![],
                 },
             },
@@ -547,7 +548,7 @@ mod tests {
             web: None,
         };
         let engine = Arc::new(
-            ConversationEngine::new(&config, claude.clone(), None, None)
+            ConversationEngine::new(&config, claude.clone(), None, None, None)
                 .await
                 .unwrap(),
         );

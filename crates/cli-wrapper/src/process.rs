@@ -100,6 +100,9 @@ impl CliProcess {
         if stdin_data.is_some() {
             cmd.stdin(std::process::Stdio::piped());
         }
+        // Kill child process when the Child handle is dropped (e.g. future
+        // cancelled by tokio::time::timeout). Prevents orphaned processes.
+        cmd.kill_on_drop(true);
 
         // Spawn
         let mut child = cmd.spawn().map_err(|e| {

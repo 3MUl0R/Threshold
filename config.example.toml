@@ -29,6 +29,11 @@ model = "sonnet"
 # Optional: Skip permission prompts (use with caution!)
 # skip_permissions = false
 
+# Enable immediate acknowledgment via Haiku when a message is received.
+# The bot will send a brief "got it" message within 1-2 seconds.
+# Default: true.
+# ack_enabled = true
+
 # Optional: Extra CLI flags to pass
 # extra_flags = ["--some-flag"]
 

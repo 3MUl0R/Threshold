@@ -83,6 +83,7 @@ mod tests {
                     model: None,
                     timeout_seconds: None,
                     skip_permissions: None,
+                    ack_enabled: None,
                     extra_flags: vec![],
                 },
             },

@@ -1,5 +1,18 @@
 //! Message chunking for Discord's 2000-character limit.
 
+/// Find the largest byte index <= `pos` that lies on a UTF-8 char boundary.
+/// Equivalent to the nightly `str::floor_char_boundary`.
+fn floor_char_boundary(s: &str, pos: usize) -> usize {
+    if pos >= s.len() {
+        return s.len();
+    }
+    let mut i = pos;
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// Split a message respecting Discord's character limit.
 ///
 /// Split priorities:
@@ -10,6 +23,7 @@
 /// 5. Hard cut (last resort)
 ///
 /// Never splits inside a markdown code block (``` ... ```).
+/// All byte-index slicing is char-boundary safe (no panics on multi-byte UTF-8).
 pub fn chunk_message(content: &str, max_len: usize) -> Vec<String> {
     if content.len() <= max_len {
         return vec![content.to_string()];
@@ -33,15 +47,18 @@ pub fn chunk_message(content: &str, max_len: usize) -> Vec<String> {
     chunks
 }
 
-/// Find the best split point respecting code blocks and natural boundaries
+/// Find the best split point respecting code blocks and natural boundaries.
+/// All slicing uses `floor_char_boundary` for UTF-8 safety.
 fn split_at_best_boundary(content: &str, max_len: usize) -> (&str, &str) {
+    let safe_max = floor_char_boundary(content, max_len);
+
     // Check if we're inside a code block
-    let in_code_block = count_code_fences(&content[..max_len.min(content.len())]) % 2 == 1;
+    let in_code_block = count_code_fences(&content[..safe_max]) % 2 == 1;
 
     if in_code_block {
         // Find the closing ``` and extend chunk to include it
-        if let Some(close_pos) = content[max_len..].find("```") {
-            let split_pos = max_len + close_pos + 3; // +3 for ```
+        if let Some(close_pos) = content[safe_max..].find("```") {
+            let split_pos = safe_max + close_pos + 3; // +3 for ```
             if split_pos <= content.len() {
                 let (chunk, rest) = content.split_at(split_pos);
                 return (chunk.trim_end(), rest.trim_start());
@@ -52,11 +69,23 @@ fn split_at_best_boundary(content: &str, max_len: usize) -> (&str, &str) {
     }
 
     // Try split priorities in order
-    let split_pos = find_paragraph_boundary(content, max_len)
-        .or_else(|| find_newline_boundary(content, max_len))
-        .or_else(|| find_sentence_boundary(content, max_len))
-        .or_else(|| find_word_boundary(content, max_len))
-        .unwrap_or(max_len);
+    let split_pos = find_paragraph_boundary(content, safe_max)
+        .or_else(|| find_newline_boundary(content, safe_max))
+        .or_else(|| find_sentence_boundary(content, safe_max))
+        .or_else(|| find_word_boundary(content, safe_max))
+        .unwrap_or(safe_max);
+
+    // Guarantee forward progress: if safe_max rounded down to 0 (first char
+    // wider than max_len), advance past the first character.
+    let split_pos = if split_pos == 0 {
+        content
+            .char_indices()
+            .nth(1)
+            .map(|(i, _)| i)
+            .unwrap_or(content.len())
+    } else {
+        split_pos
+    };
 
     let (chunk, rest) = content.split_at(split_pos);
     (chunk.trim_end(), rest.trim_start())
@@ -67,21 +96,21 @@ fn count_code_fences(text: &str) -> usize {
     text.matches("```").count()
 }
 
-/// Find paragraph boundary (double newline) searching backwards from max_len
-fn find_paragraph_boundary(content: &str, max_len: usize) -> Option<usize> {
-    let search_text = &content[..max_len.min(content.len())];
+/// Find paragraph boundary (double newline) searching backwards from safe_max
+fn find_paragraph_boundary(content: &str, safe_max: usize) -> Option<usize> {
+    let search_text = &content[..safe_max];
     search_text.rfind("\n\n").map(|pos| pos + 2)
 }
 
-/// Find single newline searching backwards from max_len
-fn find_newline_boundary(content: &str, max_len: usize) -> Option<usize> {
-    let search_text = &content[..max_len.min(content.len())];
+/// Find single newline searching backwards from safe_max
+fn find_newline_boundary(content: &str, safe_max: usize) -> Option<usize> {
+    let search_text = &content[..safe_max];
     search_text.rfind('\n').map(|pos| pos + 1)
 }
 
-/// Find sentence boundary (. ! ?) searching backwards from max_len
-fn find_sentence_boundary(content: &str, max_len: usize) -> Option<usize> {
-    let search_text = &content[..max_len.min(content.len())];
+/// Find sentence boundary (. ! ?) searching backwards from safe_max
+fn find_sentence_boundary(content: &str, safe_max: usize) -> Option<usize> {
+    let search_text = &content[..safe_max];
     for (i, c) in search_text.char_indices().rev() {
         if matches!(c, '.' | '!' | '?') {
             // Check if followed by space or end
@@ -96,9 +125,9 @@ fn find_sentence_boundary(content: &str, max_len: usize) -> Option<usize> {
     None
 }
 
-/// Find word boundary (space) searching backwards from max_len
-fn find_word_boundary(content: &str, max_len: usize) -> Option<usize> {
-    let search_text = &content[..max_len.min(content.len())];
+/// Find word boundary (space) searching backwards from safe_max
+fn find_word_boundary(content: &str, safe_max: usize) -> Option<usize> {
+    let search_text = &content[..safe_max];
     search_text.rfind(' ').map(|pos| pos + 1)
 }
 
@@ -208,5 +237,44 @@ mod tests {
         let combined = chunks.join("");
         // Count code fences - should be even (2 opening, 2 closing)
         assert_eq!(combined.matches("```").count(), 4);
+    }
+
+    #[test]
+    fn multibyte_utf8_boundary_does_not_panic() {
+        // 1999 ASCII bytes + a 4-byte emoji = byte 2000 lands inside a multi-byte char
+        let msg = format!("{}🙂tail", "a".repeat(1999));
+        let chunks = chunk_message(&msg, 2000);
+        // Should split without panic; all content preserved
+        let combined: String = chunks.iter().map(|c| c.as_str()).collect();
+        assert!(combined.contains("🙂"));
+        assert!(combined.contains("tail"));
+    }
+
+    #[test]
+    fn floor_char_boundary_on_ascii() {
+        let s = "hello world";
+        assert_eq!(floor_char_boundary(s, 5), 5);
+        assert_eq!(floor_char_boundary(s, 100), s.len());
+        assert_eq!(floor_char_boundary(s, 0), 0);
+    }
+
+    #[test]
+    fn floor_char_boundary_on_multibyte() {
+        let s = "aaa🙂bbb"; // bytes: 3 ascii + 4 emoji + 3 ascii = 10 bytes
+        assert_eq!(floor_char_boundary(s, 3), 3); // before emoji
+        assert_eq!(floor_char_boundary(s, 4), 3); // inside emoji → back to 3
+        assert_eq!(floor_char_boundary(s, 5), 3); // inside emoji → back to 3
+        assert_eq!(floor_char_boundary(s, 6), 3); // inside emoji → back to 3
+        assert_eq!(floor_char_boundary(s, 7), 7); // after emoji
+    }
+
+    #[test]
+    fn leading_multibyte_with_tiny_max_len() {
+        // max_len smaller than the first character — must not loop forever
+        let msg = "🙂hello";
+        let chunks = chunk_message(msg, 1);
+        let combined: String = chunks.iter().map(|c| c.as_str()).collect();
+        assert_eq!(combined, "🙂hello");
+        assert!(chunks.len() >= 2); // emoji in one chunk, rest in others
     }
 }

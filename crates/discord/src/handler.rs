@@ -4,10 +4,10 @@ use crate::bot::BotData;
 use crate::chunking::chunk_message;
 use crate::portals::resolve_or_create_portal;
 use crate::security::is_authorized;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::collections::HashMap;
 use threshold_conversation::ConversationEvent;
-use threshold_core::{ConversationId, PortalId, ThresholdError};
+use threshold_core::{ConversationId, PortalId, RunId, ThresholdError};
 use tokio::sync::RwLock;
 
 /// Track active portal listeners
@@ -152,6 +152,15 @@ async fn portal_listener(
     http: Arc<serenity::all::Http>,
     outbound: Arc<crate::outbound::DiscordOutbound>,
 ) {
+    // Track completed runs so we can suppress stale ack events that arrive
+    // after a run has already finished or been aborted. Uses a set rather than
+    // a single Option so that acks for older completed runs are also suppressed
+    // when multiple runs complete before a delayed ack arrives.
+    // Each entry is 16 bytes (UUID); capped at 128 entries. Acks timeout after
+    // 5 seconds, so old run_ids are safely discarded.
+    let mut completed_runs: HashSet<RunId> = HashSet::new();
+    let mut latest_completed: Option<RunId> = None;
+
     loop {
         let event = match receiver.recv().await {
             Ok(event) => event,
@@ -180,6 +189,10 @@ async fn portal_listener(
                 conversation_id: cid,
             } if pid == portal_id => {
                 conversation_id = cid;
+                // Old run_ids are for the previous conversation — drop and reallocate
+                // to release capacity (unlike clear() which retains allocated memory).
+                completed_runs = HashSet::new();
+                latest_completed = None;
                 tracing::debug!(
                     portal_id = ?portal_id,
                     conversation_id = ?conversation_id,
@@ -190,10 +203,13 @@ async fn portal_listener(
             // Send assistant messages
             ConversationEvent::AssistantMessage {
                 conversation_id: cid,
+                run_id,
                 content,
                 artifacts,
                 ..
             } if cid == conversation_id => {
+                completed_runs.insert(run_id);
+                latest_completed = Some(run_id);
                 if artifacts.is_empty() {
                     // Send as chunked text messages
                     for chunk in chunk_message(&content, 2000) {
@@ -228,9 +244,14 @@ async fn portal_listener(
             // Send errors
             ConversationEvent::Error {
                 conversation_id: cid,
+                run_id,
                 error,
                 ..
             } if cid == conversation_id => {
+                if let Some(rid) = run_id {
+                    completed_runs.insert(rid);
+                    latest_completed = Some(rid);
+                }
                 let error_msg = format!("❌ Error: {}", error);
                 if let Err(e) = channel_id.say(&http, &error_msg).await {
                     tracing::error!(
@@ -244,8 +265,11 @@ async fn portal_listener(
             // Handle abort notification
             ConversationEvent::Aborted {
                 conversation_id: cid,
+                run_id,
                 ..
             } if cid == conversation_id => {
+                completed_runs.insert(run_id);
+                latest_completed = Some(run_id);
                 if let Err(e) = channel_id.say(&http, "Task aborted.").await {
                     tracing::error!(
                         error = %e,
@@ -255,8 +279,45 @@ async fn portal_listener(
                 }
             }
 
+            // Send acknowledgment message (suppressed if run already completed)
+            ConversationEvent::Acknowledgment {
+                conversation_id: cid,
+                run_id,
+                content,
+            } if cid == conversation_id => {
+                if completed_runs.contains(&run_id) {
+                    tracing::debug!(
+                        ?run_id,
+                        "Suppressed stale ack (run already completed)"
+                    );
+                } else {
+                    // Truncate to Discord's 2000-char limit (UTF-8 safe via chunk_message)
+                    let chunks = chunk_message(&content, 2000);
+                    if let Some(first_chunk) = chunks.first() {
+                        if let Err(e) = channel_id.say(&http, first_chunk).await {
+                            tracing::debug!(
+                                error = %e,
+                                portal_id = ?portal_id,
+                                "Failed to send acknowledgment"
+                            );
+                        }
+                    }
+                }
+            }
+
             _ => {
                 // Ignore events for other conversations/portals
+            }
+        }
+
+        // Cap the completed_runs set to prevent unbounded growth in long-lived
+        // listeners that never switch conversations. Acks timeout after 5s, so
+        // old run_ids are safely discarded. Preserve the most recent entry.
+        if completed_runs.len() > 128 {
+            if let Some(keep) = latest_completed {
+                completed_runs = HashSet::from([keep]);
+            } else {
+                completed_runs = HashSet::new();
             }
         }
     }

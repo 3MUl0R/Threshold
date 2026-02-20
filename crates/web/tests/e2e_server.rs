@@ -26,6 +26,7 @@ async fn main() {
                 model: None,
                 timeout_seconds: None,
                 skip_permissions: None,
+                ack_enabled: None,
                 extra_flags: vec![],
             },
         },
@@ -69,7 +70,7 @@ async fn main() {
     );
 
     let engine = Arc::new(
-        threshold_conversation::ConversationEngine::new(&config, claude, None, None)
+        threshold_conversation::ConversationEngine::new(&config, claude, None, None, None)
             .await
             .unwrap(),
     );

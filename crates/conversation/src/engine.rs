@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use threshold_cli_wrapper::ClaudeClient;
+use threshold_cli_wrapper::HaikuClient;
 use threshold_cli_wrapper::response::Usage;
 use threshold_core::config::{AgentConfigToml, ThresholdConfig};
 use threshold_core::{
@@ -96,6 +97,8 @@ pub struct ConversationEngine {
     tool_prompt: Option<String>,
     /// Shared tracker of conversations with active CLI invocations.
     active_conversations: Arc<ActiveConversations>,
+    /// Optional Haiku client for fast acknowledgment messages.
+    haiku: Option<Arc<HaikuClient>>,
 }
 
 impl ConversationEngine {
@@ -111,6 +114,7 @@ impl ConversationEngine {
         claude: Arc<ClaudeClient>,
         tool_prompt: Option<String>,
         active_conversations: Option<Arc<ActiveConversations>>,
+        haiku: Option<Arc<HaikuClient>>,
     ) -> Result<Self> {
         // Resolve data directory from config
         let data_dir = config.data_dir()?;
@@ -147,6 +151,7 @@ impl ConversationEngine {
             tool_prompt,
             active_conversations: active_conversations
                 .unwrap_or_else(|| Arc::new(ActiveConversations::new())),
+            haiku,
         })
     }
 
@@ -326,10 +331,55 @@ impl ConversationEngine {
         )
         .await?;
 
-        // 5. Acquire per-conversation lock (held for entire stream lifetime)
+        // 5. Spawn Haiku acknowledgment (independent, no lock needed).
+        //    Capped at 5 seconds — if Haiku hasn't responded by then the ack
+        //    would arrive too late to be useful and is silently dropped.
+        if let Some(haiku) = &self.haiku {
+            let haiku = haiku.clone();
+            let event_tx = self.event_tx.clone();
+            let ack_conversation_id = conversation_id;
+            let ack_run_id = run_id;
+            let ack_prompt = format!(
+                "You are generating a brief acknowledgment for a Discord chat message. \
+                 The user just sent a message to an AI assistant. Generate a short (1-2 sentence) \
+                 acknowledgment that shows you understand what they're asking and sets expectations. \
+                 Be conversational and natural — like a teammate saying \"on it.\" \
+                 Do NOT actually do the work. Just acknowledge.\n\nUser message: {}",
+                content
+            );
+            tokio::spawn(async move {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    haiku.generate(&ack_prompt, None),
+                )
+                .await;
+                match result {
+                    Ok(Ok(ack_text)) => {
+                        let _ = event_tx.send(ConversationEvent::Acknowledgment {
+                            conversation_id: ack_conversation_id,
+                            run_id: ack_run_id,
+                            content: ack_text,
+                        });
+                    }
+                    Ok(Err(e)) => {
+                        tracing::debug!(
+                            error = %e,
+                            "Haiku acknowledgment failed (non-fatal)"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            "Haiku acknowledgment timed out after 5s (dropped)"
+                        );
+                    }
+                }
+            });
+        }
+
+        // 6. Acquire per-conversation lock (held for entire stream lifetime)
         let _guard = self.claude.locks().lock(conversation_id.0).await;
 
-        // 6. Start streaming CLI invocation
+        // 7. Start streaming CLI invocation
         self.active_conversations.insert(conversation_id).await;
         let start = std::time::Instant::now();
 
@@ -354,7 +404,7 @@ impl ConversationEngine {
             }
         };
 
-        // 7. Consume stream events, build final response
+        // 8. Consume stream events, build final response
         let mut final_text = String::new();
         let mut final_session_id = None;
         let mut final_usage = None;
@@ -411,7 +461,7 @@ impl ConversationEngine {
         self.active_conversations.remove(&conversation_id).await;
         self.claude.tracker().deregister(&run_id).await;
 
-        // 8. Handle abort
+        // 9. Handle abort
         if was_aborted {
             self.write_audit_event(
                 &conversation_id,
@@ -430,7 +480,7 @@ impl ConversationEngine {
             return Err(ThresholdError::Aborted);
         }
 
-        // 9. Handle stream close without Result event (process crashed)
+        // 10. Handle stream close without Result event (process crashed)
         if !saw_result {
             let err = ThresholdError::CliError {
                 provider: "claude".into(),
@@ -444,7 +494,7 @@ impl ConversationEngine {
 
         let duration = start.elapsed();
 
-        // 10. Update session ID if returned
+        // 11. Update session ID if returned
         if let Some(session_id) = &final_session_id {
             self.claude
                 .sessions()
@@ -452,7 +502,7 @@ impl ConversationEngine {
                 .await?;
         }
 
-        // 11. Write assistant response to audit
+        // 12. Write assistant response to audit
         self.write_audit_event(
             &conversation_id,
             &ConversationAuditEvent::AssistantMessage {
@@ -464,7 +514,7 @@ impl ConversationEngine {
         )
         .await?;
 
-        // 12. Update conversation.last_active
+        // 13. Update conversation.last_active
         {
             let mut conversations = self.conversations.write().await;
             if let Some(conv) = conversations.get_mut(&conversation_id) {
@@ -476,7 +526,7 @@ impl ConversationEngine {
             conversations.save().await?;
         }
 
-        // 13. Broadcast AssistantMessage event
+        // 14. Broadcast AssistantMessage event
         let _ = self.event_tx.send(ConversationEvent::AssistantMessage {
             conversation_id,
             run_id,
@@ -1019,6 +1069,7 @@ mod tests {
                     model: Some("sonnet".to_string()),
                     timeout_seconds: None,
                     skip_permissions: Some(false),
+                    ack_enabled: None,
                     extra_flags: vec![],
                 },
             },
@@ -1119,7 +1170,7 @@ mod tests {
             .unwrap(),
         );
 
-        let engine = ConversationEngine::new(&config, claude, None, None).await.unwrap();
+        let engine = ConversationEngine::new(&config, claude, None, None, None).await.unwrap();
 
         let agent = engine.resolve_agent_for_mode(&ConversationMode::Coding {
             project: "test".to_string(),
@@ -1151,7 +1202,7 @@ mod tests {
             .unwrap(),
         );
 
-        let engine = ConversationEngine::new(&config, claude, None, None).await.unwrap();
+        let engine = ConversationEngine::new(&config, claude, None, None, None).await.unwrap();
 
         let agent = engine.resolve_agent_for_mode(&ConversationMode::General);
 
@@ -1313,6 +1364,7 @@ mod tests {
                     model: Some("sonnet".to_string()),
                     timeout_seconds: None,
                     skip_permissions: Some(false),
+                    ack_enabled: None,
                     extra_flags: vec![],
                 },
             },
@@ -1342,7 +1394,7 @@ mod tests {
             scheduler: None,
             web: None,
         };
-        let engine = Arc::new(ConversationEngine::new(&config, claude, None, None).await.unwrap());
+        let engine = Arc::new(ConversationEngine::new(&config, claude, None, None, None).await.unwrap());
         let rx = engine.subscribe();
         (engine, rx)
     }

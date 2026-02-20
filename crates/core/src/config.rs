@@ -35,6 +35,9 @@ pub struct ClaudeCliConfig {
     pub model: Option<String>,
     pub timeout_seconds: Option<u64>,
     pub skip_permissions: Option<bool>,
+    /// Enable immediate acknowledgment via Haiku when a message is received.
+    /// Default: true.
+    pub ack_enabled: Option<bool>,
     #[serde(default)]
     pub extra_flags: Vec<String>,
 }
