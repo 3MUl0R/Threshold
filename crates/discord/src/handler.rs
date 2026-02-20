@@ -208,7 +208,7 @@ async fn portal_listener(
                     let _ = channel_id.delete_message(&http, *msg_id).await;
                 }
                 status_messages.clear();
-                tracing::debug!(
+                tracing::info!(
                     portal_id = ?portal_id,
                     conversation_id = ?conversation_id,
                     "Portal switched conversation"
@@ -312,7 +312,7 @@ async fn portal_listener(
                 content,
             } if cid == conversation_id => {
                 if completed_runs.contains(&run_id) {
-                    tracing::debug!(
+                    tracing::info!(
                         ?run_id,
                         "Suppressed stale ack (run already completed)"
                     );
@@ -321,7 +321,7 @@ async fn portal_listener(
                     let chunks = chunk_message(&content, 2000);
                     if let Some(first_chunk) = chunks.first() {
                         if let Err(e) = channel_id.say(&http, first_chunk).await {
-                            tracing::debug!(
+                            tracing::warn!(
                                 error = %e,
                                 portal_id = ?portal_id,
                                 "Failed to send acknowledgment"
@@ -356,7 +356,7 @@ async fn portal_listener(
                     if let Err(e) = channel_id.edit_message(&http, *msg_id, edit).await {
                         // Message may have been deleted externally — drop tracking
                         // so the next status update creates a new message.
-                        tracing::debug!(
+                        tracing::warn!(
                             error = %e,
                             portal_id = ?portal_id,
                             "Failed to edit status message, dropping tracker"
@@ -370,7 +370,7 @@ async fn portal_listener(
                             status_messages.insert(run_id, msg.id);
                         }
                         Err(e) => {
-                            tracing::debug!(
+                            tracing::warn!(
                                 error = %e,
                                 portal_id = ?portal_id,
                                 "Failed to create status message"

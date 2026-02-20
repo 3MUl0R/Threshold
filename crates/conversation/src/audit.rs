@@ -41,6 +41,17 @@ pub enum ConversationAuditEvent {
         error: String,
         timestamp: DateTime<Utc>,
     },
+    Acknowledgment {
+        run_id: String,
+        content: String,
+        timestamp: DateTime<Utc>,
+    },
+    StatusUpdate {
+        run_id: String,
+        summary: String,
+        elapsed_secs: u64,
+        timestamp: DateTime<Utc>,
+    },
 }
 
 /// Write an audit event to the conversation's JSONL file

@@ -348,6 +348,7 @@ impl ConversationEngine {
                 let event_tx = self.event_tx.clone();
                 let ack_conversation_id = conversation_id;
                 let ack_run_id = run_id;
+                let ack_audit_dir = self.audit_dir.clone();
                 let ack_prompt = format!(
                     "You are generating a brief acknowledgment for a Discord chat message. \
                      The user just sent a message to an AI assistant. Generate a short (1-2 sentence) \
@@ -364,6 +365,24 @@ impl ConversationEngine {
                     .await;
                     match result {
                         Ok(Ok(ack_text)) => {
+                            tracing::info!(
+                                conversation_id = %ack_conversation_id.0,
+                                run_id = %ack_run_id,
+                                "Haiku acknowledgment sent"
+                            );
+                            if let Err(e) = crate::audit::write_audit_event(
+                                &ack_audit_dir,
+                                &ack_conversation_id,
+                                &ConversationAuditEvent::Acknowledgment {
+                                    run_id: ack_run_id.0.to_string(),
+                                    content: ack_text.clone(),
+                                    timestamp: Utc::now(),
+                                },
+                            )
+                            .await
+                            {
+                                tracing::warn!(error = %e, "Failed to write ack audit event");
+                            }
                             let _ = event_tx.send(ConversationEvent::Acknowledgment {
                                 conversation_id: ack_conversation_id,
                                 run_id: ack_run_id,
@@ -371,13 +390,13 @@ impl ConversationEngine {
                             });
                         }
                         Ok(Err(e)) => {
-                            tracing::debug!(
+                            tracing::info!(
                                 error = %e,
                                 "Haiku acknowledgment failed (non-fatal)"
                             );
                         }
                         Err(_) => {
-                            tracing::debug!(
+                            tracing::info!(
                                 "Haiku acknowledgment timed out after 5s (dropped)"
                             );
                         }
@@ -393,6 +412,11 @@ impl ConversationEngine {
             Some(guard) => guard,
             None => {
                 // Another message is processing — show queued status
+                tracing::info!(
+                    conversation_id = %conversation_id.0,
+                    run_id = %run_id,
+                    "Message queued — waiting for previous message to complete"
+                );
                 if status_interval > 0 {
                     let _ = self.event_tx.send(ConversationEvent::StatusUpdate {
                         conversation_id,
@@ -410,12 +434,23 @@ impl ConversationEngine {
         self.active_conversations.insert(conversation_id).await;
         let start = std::time::Instant::now();
 
+        // Prefix the message with a timestamp so the agent knows the current
+        // date/time. This prevents confusion when conversations resume after
+        // hours or days. Cost: ~10 tokens per message — negligible.
+        let now = chrono::Local::now();
+        let timestamped_content = format!(
+            "[{} {}]\n{}",
+            now.format("%Y-%m-%d %H:%M"),
+            now.format("%Z"),
+            content,
+        );
+
         let stream_result = self
             .claude
             .send_message_streaming(
                 conversation_id.0,
                 run_id,
-                content,
+                &timestamped_content,
                 system_prompt,
                 Some(model),
             )
@@ -489,11 +524,11 @@ impl ConversationEngine {
                     }
                 }
                 StreamEvent::ToolUse { tool_name, .. } => {
-                    tracing::debug!(
-                        conversation_id = ?conversation_id,
+                    tracing::info!(
+                        conversation_id = %conversation_id.0,
                         run_id = %run_id,
                         tool = %tool_name,
-                        "tool use detected"
+                        "Tool use detected"
                     );
                     if status_interval > 0 {
                         event_log.push(format!("Using tool: {}", tool_name));
@@ -541,6 +576,7 @@ impl ConversationEngine {
                     let status_cid = conversation_id;
                     let status_rid = run_id;
                     let in_flight = status_in_flight.clone();
+                    let status_audit_dir = self.audit_dir.clone();
                     tokio::spawn(async move {
                         let result = tokio::time::timeout(
                             std::time::Duration::from_secs(10),
@@ -548,6 +584,27 @@ impl ConversationEngine {
                         )
                         .await;
                         if let Ok(Ok(summary)) = result {
+                            tracing::info!(
+                                conversation_id = %status_cid.0,
+                                run_id = %status_rid,
+                                elapsed_secs,
+                                summary = %summary,
+                                "Status update sent"
+                            );
+                            if let Err(e) = crate::audit::write_audit_event(
+                                &status_audit_dir,
+                                &status_cid,
+                                &ConversationAuditEvent::StatusUpdate {
+                                    run_id: status_rid.0.to_string(),
+                                    summary: summary.clone(),
+                                    elapsed_secs,
+                                    timestamp: Utc::now(),
+                                },
+                            )
+                            .await
+                            {
+                                tracing::warn!(error = %e, "Failed to write status audit event");
+                            }
                             let _ = event_tx.send(ConversationEvent::StatusUpdate {
                                 conversation_id: status_cid,
                                 run_id: status_rid,
