@@ -1080,13 +1080,25 @@ impl ConversationEngine {
         Ok(())
     }
 
-    /// Send a message directly to a conversation (for heartbeat, cron)
+    /// Send a message directly to a conversation (for heartbeat, cron).
+    ///
+    /// Uses the same streaming path as user messages, giving scheduled tasks:
+    /// - Abort support via the process tracker
+    /// - Status updates through the portal system
+    /// - Proper per-conversation lock handling with timeout
+    ///
+    /// If the conversation is already processing a message, returns an error
+    /// immediately rather than blocking indefinitely.
     pub async fn send_to_conversation(
         &self,
         conversation_id: &ConversationId,
         content: &str,
     ) -> Result<String> {
-        // Look up conversation
+        use threshold_cli_wrapper::stream::StreamEvent;
+
+        let run_id = RunId::new();
+
+        // 1. Look up conversation
         let (agent_id, cli_provider) = {
             let conversations = self.conversations.read().await;
             let conv =
@@ -1098,7 +1110,7 @@ impl ConversationEngine {
             (conv.agent_id.clone(), conv.cli_provider.clone())
         };
 
-        // Look up agent
+        // 2. Look up agent
         let agent = self
             .agents
             .get(&agent_id)
@@ -1114,63 +1126,283 @@ impl ConversationEngine {
             CliProvider::Claude { model } => (combined_prompt.as_deref(), model.as_str()),
         };
 
-        // Call Claude (track active conversation for heartbeat skip)
-        self.active_conversations.insert(*conversation_id).await;
-        let response = self
-            .claude
-            .send_message(conversation_id.0, content, system_prompt, Some(model))
-            .await;
-        self.active_conversations.remove(conversation_id).await;
-        let response = response?;
+        // 3. Acquire per-conversation lock with timeout.
+        //    If the conversation is busy (user message in progress), fail fast
+        //    rather than blocking the scheduler for hours.
+        let _guard = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.claude.locks().lock(conversation_id.0),
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(_) => {
+                tracing::warn!(
+                    conversation_id = %conversation_id.0,
+                    "Scheduled message skipped: conversation busy (lock timeout)"
+                );
+                return Err(ThresholdError::InvalidInput {
+                    message: "Conversation is busy — scheduled message skipped".into(),
+                });
+            }
+        };
 
-        // Write to audit (no portal_id for system messages)
+        // 4. Start streaming CLI invocation
+        self.active_conversations.insert(*conversation_id).await;
+        let start = std::time::Instant::now();
+
+        let now = chrono::Local::now();
+        let timestamped_content = format!(
+            "[{} {}]\n{}",
+            now.format("%Y-%m-%d %H:%M"),
+            now.format("%Z"),
+            content,
+        );
+
+        let stream_result = self
+            .claude
+            .send_message_streaming(
+                conversation_id.0,
+                run_id,
+                &timestamped_content,
+                system_prompt,
+                Some(model),
+            )
+            .await;
+
+        let mut stream_handle = match stream_result {
+            Ok(handle) => handle,
+            Err(e) => {
+                self.active_conversations.remove(conversation_id).await;
+                self.claude.tracker().deregister(&run_id).await;
+                self.broadcast_error(conversation_id, Some(run_id), &e).await;
+                return Err(e);
+            }
+        };
+
+        // 5. Consume stream events, build final response
+        let mut final_text = String::new();
+        let mut final_session_id = None;
+        let mut final_usage = None;
+        let mut saw_result = false;
+
+        let status_interval = self.status_interval_secs;
+        let mut event_log: Vec<String> = Vec::new();
+        let mut last_status = std::time::Instant::now();
+        let status_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut has_notable_events = false;
+
+        while let Some(event) = stream_handle.event_rx.recv().await {
+            match event {
+                StreamEvent::Result {
+                    text,
+                    session_id,
+                    usage,
+                } => {
+                    final_text = text;
+                    final_session_id = session_id;
+                    final_usage = usage;
+                    saw_result = true;
+                    break;
+                }
+                StreamEvent::Error { message } => {
+                    self.active_conversations.remove(conversation_id).await;
+                    self.claude.tracker().deregister(&run_id).await;
+                    let err = ThresholdError::CliError {
+                        provider: "claude".into(),
+                        code: -1,
+                        stderr: message,
+                    };
+                    self.broadcast_error(conversation_id, Some(run_id), &err)
+                        .await;
+                    return Err(err);
+                }
+                StreamEvent::TextDelta { text } => {
+                    final_text.push_str(&text);
+                }
+                StreamEvent::ToolUse { tool_name, .. } => {
+                    tracing::info!(
+                        conversation_id = %conversation_id.0,
+                        run_id = %run_id,
+                        tool = %tool_name,
+                        "Tool use detected (scheduled)"
+                    );
+                    if status_interval > 0 {
+                        event_log.push(format!("Using tool: {}", tool_name));
+                        has_notable_events = true;
+                    }
+                }
+                StreamEvent::ToolResult { tool_name, is_error } => {
+                    if status_interval > 0 {
+                        if is_error {
+                            event_log.push(format!("Tool {} returned error", tool_name));
+                        } else {
+                            event_log.push(format!("Tool {} completed", tool_name));
+                        }
+                        has_notable_events = true;
+                    }
+                }
+            }
+
+            // Periodic status updates (same as handle_message)
+            if status_interval > 0
+                && has_notable_events
+                && last_status.elapsed()
+                    >= std::time::Duration::from_secs(status_interval)
+                && !status_in_flight.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                if let Some(haiku) = &self.haiku {
+                    status_in_flight
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    let elapsed_secs = start.elapsed().as_secs();
+                    let summary_prompt = format!(
+                        "Summarize the AI assistant's live activity for a short status line.\n\
+                         Rules:\n\
+                         - Output ONLY the status text, nothing else\n\
+                         - No quotes, no markdown, no bold, no code fences, no preamble\n\
+                         - Under 80 characters, plain text, present tense\n\
+                         - Focus on the most recent activity\n\
+                         Examples of correct output:\n\
+                         Reading project structure — 12 files examined\n\
+                         Writing implementation for user auth module\n\
+                         Running test suite — 3 of 8 passing so far\n\n\
+                         Recent events:\n{}",
+                        event_log.join("\n")
+                    );
+                    let haiku = haiku.clone();
+                    let event_tx = self.event_tx.clone();
+                    let status_cid = *conversation_id;
+                    let status_rid = run_id;
+                    let in_flight = status_in_flight.clone();
+                    let status_audit_dir = self.audit_dir.clone();
+                    tokio::spawn(async move {
+                        let result = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            haiku.generate(&summary_prompt, None),
+                        )
+                        .await;
+                        if let Ok(Ok(raw_summary)) = result {
+                            let summary = sanitize_status_summary(&raw_summary);
+                            tracing::info!(
+                                conversation_id = %status_cid.0,
+                                run_id = %status_rid,
+                                elapsed_secs,
+                                summary = %summary,
+                                "Status update sent (scheduled)"
+                            );
+                            if let Err(e) = crate::audit::write_audit_event(
+                                &status_audit_dir,
+                                &status_cid,
+                                &ConversationAuditEvent::StatusUpdate {
+                                    run_id: status_rid.0.to_string(),
+                                    summary: summary.clone(),
+                                    elapsed_secs,
+                                    timestamp: Utc::now(),
+                                },
+                            )
+                            .await
+                            {
+                                tracing::warn!(error = %e, "Failed to write status audit event");
+                            }
+                            let _ = event_tx.send(ConversationEvent::StatusUpdate {
+                                conversation_id: status_cid,
+                                run_id: status_rid,
+                                summary,
+                                elapsed_secs,
+                            });
+                        }
+                        in_flight.store(false, std::sync::atomic::Ordering::Relaxed);
+                    });
+                }
+                event_log.clear();
+                has_notable_events = false;
+                last_status = std::time::Instant::now();
+            }
+        }
+
+        // 6. Check abort
+        let was_aborted = stream_handle
+            .was_aborted
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        self.active_conversations.remove(conversation_id).await;
+        self.claude.tracker().deregister(&run_id).await;
+
+        if was_aborted {
+            self.write_audit_event(
+                conversation_id,
+                &ConversationAuditEvent::Error {
+                    error: "Scheduled task aborted by user".to_string(),
+                    timestamp: Utc::now(),
+                },
+            )
+            .await?;
+
+            let _ = self.event_tx.send(ConversationEvent::Aborted {
+                conversation_id: *conversation_id,
+                run_id,
+            });
+
+            return Err(ThresholdError::Aborted);
+        }
+
+        // 7. Handle stream close without Result event
+        if !saw_result {
+            let err = ThresholdError::CliError {
+                provider: "claude".into(),
+                code: -1,
+                stderr: "CLI process exited without producing a result".into(),
+            };
+            self.broadcast_error(conversation_id, Some(run_id), &err)
+                .await;
+            return Err(err);
+        }
+
+        let duration = start.elapsed();
+
+        // 8. Update session ID
+        if let Some(session_id) = &final_session_id {
+            self.claude
+                .sessions()
+                .set(conversation_id.0, session_id.clone())
+                .await?;
+        }
+
+        // 9. Write assistant response to audit
         self.write_audit_event(
             conversation_id,
             &ConversationAuditEvent::AssistantMessage {
-                content: response.text.clone(),
-                usage: response.usage.clone(),
-                duration_ms: 0, // Duration not tracked for system messages
+                content: final_text.clone(),
+                usage: final_usage.clone(),
+                duration_ms: duration.as_millis() as u64,
                 timestamp: Utc::now(),
             },
         )
         .await?;
 
-        // Broadcast AssistantMessage event so portal listeners receive it
-        // This is critical for heartbeat/cron messages to reach portals (Milestone 7)
-        match self.event_tx.send(ConversationEvent::AssistantMessage {
-            conversation_id: *conversation_id,
-            run_id: RunId(uuid::Uuid::new_v4()),
-            content: response.text.clone(),
-            artifacts: Vec::new(),
-            usage: response.usage.clone(),
-            timestamp: Utc::now(),
-        }) {
-            Ok(receiver_count) => {
-                tracing::debug!(
-                    receiver_count,
-                    "Broadcasted system message to {} receivers",
-                    receiver_count
-                );
-            }
-            Err(_) => {
-                tracing::warn!("No receivers for system message (all portals may be disconnected)");
-            }
-        }
-
-        // Update last_active
+        // 10. Update last_active
         {
             let mut conversations = self.conversations.write().await;
             if let Some(conv) = conversations.get_mut(conversation_id) {
                 conv.last_active = Utc::now();
             }
         }
-
         {
             let conversations = self.conversations.read().await;
             conversations.save().await?;
         }
 
-        Ok(response.text)
+        // 11. Broadcast AssistantMessage for portal delivery
+        let _ = self.event_tx.send(ConversationEvent::AssistantMessage {
+            conversation_id: *conversation_id,
+            run_id,
+            content: final_text.clone(),
+            artifacts: Vec::new(),
+            usage: final_usage,
+            timestamp: Utc::now(),
+        });
+
+        Ok(final_text)
     }
 
     /// Resolve which agent handles a given mode
