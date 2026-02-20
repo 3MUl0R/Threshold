@@ -477,6 +477,10 @@ impl ConversationEngine {
         let mut event_log: Vec<String> = Vec::new();
         let mut last_status = std::time::Instant::now();
         let status_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Track whether any "interesting" events (tool use, tool result, errors)
+        // occurred since the last status update. Pure text-writing phases produce
+        // repetitive "Writing code..." summaries — skip Haiku calls for those.
+        let mut has_notable_events = false;
 
         while let Some(event) = stream_handle.event_rx.recv().await {
             match event {
@@ -506,22 +510,10 @@ impl ConversationEngine {
                 }
                 StreamEvent::TextDelta { text } => {
                     final_text.push_str(&text);
-                    if status_interval > 0 {
-                        // Capture a preview for status summarization (last 200 chars).
-                        // Use char_indices for UTF-8 safe truncation.
-                        let preview = if text.chars().count() > 200 {
-                            let start = text
-                                .char_indices()
-                                .rev()
-                                .nth(199)
-                                .map(|(i, _)| i)
-                                .unwrap_or(0);
-                            format!("...{}", &text[start..])
-                        } else {
-                            text
-                        };
-                        event_log.push(format!("Writing: {}", preview));
-                    }
+                    // TextDelta events are not added to event_log — status updates
+                    // only fire on tool-use events (has_notable_events guard), so
+                    // accumulating text previews would just grow memory unboundedly
+                    // during long writing phases without ever being consumed.
                 }
                 StreamEvent::ToolUse { tool_name, .. } => {
                     tracing::info!(
@@ -532,6 +524,7 @@ impl ConversationEngine {
                     );
                     if status_interval > 0 {
                         event_log.push(format!("Using tool: {}", tool_name));
+                        has_notable_events = true;
                     }
                 }
                 StreamEvent::ToolResult { tool_name, is_error } => {
@@ -541,6 +534,7 @@ impl ConversationEngine {
                         } else {
                             event_log.push(format!("Tool {} completed", tool_name));
                         }
+                        has_notable_events = true;
                     }
                 }
             }
@@ -549,7 +543,7 @@ impl ConversationEngine {
             // Skip if a previous status call is still in-flight to prevent
             // stale/out-of-order edits when Haiku is slow.
             if status_interval > 0
-                && !event_log.is_empty()
+                && has_notable_events
                 && last_status.elapsed()
                     >= std::time::Duration::from_secs(status_interval)
                 && !status_in_flight.load(std::sync::atomic::Ordering::Relaxed)
@@ -559,14 +553,16 @@ impl ConversationEngine {
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                     let elapsed_secs = start.elapsed().as_secs();
                     let summary_prompt = format!(
-                        "You are summarizing the live activity of an AI coding assistant for a Discord status update.\n\
-                         Below is a log of recent events from the assistant's work. Generate a single concise line\n\
-                         (under 100 chars) describing what's happening right now. Use present tense.\n\
-                         Focus on the most recent activity. Examples:\n\
-                         - \"Reading project structure... 12 files examined\"\n\
-                         - \"Writing implementation for user auth module\"\n\
-                         - \"Running test suite \u{2014} 3 of 8 passing so far\"\n\
-                         - \"Thinking through the database schema design\"\n\n\
+                        "Summarize the AI assistant's live activity for a short status line.\n\
+                         Rules:\n\
+                         - Output ONLY the status text, nothing else\n\
+                         - No quotes, no markdown, no bold, no code fences, no preamble\n\
+                         - Under 80 characters, plain text, present tense\n\
+                         - Focus on the most recent activity\n\
+                         Examples of correct output:\n\
+                         Reading project structure — 12 files examined\n\
+                         Writing implementation for user auth module\n\
+                         Running test suite — 3 of 8 passing so far\n\n\
                          Recent events:\n{}",
                         event_log.join("\n")
                     );
@@ -583,7 +579,8 @@ impl ConversationEngine {
                             haiku.generate(&summary_prompt, None),
                         )
                         .await;
-                        if let Ok(Ok(summary)) = result {
+                        if let Ok(Ok(raw_summary)) = result {
+                            let summary = sanitize_status_summary(&raw_summary);
                             tracing::info!(
                                 conversation_id = %status_cid.0,
                                 run_id = %status_rid,
@@ -616,6 +613,7 @@ impl ConversationEngine {
                     });
                 }
                 event_log.clear();
+                has_notable_events = false;
                 last_status = std::time::Instant::now();
             }
         }
@@ -1217,6 +1215,73 @@ impl ConversationEngine {
     }
 }
 
+/// Strip markdown formatting and quoting artifacts from Haiku status summaries.
+///
+/// Despite explicit prompt instructions, Haiku occasionally wraps its output in
+/// code fences, quotes, bold markers, or adds preamble text. This function
+/// normalises the summary to plain text.
+fn sanitize_status_summary(raw: &str) -> String {
+    let s = raw.trim();
+
+    // 1. Strip wrapping code fences: ```...\n<content>\n```
+    let s = if s.starts_with("```") && s.ends_with("```") {
+        let inner = s.trim_start_matches('`');
+        let inner = inner.strip_prefix('\n').unwrap_or(inner);
+        let inner = inner.trim_end_matches('`').trim();
+        // If there are multiple lines, check if the first line is a language
+        // tag (e.g. "rust", "text"). Language tags are short, no spaces, and
+        // all-lowercase ascii. Skip it if so; otherwise keep everything.
+        if let Some(nl) = inner.find('\n') {
+            let first_line = &inner[..nl];
+            if first_line.len() < 12
+                && !first_line.contains(' ')
+                && first_line.chars().all(|c| c.is_ascii_lowercase())
+            {
+                inner[nl + 1..].trim()
+            } else {
+                inner
+            }
+        } else {
+            // Single line inside fences — that IS the content
+            inner
+        }
+    } else {
+        s
+    };
+
+    // 2. Reduce multiline output to last non-empty line (strips preamble).
+    //    Must happen before quote/bold stripping so those apply to the final line.
+    let s = if s.contains('\n') {
+        s.lines()
+            .rev()
+            .find(|line| {
+                let l = line.trim();
+                !l.is_empty() && !l.starts_with("```")
+            })
+            .unwrap_or(s)
+    } else {
+        s
+    };
+
+    // 3. Strip wrapping double-quotes
+    let s = s.trim();
+    let s = if s.starts_with('"') && s.ends_with('"') && s.len() > 2 {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    };
+
+    // 4. Strip leading bullet "- " (before bold, so "- **text**" works)
+    let s = s.strip_prefix("- ").unwrap_or(s);
+
+    // 5. Strip leading/trailing bold markers: **text** → text
+    let s = s.trim();
+    let s = s.strip_prefix("**").unwrap_or(s);
+    let s = s.strip_suffix("**").unwrap_or(s);
+
+    s.trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1716,5 +1781,101 @@ mod tests {
         let fake_id = ConversationId::new();
         let result = engine.delete_conversation(&fake_id).await;
         assert!(result.is_err());
+    }
+
+    // --- sanitize_status_summary tests ---
+
+    #[test]
+    fn sanitize_strips_code_fences() {
+        let raw = "```\nReading project files — 5 examined\n```";
+        assert_eq!(
+            super::sanitize_status_summary(raw),
+            "Reading project files — 5 examined"
+        );
+    }
+
+    #[test]
+    fn sanitize_code_fences_single_word() {
+        // Single-word status inside fences should not be mistaken for a language tag
+        let raw = "```\nRefactoring\n```";
+        assert_eq!(super::sanitize_status_summary(raw), "Refactoring");
+    }
+
+    #[test]
+    fn sanitize_code_fences_with_language_tag() {
+        let raw = "```text\nRunning tests — 5 passing\n```";
+        assert_eq!(
+            super::sanitize_status_summary(raw),
+            "Running tests — 5 passing"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_wrapping_quotes() {
+        let raw = r#""Updating scheduler timezone support — editing task.rs""#;
+        assert_eq!(
+            super::sanitize_status_summary(raw),
+            "Updating scheduler timezone support — editing task.rs"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_bold_markers() {
+        let raw = "**Writing code changes — implementation in progress**";
+        assert_eq!(
+            super::sanitize_status_summary(raw),
+            "Writing code changes — implementation in progress"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_preamble_and_bold() {
+        let raw = "Looking at the recent events, the assistant is writing code. Here's a concise status line:\n\n**Analyzing project state — 7 bash queries executed**";
+        assert_eq!(
+            super::sanitize_status_summary(raw),
+            "Analyzing project state — 7 bash queries executed"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_bullet_prefix() {
+        let raw = "- Running test suite — 3 of 8 passing";
+        assert_eq!(
+            super::sanitize_status_summary(raw),
+            "Running test suite — 3 of 8 passing"
+        );
+    }
+
+    #[test]
+    fn sanitize_passes_clean_text_through() {
+        let raw = "Reading project structure — 12 files examined";
+        assert_eq!(
+            super::sanitize_status_summary(raw),
+            "Reading project structure — 12 files examined"
+        );
+    }
+
+    #[test]
+    fn sanitize_handles_empty_input() {
+        assert_eq!(super::sanitize_status_summary(""), "");
+        assert_eq!(super::sanitize_status_summary("  "), "");
+    }
+
+    #[test]
+    fn sanitize_bullet_then_bold() {
+        let raw = "- **Running tests — 3 passing**";
+        assert_eq!(
+            super::sanitize_status_summary(raw),
+            "Running tests — 3 passing"
+        );
+    }
+
+    #[test]
+    fn sanitize_preamble_then_quoted_status() {
+        let raw = "Here's a status update:\n\n\"Running test suite — verifying changes\"";
+        assert_eq!(
+            super::sanitize_status_summary(raw),
+            "Running test suite — verifying changes"
+        );
     }
 }
