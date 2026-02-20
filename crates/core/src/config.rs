@@ -38,6 +38,9 @@ pub struct ClaudeCliConfig {
     /// Enable immediate acknowledgment via Haiku when a message is received.
     /// Default: true.
     pub ack_enabled: Option<bool>,
+    /// Interval in seconds for live status updates during processing.
+    /// 0 = disabled. Default: 30.
+    pub status_interval_seconds: Option<u64>,
     #[serde(default)]
     pub extra_flags: Vec<String>,
 }

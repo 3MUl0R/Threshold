@@ -51,6 +51,7 @@ mod tests {
                     timeout_seconds: None,
                     skip_permissions: None,
                     ack_enabled: None,
+                    status_interval_seconds: None,
                     extra_flags: vec![],
                 },
             },
@@ -94,7 +95,7 @@ mod tests {
             .await
             .unwrap(),
         );
-        let engine = ConversationEngine::new(&config, claude, None, None, None).await.unwrap();
+        let engine = ConversationEngine::new(&config, claude, None, None, None, false, 0).await.unwrap();
 
         let portal_id = resolve_or_create_portal(&engine, 123, 456).await;
 
@@ -128,7 +129,7 @@ mod tests {
             .await
             .unwrap(),
         );
-        let engine = ConversationEngine::new(&config, claude, None, None, None).await.unwrap();
+        let engine = ConversationEngine::new(&config, claude, None, None, None, false, 0).await.unwrap();
 
         let portal_id1 = resolve_or_create_portal(&engine, 123, 456).await;
         let portal_id2 = resolve_or_create_portal(&engine, 123, 456).await;

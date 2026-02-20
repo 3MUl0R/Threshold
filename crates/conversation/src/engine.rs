@@ -97,8 +97,12 @@ pub struct ConversationEngine {
     tool_prompt: Option<String>,
     /// Shared tracker of conversations with active CLI invocations.
     active_conversations: Arc<ActiveConversations>,
-    /// Optional Haiku client for fast acknowledgment messages.
+    /// Optional Haiku client for acknowledgments and/or status updates.
     haiku: Option<Arc<HaikuClient>>,
+    /// Whether to send Haiku acknowledgment messages.
+    ack_enabled: bool,
+    /// Interval in seconds for live status updates (0 = disabled).
+    status_interval_secs: u64,
 }
 
 impl ConversationEngine {
@@ -115,6 +119,8 @@ impl ConversationEngine {
         tool_prompt: Option<String>,
         active_conversations: Option<Arc<ActiveConversations>>,
         haiku: Option<Arc<HaikuClient>>,
+        ack_enabled: bool,
+        status_interval_secs: u64,
     ) -> Result<Self> {
         // Resolve data directory from config
         let data_dir = config.data_dir()?;
@@ -152,6 +158,8 @@ impl ConversationEngine {
             active_conversations: active_conversations
                 .unwrap_or_else(|| Arc::new(ActiveConversations::new())),
             haiku,
+            ack_enabled,
+            status_interval_secs,
         })
     }
 
@@ -334,50 +342,69 @@ impl ConversationEngine {
         // 5. Spawn Haiku acknowledgment (independent, no lock needed).
         //    Capped at 5 seconds — if Haiku hasn't responded by then the ack
         //    would arrive too late to be useful and is silently dropped.
-        if let Some(haiku) = &self.haiku {
-            let haiku = haiku.clone();
-            let event_tx = self.event_tx.clone();
-            let ack_conversation_id = conversation_id;
-            let ack_run_id = run_id;
-            let ack_prompt = format!(
-                "You are generating a brief acknowledgment for a Discord chat message. \
-                 The user just sent a message to an AI assistant. Generate a short (1-2 sentence) \
-                 acknowledgment that shows you understand what they're asking and sets expectations. \
-                 Be conversational and natural — like a teammate saying \"on it.\" \
-                 Do NOT actually do the work. Just acknowledge.\n\nUser message: {}",
-                content
-            );
-            tokio::spawn(async move {
-                let result = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    haiku.generate(&ack_prompt, None),
-                )
-                .await;
-                match result {
-                    Ok(Ok(ack_text)) => {
-                        let _ = event_tx.send(ConversationEvent::Acknowledgment {
-                            conversation_id: ack_conversation_id,
-                            run_id: ack_run_id,
-                            content: ack_text,
-                        });
+        if self.ack_enabled {
+            if let Some(haiku) = &self.haiku {
+                let haiku = haiku.clone();
+                let event_tx = self.event_tx.clone();
+                let ack_conversation_id = conversation_id;
+                let ack_run_id = run_id;
+                let ack_prompt = format!(
+                    "You are generating a brief acknowledgment for a Discord chat message. \
+                     The user just sent a message to an AI assistant. Generate a short (1-2 sentence) \
+                     acknowledgment that shows you understand what they're asking and sets expectations. \
+                     Be conversational and natural — like a teammate saying \"on it.\" \
+                     Do NOT actually do the work. Just acknowledge.\n\nUser message: {}",
+                    content
+                );
+                tokio::spawn(async move {
+                    let result = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        haiku.generate(&ack_prompt, None),
+                    )
+                    .await;
+                    match result {
+                        Ok(Ok(ack_text)) => {
+                            let _ = event_tx.send(ConversationEvent::Acknowledgment {
+                                conversation_id: ack_conversation_id,
+                                run_id: ack_run_id,
+                                content: ack_text,
+                            });
+                        }
+                        Ok(Err(e)) => {
+                            tracing::debug!(
+                                error = %e,
+                                "Haiku acknowledgment failed (non-fatal)"
+                            );
+                        }
+                        Err(_) => {
+                            tracing::debug!(
+                                "Haiku acknowledgment timed out after 5s (dropped)"
+                            );
+                        }
                     }
-                    Ok(Err(e)) => {
-                        tracing::debug!(
-                            error = %e,
-                            "Haiku acknowledgment failed (non-fatal)"
-                        );
-                    }
-                    Err(_) => {
-                        tracing::debug!(
-                            "Haiku acknowledgment timed out after 5s (dropped)"
-                        );
-                    }
-                }
-            });
+                });
+            }
         }
 
-        // 6. Acquire per-conversation lock (held for entire stream lifetime)
-        let _guard = self.claude.locks().lock(conversation_id.0).await;
+        // 6. Acquire per-conversation lock (held for entire stream lifetime).
+        //    Use try_lock first to detect queuing and notify user.
+        let status_interval = self.status_interval_secs;
+        let _guard = match self.claude.locks().try_lock(conversation_id.0).await {
+            Some(guard) => guard,
+            None => {
+                // Another message is processing — show queued status
+                if status_interval > 0 {
+                    let _ = self.event_tx.send(ConversationEvent::StatusUpdate {
+                        conversation_id,
+                        run_id,
+                        summary: "Queued \u{2014} waiting for previous message to complete\u{2026}"
+                            .to_string(),
+                        elapsed_secs: 0,
+                    });
+                }
+                self.claude.locks().lock(conversation_id.0).await
+            }
+        };
 
         // 7. Start streaming CLI invocation
         self.active_conversations.insert(conversation_id).await;
@@ -404,11 +431,17 @@ impl ConversationEngine {
             }
         };
 
-        // 8. Consume stream events, build final response
+        // 8. Consume stream events, build final response.
+        //    Periodically summarize activity via Haiku and broadcast StatusUpdate.
         let mut final_text = String::new();
         let mut final_session_id = None;
         let mut final_usage = None;
         let mut saw_result = false;
+
+        // Status update tracking
+        let mut event_log: Vec<String> = Vec::new();
+        let mut last_status = std::time::Instant::now();
+        let status_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         while let Some(event) = stream_handle.event_rx.recv().await {
             match event {
@@ -437,8 +470,23 @@ impl ConversationEngine {
                     return Err(err);
                 }
                 StreamEvent::TextDelta { text } => {
-                    // Accumulate text (used for status updates in Phase 14D)
                     final_text.push_str(&text);
+                    if status_interval > 0 {
+                        // Capture a preview for status summarization (last 200 chars).
+                        // Use char_indices for UTF-8 safe truncation.
+                        let preview = if text.chars().count() > 200 {
+                            let start = text
+                                .char_indices()
+                                .rev()
+                                .nth(199)
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
+                            format!("...{}", &text[start..])
+                        } else {
+                            text
+                        };
+                        event_log.push(format!("Writing: {}", preview));
+                    }
                 }
                 StreamEvent::ToolUse { tool_name, .. } => {
                     tracing::debug!(
@@ -447,8 +495,71 @@ impl ConversationEngine {
                         tool = %tool_name,
                         "tool use detected"
                     );
+                    if status_interval > 0 {
+                        event_log.push(format!("Using tool: {}", tool_name));
+                    }
                 }
-                StreamEvent::ToolResult { .. } => {}
+                StreamEvent::ToolResult { tool_name, is_error } => {
+                    if status_interval > 0 {
+                        if is_error {
+                            event_log.push(format!("Tool {} returned error", tool_name));
+                        } else {
+                            event_log.push(format!("Tool {} completed", tool_name));
+                        }
+                    }
+                }
+            }
+
+            // Emit periodic status update via Haiku.
+            // Skip if a previous status call is still in-flight to prevent
+            // stale/out-of-order edits when Haiku is slow.
+            if status_interval > 0
+                && !event_log.is_empty()
+                && last_status.elapsed()
+                    >= std::time::Duration::from_secs(status_interval)
+                && !status_in_flight.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                if let Some(haiku) = &self.haiku {
+                    status_in_flight
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    let elapsed_secs = start.elapsed().as_secs();
+                    let summary_prompt = format!(
+                        "You are summarizing the live activity of an AI coding assistant for a Discord status update.\n\
+                         Below is a log of recent events from the assistant's work. Generate a single concise line\n\
+                         (under 100 chars) describing what's happening right now. Use present tense.\n\
+                         Focus on the most recent activity. Examples:\n\
+                         - \"Reading project structure... 12 files examined\"\n\
+                         - \"Writing implementation for user auth module\"\n\
+                         - \"Running test suite \u{2014} 3 of 8 passing so far\"\n\
+                         - \"Thinking through the database schema design\"\n\n\
+                         Recent events:\n{}",
+                        event_log.join("\n")
+                    );
+                    // Fire and forget — don't block the stream loop
+                    let haiku = haiku.clone();
+                    let event_tx = self.event_tx.clone();
+                    let status_cid = conversation_id;
+                    let status_rid = run_id;
+                    let in_flight = status_in_flight.clone();
+                    tokio::spawn(async move {
+                        let result = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            haiku.generate(&summary_prompt, None),
+                        )
+                        .await;
+                        if let Ok(Ok(summary)) = result {
+                            let _ = event_tx.send(ConversationEvent::StatusUpdate {
+                                conversation_id: status_cid,
+                                run_id: status_rid,
+                                summary,
+                                elapsed_secs,
+                            });
+                        }
+                        in_flight.store(false, std::sync::atomic::Ordering::Relaxed);
+                    });
+                }
+                event_log.clear();
+                last_status = std::time::Instant::now();
             }
         }
 
@@ -1070,6 +1181,7 @@ mod tests {
                     timeout_seconds: None,
                     skip_permissions: Some(false),
                     ack_enabled: None,
+                    status_interval_seconds: None,
                     extra_flags: vec![],
                 },
             },
@@ -1170,7 +1282,7 @@ mod tests {
             .unwrap(),
         );
 
-        let engine = ConversationEngine::new(&config, claude, None, None, None).await.unwrap();
+        let engine = ConversationEngine::new(&config, claude, None, None, None, false, 0).await.unwrap();
 
         let agent = engine.resolve_agent_for_mode(&ConversationMode::Coding {
             project: "test".to_string(),
@@ -1202,7 +1314,7 @@ mod tests {
             .unwrap(),
         );
 
-        let engine = ConversationEngine::new(&config, claude, None, None, None).await.unwrap();
+        let engine = ConversationEngine::new(&config, claude, None, None, None, false, 0).await.unwrap();
 
         let agent = engine.resolve_agent_for_mode(&ConversationMode::General);
 
@@ -1365,6 +1477,7 @@ mod tests {
                     timeout_seconds: None,
                     skip_permissions: Some(false),
                     ack_enabled: None,
+                    status_interval_seconds: None,
                     extra_flags: vec![],
                 },
             },
@@ -1394,7 +1507,7 @@ mod tests {
             scheduler: None,
             web: None,
         };
-        let engine = Arc::new(ConversationEngine::new(&config, claude, None, None, None).await.unwrap());
+        let engine = Arc::new(ConversationEngine::new(&config, claude, None, None, None, false, 0).await.unwrap());
         let rx = engine.subscribe();
         (engine, rx)
     }

@@ -161,16 +161,26 @@ async fn portal_listener(
     let mut completed_runs: HashSet<RunId> = HashSet::new();
     let mut latest_completed: Option<RunId> = None;
 
+    // Track status messages by RunId for create → edit → delete lifecycle.
+    let mut status_messages: HashMap<RunId, serenity::all::MessageId> = HashMap::new();
+
     loop {
         let event = match receiver.recv().await {
             Ok(event) => event,
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                // Receiver fell behind — log and continue
+                // Receiver fell behind — we may have missed completion events
+                // that would clean up status messages. Delete them now to avoid
+                // orphaned status messages persisting indefinitely.
                 tracing::warn!(
                     portal_id = ?portal_id,
                     lagged = n,
-                    "Portal listener lagged, skipped events"
+                    status_messages = status_messages.len(),
+                    "Portal listener lagged, skipped events — cleaning up status messages"
                 );
+                for msg_id in status_messages.values() {
+                    let _ = channel_id.delete_message(&http, *msg_id).await;
+                }
+                status_messages.clear();
                 continue;
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -193,6 +203,11 @@ async fn portal_listener(
                 // to release capacity (unlike clear() which retains allocated memory).
                 completed_runs = HashSet::new();
                 latest_completed = None;
+                // Delete any leftover status messages before dropping tracking
+                for msg_id in status_messages.values() {
+                    let _ = channel_id.delete_message(&http, *msg_id).await;
+                }
+                status_messages.clear();
                 tracing::debug!(
                     portal_id = ?portal_id,
                     conversation_id = ?conversation_id,
@@ -210,6 +225,10 @@ async fn portal_listener(
             } if cid == conversation_id => {
                 completed_runs.insert(run_id);
                 latest_completed = Some(run_id);
+                // Delete status message for this run (task complete)
+                if let Some(msg_id) = status_messages.remove(&run_id) {
+                    let _ = channel_id.delete_message(&http, msg_id).await;
+                }
                 if artifacts.is_empty() {
                     // Send as chunked text messages
                     for chunk in chunk_message(&content, 2000) {
@@ -251,6 +270,9 @@ async fn portal_listener(
                 if let Some(rid) = run_id {
                     completed_runs.insert(rid);
                     latest_completed = Some(rid);
+                    if let Some(msg_id) = status_messages.remove(&rid) {
+                        let _ = channel_id.delete_message(&http, msg_id).await;
+                    }
                 }
                 let error_msg = format!("❌ Error: {}", error);
                 if let Err(e) = channel_id.say(&http, &error_msg).await {
@@ -270,6 +292,10 @@ async fn portal_listener(
             } if cid == conversation_id => {
                 completed_runs.insert(run_id);
                 latest_completed = Some(run_id);
+                // Delete status message for this run (aborted)
+                if let Some(msg_id) = status_messages.remove(&run_id) {
+                    let _ = channel_id.delete_message(&http, msg_id).await;
+                }
                 if let Err(e) = channel_id.say(&http, "Task aborted.").await {
                     tracing::error!(
                         error = %e,
@@ -299,6 +325,55 @@ async fn portal_listener(
                                 error = %e,
                                 portal_id = ?portal_id,
                                 "Failed to send acknowledgment"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Handle live status updates — create or edit a single status message per run
+            ConversationEvent::StatusUpdate {
+                conversation_id: cid,
+                run_id,
+                summary,
+                elapsed_secs,
+            } if cid == conversation_id => {
+                if completed_runs.contains(&run_id) {
+                    // Run already completed — suppress stale status update
+                    continue;
+                }
+                let status_text = format!(
+                    "\u{23f3} [{}s] {}",
+                    elapsed_secs,
+                    chunk_message(&summary, 1980)
+                        .first()
+                        .map(|s| s.as_str())
+                        .unwrap_or(&summary)
+                );
+                if let Some(msg_id) = status_messages.get(&run_id) {
+                    // Edit existing status message
+                    let edit = serenity::all::EditMessage::new().content(&status_text);
+                    if let Err(e) = channel_id.edit_message(&http, *msg_id, edit).await {
+                        // Message may have been deleted externally — drop tracking
+                        // so the next status update creates a new message.
+                        tracing::debug!(
+                            error = %e,
+                            portal_id = ?portal_id,
+                            "Failed to edit status message, dropping tracker"
+                        );
+                        status_messages.remove(&run_id);
+                    }
+                } else {
+                    // Create new status message
+                    match channel_id.say(&http, &status_text).await {
+                        Ok(msg) => {
+                            status_messages.insert(run_id, msg.id);
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                error = %e,
+                                portal_id = ?portal_id,
+                                "Failed to create status message"
                             );
                         }
                     }

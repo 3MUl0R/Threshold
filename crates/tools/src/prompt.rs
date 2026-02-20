@@ -84,6 +84,7 @@ mod tests {
                     timeout_seconds: None,
                     skip_permissions: None,
                     ack_enabled: None,
+                    status_interval_seconds: None,
                     extra_flags: vec![],
                 },
             },

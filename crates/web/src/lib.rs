@@ -93,6 +93,7 @@ mod integration_tests {
                     timeout_seconds: None,
                     skip_permissions: None,
                     ack_enabled: None,
+                    status_interval_seconds: None,
                     extra_flags: vec![],
                 },
             },
@@ -142,6 +143,8 @@ mod integration_tests {
                 None,
                 None,
                 None,
+                false,
+                0,
             )
             .await
             .unwrap(),

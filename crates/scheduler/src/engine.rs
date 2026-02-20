@@ -529,6 +529,7 @@ mod tests {
                     timeout_seconds: None,
                     skip_permissions: Some(false),
                     ack_enabled: None,
+                    status_interval_seconds: None,
                     extra_flags: vec![],
                 },
             },
@@ -548,7 +549,7 @@ mod tests {
             web: None,
         };
         let engine = Arc::new(
-            ConversationEngine::new(&config, claude.clone(), None, None, None)
+            ConversationEngine::new(&config, claude.clone(), None, None, None, false, 0)
                 .await
                 .unwrap(),
         );

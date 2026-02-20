@@ -145,7 +145,14 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
         if prompt.is_empty() { None } else { Some(prompt) }
     };
     let ack_enabled = config.cli.claude.ack_enabled.unwrap_or(true);
-    let haiku = if ack_enabled {
+    let status_interval_secs = config
+        .cli
+        .claude
+        .status_interval_seconds
+        .unwrap_or(30);
+    // HaikuClient is needed for acknowledgments and/or periodic status updates
+    let needs_haiku = ack_enabled || status_interval_secs > 0;
+    let haiku = if needs_haiku {
         let command = config
             .cli
             .claude
@@ -159,6 +166,9 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
     if ack_enabled {
         tracing::info!("Haiku acknowledgment enabled.");
     }
+    if status_interval_secs > 0 {
+        tracing::info!(interval_secs = status_interval_secs, "Live status updates enabled.");
+    }
     let active_conversations = Arc::new(threshold_core::ActiveConversations::new());
     let engine = Arc::new(
         ConversationEngine::new(
@@ -167,6 +177,8 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
             tool_prompt,
             Some(active_conversations.clone()),
             haiku,
+            ack_enabled,
+            status_interval_secs,
         )
         .await?,
     );

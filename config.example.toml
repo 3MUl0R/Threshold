@@ -34,6 +34,11 @@ model = "sonnet"
 # Default: true.
 # ack_enabled = true
 
+# Interval for live status updates during processing (seconds).
+# A single Discord message is periodically edited with Haiku-summarized progress.
+# 0 = disabled. Default: 30.
+# status_interval_seconds = 30
+
 # Optional: Extra CLI flags to pass
 # extra_flags = ["--some-flag"]
 
