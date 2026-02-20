@@ -972,11 +972,19 @@ mod tests {
     async fn resolve_agent_for_mode_coding_uses_coder() {
         let config = test_config();
         // Create a dummy ClaudeClient (won't be used in this test)
+        let tmp = tempdir().unwrap();
+        let sessions = Arc::new(threshold_cli_wrapper::session::SessionManager::new(
+            tmp.path().join("cli-sessions.json"),
+        ));
+        let locks = Arc::new(threshold_cli_wrapper::ConversationLockMap::new());
         let claude = Arc::new(
             threshold_cli_wrapper::ClaudeClient::new(
                 "claude".to_string(),
-                tempdir().unwrap().path().to_path_buf(),
+                tmp.path().to_path_buf(),
                 false,
+                300,
+                sessions,
+                locks,
             )
             .await
             .unwrap(),
@@ -994,11 +1002,19 @@ mod tests {
     #[tokio::test]
     async fn resolve_agent_for_mode_general_uses_default() {
         let config = test_config();
+        let tmp = tempdir().unwrap();
+        let sessions = Arc::new(threshold_cli_wrapper::session::SessionManager::new(
+            tmp.path().join("cli-sessions.json"),
+        ));
+        let locks = Arc::new(threshold_cli_wrapper::ConversationLockMap::new());
         let claude = Arc::new(
             threshold_cli_wrapper::ClaudeClient::new(
                 "claude".to_string(),
-                tempdir().unwrap().path().to_path_buf(),
+                tmp.path().to_path_buf(),
                 false,
+                300,
+                sessions,
+                locks,
             )
             .await
             .unwrap(),
@@ -1138,11 +1154,18 @@ mod tests {
     ) -> (Arc<ConversationEngine>, broadcast::Receiver<ConversationEvent>) {
         use threshold_core::config::{ClaudeCliConfig, CliConfig, ToolsConfig};
 
+        let sessions = Arc::new(threshold_cli_wrapper::session::SessionManager::new(
+            dir.join("cli").join("cli-sessions.json"),
+        ));
+        let locks = Arc::new(threshold_cli_wrapper::ConversationLockMap::new());
         let claude = Arc::new(
             threshold_cli_wrapper::ClaudeClient::new(
                 "claude".to_string(),
                 dir.join("cli"),
                 false,
+                300,
+                sessions,
+                locks,
             )
             .await
             .unwrap(),

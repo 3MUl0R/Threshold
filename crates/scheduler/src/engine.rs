@@ -506,8 +506,14 @@ mod tests {
         use threshold_core::config::{AgentConfigToml, ClaudeCliConfig, CliConfig, ToolsConfig};
 
         let tmp = tempfile::tempdir().unwrap();
+        let sessions = Arc::new(
+            threshold_cli_wrapper::session::SessionManager::new(
+                tmp.path().join("cli").join("cli-sessions.json"),
+            ),
+        );
+        let locks = Arc::new(threshold_cli_wrapper::ConversationLockMap::new());
         let claude = Arc::new(
-            ClaudeClient::new("claude".into(), tmp.path().join("cli"), false)
+            ClaudeClient::new("claude".into(), tmp.path().join("cli"), false, 300, sessions, locks)
                 .await
                 .unwrap(),
         );

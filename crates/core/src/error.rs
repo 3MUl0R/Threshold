@@ -80,6 +80,9 @@ pub enum ThresholdError {
 
     #[error("Invalid input: {message}")]
     InvalidInput { message: String },
+
+    #[error("Task aborted")]
+    Aborted,
 }
 
 pub type Result<T> = std::result::Result<T, ThresholdError>;

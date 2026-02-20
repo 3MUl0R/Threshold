@@ -2,6 +2,33 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+// ──── Run Tracking ────
+
+/// Unique identifier for a single user request → agent response cycle.
+///
+/// Each time a user sends a message, a new RunId is generated. All progress
+/// events (ack, status updates, final response, abort) are tagged with this ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RunId(pub Uuid);
+
+impl RunId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for RunId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for RunId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", &self.0.to_string()[..8])
+    }
+}
+
 // ──── Conversations ────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

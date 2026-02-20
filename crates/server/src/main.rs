@@ -107,6 +107,15 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
     }
 
     // 4. Create Claude CLI client
+    //    SessionManager and ConversationLockMap are created here and shared
+    //    with both ClaudeClient and the always-on cleanup listener.
+    let session_manager = Arc::new(
+        threshold_cli_wrapper::session::SessionManager::new(
+            config.data_dir()?.join("cli-sessions").join("cli-sessions.json"),
+        ),
+    );
+    let conversation_locks = Arc::new(threshold_cli_wrapper::ConversationLockMap::new());
+    let timeout_secs = config.cli.claude.timeout_seconds.unwrap_or(21600);
     let claude = Arc::new(
         ClaudeClient::new(
             config
@@ -117,10 +126,16 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
                 .unwrap_or_else(|| "claude".to_string()),
             config.data_dir()?.join("cli-sessions"),
             config.cli.claude.skip_permissions.unwrap_or(false),
+            timeout_secs,
+            session_manager.clone(),
+            conversation_locks.clone(),
         )
         .await?,
     );
-    tracing::info!("Claude CLI client configured.");
+    tracing::info!(
+        timeout_secs,
+        "Claude CLI client configured."
+    );
 
     // 5. Build tool prompt and create conversation engine
     let tool_prompt = {
@@ -307,29 +322,54 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
         }
     };
 
-    // 9a. Wire ConversationDeleted → scheduler cleanup listener
-    if let Some(sched_handle) = scheduler_cmd_handle.clone() {
+    // 9a. Always-on cleanup listener for conversation deletion.
+    //     Runs unconditionally (not gated on scheduler). Handles:
+    //     - Scheduler task removal (if scheduler enabled)
+    //     - CLI session mapping cleanup
+    //     - Per-conversation lock cleanup
+    //     - Periodic idle lock sweep
+    {
         let mut event_rx = engine.subscribe();
         let cancel_clone = cancel.clone();
+        let session_mgr = session_manager.clone();
+        let conv_locks = conversation_locks.clone();
+        let sched_handle = scheduler_cmd_handle.clone();
         tokio::spawn(async move {
+            let mut sweep_interval =
+                tokio::time::interval(std::time::Duration::from_secs(600));
             loop {
                 tokio::select! {
                     event = event_rx.recv() => {
                         match event {
                             Ok(threshold_conversation::ConversationEvent::ConversationDeleted { conversation_id }) => {
-                                if let Err(e) = sched_handle.remove_tasks_for_conversation(conversation_id) {
+                                // 1. Scheduler cleanup (only if scheduler is enabled)
+                                if let Some(handle) = &sched_handle {
+                                    if let Err(e) = handle.remove_tasks_for_conversation(conversation_id) {
+                                        tracing::warn!(
+                                            "Failed to remove scheduler tasks: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                                // 2. CLI session mapping cleanup
+                                if let Err(e) = session_mgr.remove(conversation_id.0).await {
                                     tracing::warn!(
-                                        "Failed to forward conversation deletion to scheduler: {}",
+                                        "Failed to remove CLI session: {}",
                                         e
                                     );
                                 }
+                                // 3. Conversation lock cleanup
+                                conv_locks.remove(conversation_id.0).await;
                             }
                             Ok(_) => {} // ignore other events
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                tracing::warn!("Scheduler deletion listener lagged by {} events", n);
+                                tracing::warn!("Cleanup listener lagged by {} events", n);
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
+                    }
+                    _ = sweep_interval.tick() => {
+                        conv_locks.sweep_idle().await;
                     }
                     _ = cancel_clone.cancelled() => break,
                 }

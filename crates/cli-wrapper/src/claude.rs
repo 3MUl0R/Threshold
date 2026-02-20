@@ -2,9 +2,9 @@
 //!
 //! This is the main entry point for other crates to interact with Claude.
 
+use crate::locks::ConversationLockMap;
 use crate::models::resolve_model_alias;
 use crate::process::CliProcess;
-use crate::queue::ExecutionQueue;
 use crate::response::ClaudeResponse;
 use crate::session::SessionManager;
 use std::path::PathBuf;
@@ -19,7 +19,7 @@ use uuid::Uuid;
 pub struct ClaudeClient {
     process: CliProcess,
     sessions: Arc<SessionManager>,
-    queue: ExecutionQueue,
+    locks: Arc<ConversationLockMap>,
     skip_permissions: bool,
 }
 
@@ -30,18 +30,36 @@ impl ClaudeClient {
     /// * `command` - CLI command name (usually "claude")
     /// * `state_dir` - Directory for session state persistence
     /// * `skip_permissions` - Whether to use --dangerously-skip-permissions
-    pub async fn new(command: String, state_dir: PathBuf, skip_permissions: bool) -> Result<Self> {
-        let sessions = Arc::new(SessionManager::new(state_dir.join("cli-sessions.json")));
-
+    /// * `timeout_secs` - Timeout for CLI invocations (0 = unlimited)
+    /// * `sessions` - Shared session manager (also used by the deletion listener)
+    /// * `locks` - Per-conversation lock map (also used by the deletion listener)
+    pub async fn new(
+        command: String,
+        _state_dir: PathBuf,
+        skip_permissions: bool,
+        timeout_secs: u64,
+        sessions: Arc<SessionManager>,
+        locks: Arc<ConversationLockMap>,
+    ) -> Result<Self> {
         // Load existing sessions
         sessions.load().await?;
 
         Ok(Self {
-            process: CliProcess::new(command),
+            process: CliProcess::new(command).with_timeout(timeout_secs),
             sessions,
-            queue: ExecutionQueue::new(),
+            locks,
             skip_permissions,
         })
+    }
+
+    /// Access the shared session manager
+    pub fn sessions(&self) -> &Arc<SessionManager> {
+        &self.sessions
+    }
+
+    /// Access the per-conversation lock map
+    pub fn locks(&self) -> &Arc<ConversationLockMap> {
+        &self.locks
     }
 
     /// Send a message to Claude
@@ -60,81 +78,82 @@ impl ClaudeClient {
         system_prompt: Option<&str>,
         model: Option<&str>,
     ) -> Result<ClaudeResponse> {
-        self.queue
-            .execute(async {
-                // Check for existing session
-                let existing_session = self.sessions.get(conversation_id).await;
+        // Per-conversation lock: different conversations run in parallel,
+        // messages within the same conversation are serialized.
+        let _guard = self.locks.lock(conversation_id).await;
 
-                let result = if let Some(session_id) = existing_session {
-                    // Resume mode
-                    tracing::debug!(
+        // Check for existing session
+        let existing_session = self.sessions.get(conversation_id).await;
+
+        let result = if let Some(session_id) = existing_session {
+            // Resume mode
+            tracing::debug!(
+                conversation_id = %conversation_id,
+                session_id = %session_id,
+                "resuming existing CLI session"
+            );
+            let args = self.build_resume_args(&session_id, message);
+            self.process.run(&args, None, None).await
+        } else {
+            // New session mode — generate a fresh UUID (decoupled from conversation ID)
+            let session_id = Uuid::new_v4();
+            let resolved_model = model
+                .map(|m| resolve_model_alias(m).into_owned())
+                .unwrap_or_else(|| "sonnet".to_string());
+
+            tracing::debug!(
+                conversation_id = %conversation_id,
+                session_id = %session_id,
+                model = %resolved_model,
+                "starting new CLI session"
+            );
+
+            let args = self.build_new_session_args(
+                session_id,
+                message,
+                system_prompt,
+                &resolved_model,
+            );
+            let res = self.process.run(&args, None, None).await;
+
+            // If "already in use", fall back to resume
+            if let Err(ThresholdError::CliError { ref stderr, .. }) = res {
+                if stderr.contains("already in use") {
+                    tracing::warn!(
                         conversation_id = %conversation_id,
                         session_id = %session_id,
-                        "resuming existing CLI session"
+                        "session ID collision, retrying with --resume"
                     );
-                    let args = self.build_resume_args(&session_id, message);
-                    self.process.run(&args, None, None).await
+                    let retry_args =
+                        self.build_resume_args(&session_id.to_string(), message);
+                    self.process.run(&retry_args, None, None).await
                 } else {
-                    // New session mode — generate a fresh UUID (decoupled from conversation ID)
-                    let session_id = Uuid::new_v4();
-                    let resolved_model = model
-                        .map(|m| resolve_model_alias(m).into_owned())
-                        .unwrap_or_else(|| "sonnet".to_string());
-
-                    tracing::debug!(
-                        conversation_id = %conversation_id,
-                        session_id = %session_id,
-                        model = %resolved_model,
-                        "starting new CLI session"
-                    );
-
-                    let args = self.build_new_session_args(
-                        session_id,
-                        message,
-                        system_prompt,
-                        &resolved_model,
-                    );
-                    let res = self.process.run(&args, None, None).await;
-
-                    // If "already in use", fall back to resume
-                    if let Err(ThresholdError::CliError { ref stderr, .. }) = res {
-                        if stderr.contains("already in use") {
-                            tracing::warn!(
-                                conversation_id = %conversation_id,
-                                session_id = %session_id,
-                                "session ID collision, retrying with --resume"
-                            );
-                            let retry_args = self.build_resume_args(&session_id.to_string(), message);
-                            self.process.run(&retry_args, None, None).await
-                        } else {
-                            res
-                        }
-                    } else {
-                        res
-                    }
-                };
-
-                // Execute CLI
-                let output = result?;
-
-                // Parse response
-                let response = ClaudeResponse::parse(&output.stdout)?;
-
-                // Store session ID if present
-                if let Some(session_id) = &response.session_id {
-                    tracing::debug!(
-                        conversation_id = %conversation_id,
-                        session_id = %session_id,
-                        "stored CLI session ID"
-                    );
-                    self.sessions
-                        .set(conversation_id, session_id.clone())
-                        .await?;
+                    res
                 }
+            } else {
+                res
+            }
+        };
 
-                Ok(response)
-            })
-            .await
+        // Execute CLI
+        let output = result?;
+
+        // Parse response
+        let response = ClaudeResponse::parse(&output.stdout)?;
+
+        // Store session ID if present
+        if let Some(session_id) = &response.session_id {
+            tracing::debug!(
+                conversation_id = %conversation_id,
+                session_id = %session_id,
+                "stored CLI session ID"
+            );
+            self.sessions
+                .set(conversation_id, session_id.clone())
+                .await?;
+        }
+
+        Ok(response)
     }
 
     /// Force a new session (ignores existing session)
@@ -242,13 +261,25 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    async fn test_client(dir: &std::path::Path, skip_perms: bool) -> ClaudeClient {
+        let sessions = Arc::new(SessionManager::new(dir.join("cli-sessions.json")));
+        let locks = Arc::new(ConversationLockMap::new());
+        ClaudeClient::new(
+            "claude".to_string(),
+            dir.to_path_buf(),
+            skip_perms,
+            300,
+            sessions,
+            locks,
+        )
+        .await
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn client_creation_loads_sessions() {
         let dir = tempdir().unwrap();
-
-        let client = ClaudeClient::new("claude".to_string(), dir.path().to_path_buf(), false)
-            .await
-            .unwrap();
+        let client = test_client(dir.path(), false).await;
 
         // Sessions loaded (count is 0 since no file exists yet)
         assert_eq!(client.sessions.count().await, 0);
@@ -257,9 +288,7 @@ mod tests {
     #[tokio::test]
     async fn build_new_session_args_includes_all_flags() {
         let dir = tempdir().unwrap();
-        let client = ClaudeClient::new("claude".to_string(), dir.path().to_path_buf(), true)
-            .await
-            .unwrap();
+        let client = test_client(dir.path(), true).await;
 
         let session_id = Uuid::new_v4();
         let args =
@@ -281,9 +310,7 @@ mod tests {
     #[tokio::test]
     async fn build_new_session_args_without_system_prompt() {
         let dir = tempdir().unwrap();
-        let client = ClaudeClient::new("claude".to_string(), dir.path().to_path_buf(), false)
-            .await
-            .unwrap();
+        let client = test_client(dir.path(), false).await;
 
         let session_id = Uuid::new_v4();
         let args = client.build_new_session_args(session_id, "Hello", None, "sonnet");
@@ -295,9 +322,7 @@ mod tests {
     #[tokio::test]
     async fn build_new_session_args_uses_decoupled_session_id() {
         let dir = tempdir().unwrap();
-        let client = ClaudeClient::new("claude".to_string(), dir.path().to_path_buf(), false)
-            .await
-            .unwrap();
+        let client = test_client(dir.path(), false).await;
 
         let session_id = Uuid::new_v4();
         let args = client.build_new_session_args(session_id, "Hello", None, "sonnet");
@@ -310,9 +335,7 @@ mod tests {
     #[tokio::test]
     async fn build_resume_args_only_includes_resume_flag() {
         let dir = tempdir().unwrap();
-        let client = ClaudeClient::new("claude".to_string(), dir.path().to_path_buf(), false)
-            .await
-            .unwrap();
+        let client = test_client(dir.path(), false).await;
 
         let args = client.build_resume_args("session-123", "Follow up");
 
@@ -331,9 +354,7 @@ mod tests {
     #[tokio::test]
     async fn build_resume_args_with_skip_permissions() {
         let dir = tempdir().unwrap();
-        let client = ClaudeClient::new("claude".to_string(), dir.path().to_path_buf(), true)
-            .await
-            .unwrap();
+        let client = test_client(dir.path(), true).await;
 
         let args = client.build_resume_args("session-123", "Follow up");
 
@@ -344,9 +365,7 @@ mod tests {
     #[ignore] // Requires claude CLI installed
     async fn health_check_with_real_cli() {
         let dir = tempdir().unwrap();
-        let client = ClaudeClient::new("claude".to_string(), dir.path().to_path_buf(), false)
-            .await
-            .unwrap();
+        let client = test_client(dir.path(), false).await;
 
         let result = client.health_check().await;
         assert!(result.is_ok());

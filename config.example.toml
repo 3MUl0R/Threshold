@@ -22,8 +22,9 @@ log_level = "info"
 # Optional: Default model (sonnet, opus, haiku)
 model = "sonnet"
 
-# Optional: CLI timeout in seconds (default: 300)
-# timeout_seconds = 300
+# Maximum time for a single Claude invocation (seconds).
+# 0 = no timeout. Default: 21600 (6 hours).
+# timeout_seconds = 21600
 
 # Optional: Skip permission prompts (use with caution!)
 # skip_permissions = false
@@ -46,7 +47,7 @@ allowed_user_ids = [
 ]
 
 # Note: Discord bot token is stored in the secret store or DISCORD_BOT_TOKEN env var
-# Run: ./scripts/setup-discord-token.sh to set it up
+# Set via web UI at /config/credentials, or run: ./scripts/setup-discord-token.sh
 
 # ── Agent Configurations ──
 

@@ -73,11 +73,20 @@ mod tests {
     #[tokio::test]
     async fn resolve_creates_new_portal_for_new_channel() {
         let config = test_config();
+        let sessions = Arc::new(
+            threshold_cli_wrapper::session::SessionManager::new(
+                config.data_dir().unwrap().join("cli-sessions").join("cli-sessions.json"),
+            ),
+        );
+        let locks = Arc::new(threshold_cli_wrapper::ConversationLockMap::new());
         let claude = Arc::new(
             ClaudeClient::new(
                 config.cli.claude.command.clone().unwrap_or_else(|| "claude".to_string()),
                 config.data_dir().unwrap().join("cli-sessions"),
                 config.cli.claude.skip_permissions.unwrap_or(false),
+                300,
+                sessions,
+                locks,
             )
             .await
             .unwrap(),
@@ -96,11 +105,20 @@ mod tests {
     #[tokio::test]
     async fn resolve_reuses_existing_portal() {
         let config = test_config();
+        let sessions = Arc::new(
+            threshold_cli_wrapper::session::SessionManager::new(
+                config.data_dir().unwrap().join("cli-sessions").join("cli-sessions.json"),
+            ),
+        );
+        let locks = Arc::new(threshold_cli_wrapper::ConversationLockMap::new());
         let claude = Arc::new(
             ClaudeClient::new(
                 config.cli.claude.command.clone().unwrap_or_else(|| "claude".to_string()),
                 config.data_dir().unwrap().join("cli-sessions"),
                 config.cli.claude.skip_permissions.unwrap_or(false),
+                300,
+                sessions,
+                locks,
             )
             .await
             .unwrap(),

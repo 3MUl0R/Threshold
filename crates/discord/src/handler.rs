@@ -65,11 +65,25 @@ async fn handle_message(
     )
     .await;
 
-    // 5. Show typing indicator while processing
-    let _typing = msg.channel_id.start_typing(&ctx.http);
-
-    // 6. Send message to conversation engine
-    data.engine.handle_message(&portal_id, &msg.content).await?;
+    // 5. Spawn engine call as background task — return immediately so the
+    //    handler is not blocked for the entire duration of the CLI invocation.
+    //    The response reaches Discord through the portal listener (broadcast events).
+    let engine = data.engine.clone();
+    let content = msg.content.clone();
+    let http = ctx.http.clone();
+    let channel_id = msg.channel_id;
+    tokio::spawn(async move {
+        // Typing indicator lives inside the spawned task so it persists
+        // for the entire duration of the CLI invocation.
+        let _typing = channel_id.start_typing(&http);
+        if let Err(e) = engine.handle_message(&portal_id, &content).await {
+            tracing::error!(
+                error = %e,
+                portal_id = ?portal_id,
+                "Background message handling failed"
+            );
+        }
+    });
 
     Ok(())
 }

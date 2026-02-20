@@ -111,53 +111,91 @@ impl CliProcess {
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
 
-        // Wait with timeout
-        // IMPORTANT: Use select! without consuming child for timeout kill
-        tokio::select! {
-            result = child.wait() => {
-                // Process exited, read output
-                use tokio::io::AsyncReadExt;
-                let mut stdout_buf = Vec::new();
-                let mut stderr_buf = Vec::new();
+        // Drain stdout/stderr concurrently with wait to avoid pipe buffer deadlock.
+        // If the child produces more than ~64KB, it blocks writing to the pipe.
+        // We must read while waiting, not after.
+        use tokio::io::AsyncReadExt;
+        let stdout_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = tokio::io::BufReader::new(stdout).read_to_end(&mut buf).await;
+            buf
+        });
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = tokio::io::BufReader::new(stderr).read_to_end(&mut buf).await;
+            buf
+        });
 
-                let _ = tokio::io::BufReader::new(stdout).read_to_end(&mut stdout_buf).await;
-                let _ = tokio::io::BufReader::new(stderr).read_to_end(&mut stderr_buf).await;
-
-                let status = result.map_err(ThresholdError::Io)?;
-                let exit_code = status.code().unwrap_or(-1);
-                let stdout_str = String::from_utf8_lossy(&stdout_buf).to_string();
-                let stderr_str = String::from_utf8_lossy(&stderr_buf).to_string();
-
-                let duration = start.elapsed();
-
-                tracing::debug!(
-                    exit_code,
-                    duration_ms = duration.as_millis(),
-                    stdout_len = stdout_str.len(),
-                    stderr_len = stderr_str.len(),
-                    "CLI process completed"
-                );
-
-                // Check for errors
-                if exit_code != 0 {
-                    return Err(self.classify_error(exit_code, &stderr_str));
+        // Wait with timeout (0 = no timeout)
+        if self.timeout_secs == 0 {
+            let status = match child.wait().await {
+                Ok(s) => s,
+                Err(e) => {
+                    stdout_task.abort();
+                    stderr_task.abort();
+                    return Err(ThresholdError::Io(e));
                 }
-
-                Ok(CliOutput {
-                    stdout: stdout_str,
-                    stderr: stderr_str,
-                    exit_code,
-                    duration,
-                })
-            }
-            _ = tokio::time::sleep(Duration::from_secs(self.timeout_secs)) => {
-                // Timeout - kill the process
-                let _ = child.kill().await;
-                Err(ThresholdError::CliTimeout {
-                    timeout_ms: self.timeout_secs * 1000,
-                })
+            };
+            let stdout_buf = stdout_task.await.unwrap_or_default();
+            let stderr_buf = stderr_task.await.unwrap_or_default();
+            self.build_output(start, status, &stdout_buf, &stderr_buf)
+        } else {
+            tokio::select! {
+                result = child.wait() => {
+                    let status = match result {
+                        Ok(s) => s,
+                        Err(e) => {
+                            stdout_task.abort();
+                            stderr_task.abort();
+                            return Err(ThresholdError::Io(e));
+                        }
+                    };
+                    let stdout_buf = stdout_task.await.unwrap_or_default();
+                    let stderr_buf = stderr_task.await.unwrap_or_default();
+                    self.build_output(start, status, &stdout_buf, &stderr_buf)
+                }
+                _ = tokio::time::sleep(Duration::from_secs(self.timeout_secs)) => {
+                    let _ = child.kill().await;
+                    stdout_task.abort();
+                    stderr_task.abort();
+                    Err(ThresholdError::CliTimeout {
+                        timeout_ms: self.timeout_secs * 1000,
+                    })
+                }
             }
         }
+    }
+
+    fn build_output(
+        &self,
+        start: std::time::Instant,
+        status: std::process::ExitStatus,
+        stdout_buf: &[u8],
+        stderr_buf: &[u8],
+    ) -> Result<CliOutput> {
+        let exit_code = status.code().unwrap_or(-1);
+        let stdout_str = String::from_utf8_lossy(stdout_buf).to_string();
+        let stderr_str = String::from_utf8_lossy(stderr_buf).to_string();
+        let duration = start.elapsed();
+
+        tracing::debug!(
+            exit_code,
+            duration_ms = duration.as_millis(),
+            stdout_len = stdout_str.len(),
+            stderr_len = stderr_str.len(),
+            "CLI process completed"
+        );
+
+        if exit_code != 0 {
+            return Err(self.classify_error(exit_code, &stderr_str));
+        }
+
+        Ok(CliOutput {
+            stdout: stdout_str,
+            stderr: stderr_str,
+            exit_code,
+            duration,
+        })
     }
 
     fn classify_error(&self, exit_code: i32, stderr: &str) -> ThresholdError {
@@ -264,6 +302,39 @@ mod tests {
         let output = result.unwrap();
         assert_eq!(output.exit_code, 0);
         assert!(output.stdout.contains("claude") || output.stdout.contains("version"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_drain_large_output() {
+        // Produce >64KB of output to verify no pipe buffer deadlock.
+        // `yes` outputs "y\n" endlessly; `head -c 100000` truncates to 100KB.
+        let process = CliProcess::new("sh").with_timeout(10);
+        let result = process
+            .run(
+                &[
+                    "-c".to_string(),
+                    "yes | head -c 100000".to_string(),
+                ],
+                None,
+                None,
+            )
+            .await;
+
+        assert!(result.is_ok(), "large output should not deadlock");
+        let output = result.unwrap();
+        assert!(
+            output.stdout.len() >= 100_000,
+            "expected >=100KB stdout, got {} bytes",
+            output.stdout.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn no_timeout_when_zero() {
+        // timeout_secs = 0 should not impose any timeout
+        let process = CliProcess::new("sleep").with_timeout(0);
+        let result = process.run(&["0.1".to_string()], None, None).await;
+        assert!(result.is_ok(), "zero timeout should not fire");
     }
 
     #[test]

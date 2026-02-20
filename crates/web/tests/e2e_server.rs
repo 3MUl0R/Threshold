@@ -49,11 +49,18 @@ async fn main() {
         }),
     });
 
+    let sessions = Arc::new(threshold_cli_wrapper::session::SessionManager::new(
+        data_dir.join("cli-sessions").join("cli-sessions.json"),
+    ));
+    let locks = Arc::new(threshold_cli_wrapper::ConversationLockMap::new());
     let claude = Arc::new(
         threshold_cli_wrapper::ClaudeClient::new(
             "echo".into(),
             data_dir.join("cli-sessions"),
             false,
+            300,
+            sessions,
+            locks,
         )
         .await
         .unwrap(),
