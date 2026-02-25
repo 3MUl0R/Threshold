@@ -359,7 +359,7 @@ impl ConversationEngine {
                 );
                 tokio::spawn(async move {
                     let result = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
+                        std::time::Duration::from_secs(30),
                         haiku.generate(&ack_prompt, None),
                     )
                     .await;
@@ -397,7 +397,7 @@ impl ConversationEngine {
                         }
                         Err(_) => {
                             tracing::info!(
-                                "Haiku acknowledgment timed out after 5s (dropped)"
+                                "Haiku acknowledgment timed out after 30s (dropped)"
                             );
                         }
                     }
@@ -575,7 +575,7 @@ impl ConversationEngine {
                     let status_audit_dir = self.audit_dir.clone();
                     tokio::spawn(async move {
                         let result = tokio::time::timeout(
-                            std::time::Duration::from_secs(10),
+                            std::time::Duration::from_secs(30),
                             haiku.generate(&summary_prompt, None),
                         )
                         .await;
@@ -1277,7 +1277,7 @@ impl ConversationEngine {
                     let status_audit_dir = self.audit_dir.clone();
                     tokio::spawn(async move {
                         let result = tokio::time::timeout(
-                            std::time::Duration::from_secs(10),
+                            std::time::Duration::from_secs(30),
                             haiku.generate(&summary_prompt, None),
                         )
                         .await;
