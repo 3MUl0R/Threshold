@@ -1459,7 +1459,7 @@ fn detect_supervised(data_dir: &Path) -> bool {
     }
 
     // Check 3: Validate start time to catch PID reuse to a different shell process.
-    // The wrapper writes an ISO 8601 timestamp; we compare it against `ps -o lstart=`.
+    // The wrapper writes an ISO 8601 UTC timestamp; `ps -o lstart=` returns local time.
     if let Some(started_at) = _started_at {
         if let Ok(marker_time) = chrono::DateTime::parse_from_rfc3339(&started_at) {
             let marker_time = marker_time.with_timezone(&chrono::Utc);
@@ -1469,18 +1469,26 @@ fn detect_supervised(data_dir: &Path) -> bool {
             {
                 let lstart = String::from_utf8_lossy(&output.stdout);
                 let lstart = lstart.trim();
-                // macOS `ps -o lstart=` format: "Mon Jan  1 00:00:00 2026"
+                // macOS `ps -o lstart=` format: "Mon Jan  1 00:00:00 2026" (local time)
                 if !lstart.is_empty() {
-                    if let Ok(proc_time) =
+                    if let Ok(proc_naive) =
                         chrono::NaiveDateTime::parse_from_str(lstart, "%a %b %e %H:%M:%S %Y")
                     {
-                        let proc_time = proc_time.and_utc();
-                        // Allow 5s of clock skew between marker write and ps output
-                        let diff = (marker_time - proc_time).num_seconds().unsigned_abs();
-                        if diff > 5 {
-                            // PID was reused — the marker's start time doesn't match
-                            let _ = std::fs::remove_file(&marker_path);
-                            return false;
+                        // ps outputs local time — interpret it in the system timezone,
+                        // then convert to UTC for comparison with the marker (which is UTC).
+                        let local_tz = chrono::Local::now().timezone();
+                        if let Some(proc_local) =
+                            proc_naive.and_local_timezone(local_tz).earliest()
+                        {
+                            let proc_utc = proc_local.with_timezone(&chrono::Utc);
+                            // Allow 5s of clock skew between marker write and ps output
+                            let diff =
+                                (marker_time - proc_utc).num_seconds().unsigned_abs();
+                            if diff > 5 {
+                                // PID was reused — the marker's start time doesn't match
+                                let _ = std::fs::remove_file(&marker_path);
+                                return false;
+                            }
                         }
                     }
                 }
