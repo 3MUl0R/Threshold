@@ -14,8 +14,8 @@
 
 use std::sync::Arc;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use threshold_core::SecretStore;
 use url::Url;
 
@@ -92,8 +92,7 @@ impl GmailAuth {
         let state = generate_random_state();
 
         let redirect_uri = format!("http://{}:{}", REDIRECT_HOST, REDIRECT_PORT);
-        let auth_url =
-            build_auth_url(&client_id, &scopes, &redirect_uri, &state, &code_challenge);
+        let auth_url = build_auth_url(&client_id, &scopes, &redirect_uri, &state, &code_challenge);
 
         // Interactive prompts go to stderr to keep stdout JSON-only
         eprintln!("Open this URL in your browser to authorize Gmail access:\n");
@@ -181,10 +180,7 @@ impl GmailAuth {
 
         // Store the new access token
         self.secret_store
-            .set(
-                &access_token_key(&self.inbox),
-                &token_response.access_token,
-            )
+            .set(&access_token_key(&self.inbox), &token_response.access_token)
             .map_err(|e| AuthError::KeychainError(e.to_string()))?;
 
         // If a new refresh token was issued, store it too
@@ -316,9 +312,7 @@ async fn receive_authorization_code() -> Result<(String, Option<String>), AuthEr
         total += n;
 
         // We only need the first line, check if we have \r\n or \n
-        if buf[..total].windows(2).any(|w| w == b"\r\n")
-            || buf[..total].contains(&b'\n')
-        {
+        if buf[..total].windows(2).any(|w| w == b"\r\n") || buf[..total].contains(&b'\n') {
             break;
         }
     }

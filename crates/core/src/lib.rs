@@ -15,6 +15,6 @@ pub use paths::resolve_path;
 pub use secrets::{SecretBackend, SecretStore};
 pub use types::{
     AgentConfig, CliProvider, Conversation, ConversationId, ConversationMode, DaemonState,
-    DrainSummary, HealthConfig, Message, MessageRole, Portal, PortalId, PortalType, RestartHook,
-    ResultSender, RunId, ScheduledAction, ToolPermissionMode, ToolProfile, WorkGuard,
+    DrainSummary, HealthConfig, Message, MessageRole, MessageSource, Portal, PortalId, PortalType,
+    RestartHook, ResultSender, RunId, ScheduledAction, ToolPermissionMode, ToolProfile, WorkGuard,
 };

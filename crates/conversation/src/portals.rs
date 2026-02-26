@@ -129,6 +129,11 @@ impl PortalRegistry {
             .collect()
     }
 
+    /// Iterate all portals.
+    pub fn iter(&self) -> impl Iterator<Item = (&PortalId, &Portal)> {
+        self.portals.iter()
+    }
+
     /// Find a portal by Discord channel
     pub fn find_by_discord_channel(&self, guild_id: u64, channel_id: u64) -> Option<&Portal> {
         self.portals.values().find(|p| match &p.portal_type {

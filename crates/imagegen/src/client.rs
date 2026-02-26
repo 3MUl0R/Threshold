@@ -6,8 +6,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::Deserialize;
 use threshold_core::SecretStore;
 
@@ -407,18 +407,26 @@ mod tests {
 
     #[test]
     fn error_display_strings() {
-        assert!(ImageGenError::SecretNotFound
-            .to_string()
-            .contains("google-api-key"));
-        assert!(ImageGenError::RequestFailed("500".into())
-            .to_string()
-            .contains("500"));
-        assert!(ImageGenError::ParseError("bad json".into())
-            .to_string()
-            .contains("bad json"));
-        assert!(ImageGenError::NotEnabled
-            .to_string()
-            .contains("not enabled"));
+        assert!(
+            ImageGenError::SecretNotFound
+                .to_string()
+                .contains("google-api-key")
+        );
+        assert!(
+            ImageGenError::RequestFailed("500".into())
+                .to_string()
+                .contains("500")
+        );
+        assert!(
+            ImageGenError::ParseError("bad json".into())
+                .to_string()
+                .contains("bad json")
+        );
+        assert!(
+            ImageGenError::NotEnabled
+                .to_string()
+                .contains("not enabled")
+        );
     }
 
     #[test]

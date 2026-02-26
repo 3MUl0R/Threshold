@@ -71,9 +71,11 @@ async fn main() {
     );
 
     let engine = Arc::new(
-        threshold_conversation::ConversationEngine::new(&config, claude, None, None, None, false, 0, None)
-            .await
-            .unwrap(),
+        threshold_conversation::ConversationEngine::new(
+            &config, claude, None, None, None, false, 0, None,
+        )
+        .await
+        .unwrap(),
     );
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -100,9 +102,7 @@ async fn main() {
 
     let app = routes::build_router(state);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
 
     // Print the URL for the test script to pick up

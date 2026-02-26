@@ -115,8 +115,7 @@ fn find_sentence_boundary(content: &str, safe_max: usize) -> Option<usize> {
         if matches!(c, '.' | '!' | '?') {
             // Check if followed by space or end
             let next_pos = i + c.len_utf8();
-            if next_pos >= search_text.len()
-                || search_text[next_pos..].chars().next() == Some(' ')
+            if next_pos >= search_text.len() || search_text[next_pos..].chars().next() == Some(' ')
             {
                 return Some(next_pos);
             }

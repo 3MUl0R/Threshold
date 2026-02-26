@@ -1,10 +1,10 @@
 //! Dashboard routes: GET / and GET /status (JSON for htmx polling).
 
+use axum::Router;
 use axum::extract::State;
 use axum::http::header;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
 
 use crate::error::WebError;
 use crate::state::AppState;
@@ -112,9 +112,7 @@ async fn status_json(State(state): State<AppState>) -> impl IntoResponse {
 
 /// Read and deserialize a flash message from cookies.
 fn read_flash(headers: &axum::http::HeaderMap) -> Option<minijinja::Value> {
-    let cookie_header = headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())?;
+    let cookie_header = headers.get(header::COOKIE).and_then(|v| v.to_str().ok())?;
     let flash = crate::flash::read_flash(cookie_header)?;
     Some(minijinja::context! {
         level => flash.level,

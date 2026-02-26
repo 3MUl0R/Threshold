@@ -38,10 +38,7 @@ pub async fn load_tasks(store_path: &Path) -> Result<Vec<ScheduledTask>, Thresho
 ///
 /// Writes to a `.tmp` file first, then renames to the target path.
 /// Creates parent directories if needed.
-pub async fn save_tasks(
-    store_path: &Path,
-    tasks: &[ScheduledTask],
-) -> Result<(), ThresholdError> {
+pub async fn save_tasks(store_path: &Path, tasks: &[ScheduledTask]) -> Result<(), ThresholdError> {
     if let Some(parent) = store_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -108,10 +105,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state").join("schedules.json");
 
-        let tasks = vec![
-            make_test_task("task-1"),
-            make_test_task("task-2"),
-        ];
+        let tasks = vec![make_test_task("task-1"), make_test_task("task-2")];
 
         save_tasks(&path, &tasks).await.unwrap();
 
@@ -126,7 +120,11 @@ mod tests {
     #[tokio::test]
     async fn save_creates_parent_dirs() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("deep").join("nested").join("schedules.json");
+        let path = dir
+            .path()
+            .join("deep")
+            .join("nested")
+            .join("schedules.json");
 
         save_tasks(&path, &[make_test_task("test")]).await.unwrap();
         assert!(path.exists());

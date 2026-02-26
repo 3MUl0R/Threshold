@@ -122,10 +122,14 @@ pub async fn handle_gmail_command(
             let auth = GmailAuth::new(secret_store, &inbox);
             auth.authorize(include_send).await?;
 
-            audit_log(&audit, &serde_json::json!({
-                "action": "auth",
-                "inbox": inbox
-            })).await;
+            audit_log(
+                &audit,
+                &serde_json::json!({
+                    "action": "auth",
+                    "inbox": inbox
+                }),
+            )
+            .await;
 
             let output = serde_json::json!({
                 "status": "ok",
@@ -140,11 +144,15 @@ pub async fn handle_gmail_command(
             let client = GmailClient::new(secret_store, &inbox);
             let messages = client.list_messages(query.as_deref(), max).await?;
 
-            audit_log(&audit, &serde_json::json!({
-                "action": "list",
-                "inbox": inbox,
-                "count": messages.len()
-            })).await;
+            audit_log(
+                &audit,
+                &serde_json::json!({
+                    "action": "list",
+                    "inbox": inbox,
+                    "count": messages.len()
+                }),
+            )
+            .await;
 
             println!("{}", serde_json::to_string_pretty(&messages)?);
         }
@@ -154,11 +162,15 @@ pub async fn handle_gmail_command(
             let client = GmailClient::new(secret_store, &inbox);
             let message = client.get_message(&id).await?;
 
-            audit_log(&audit, &serde_json::json!({
-                "action": "read",
-                "inbox": inbox,
-                "message_id": id
-            })).await;
+            audit_log(
+                &audit,
+                &serde_json::json!({
+                    "action": "read",
+                    "inbox": inbox,
+                    "message_id": id
+                }),
+            )
+            .await;
 
             println!("{}", serde_json::to_string_pretty(&message)?);
         }
@@ -168,12 +180,16 @@ pub async fn handle_gmail_command(
             let client = GmailClient::new(secret_store, &inbox);
             let messages = client.search(&query, max).await?;
 
-            audit_log(&audit, &serde_json::json!({
-                "action": "search",
-                "inbox": inbox,
-                "query": query,
-                "count": messages.len()
-            })).await;
+            audit_log(
+                &audit,
+                &serde_json::json!({
+                    "action": "search",
+                    "inbox": inbox,
+                    "query": query,
+                    "count": messages.len()
+                }),
+            )
+            .await;
 
             println!("{}", serde_json::to_string_pretty(&messages)?);
         }
@@ -189,12 +205,16 @@ pub async fn handle_gmail_command(
             let client = GmailClient::new(secret_store, &inbox);
             client.send(&to, &subject, &body).await?;
 
-            audit_log(&audit, &serde_json::json!({
-                "action": "send",
-                "inbox": inbox,
-                "to": to,
-                "subject": subject
-            })).await;
+            audit_log(
+                &audit,
+                &serde_json::json!({
+                    "action": "send",
+                    "inbox": inbox,
+                    "to": to,
+                    "subject": subject
+                }),
+            )
+            .await;
 
             let output = serde_json::json!({
                 "status": "ok",
@@ -211,11 +231,15 @@ pub async fn handle_gmail_command(
             let client = GmailClient::new(secret_store, &inbox);
             client.reply(&id, &body).await?;
 
-            audit_log(&audit, &serde_json::json!({
-                "action": "reply",
-                "inbox": inbox,
-                "message_id": id
-            })).await;
+            audit_log(
+                &audit,
+                &serde_json::json!({
+                    "action": "reply",
+                    "inbox": inbox,
+                    "message_id": id
+                }),
+            )
+            .await;
 
             let output = serde_json::json!({
                 "status": "ok",
@@ -284,10 +308,7 @@ mod tests {
     fn config_with_inboxes() -> GmailToolConfig {
         GmailToolConfig {
             enabled: true,
-            inboxes: Some(vec![
-                "alice@gmail.com".into(),
-                "bob@company.com".into(),
-            ]),
+            inboxes: Some(vec!["alice@gmail.com".into(), "bob@company.com".into()]),
             allow_send: None,
         }
     }

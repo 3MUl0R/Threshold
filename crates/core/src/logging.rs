@@ -117,7 +117,7 @@ pub fn init_logging(log_level: &str, log_dir: &Path) -> crate::Result<WorkerGuar
 /// This function scans the log directory for archived log files matching
 /// the pattern `threshold.log.*` and removes files older than `keep_days`.
 fn cleanup_old_logs(log_dir: &Path, keep_days: u64) -> crate::Result<()> {
-    use std::time::{SystemTime, Duration};
+    use std::time::{Duration, SystemTime};
 
     let cutoff = SystemTime::now()
         .checked_sub(Duration::from_secs(keep_days * 24 * 60 * 60))
@@ -141,9 +141,7 @@ fn cleanup_old_logs(log_dir: &Path, keep_days: u64) -> crate::Result<()> {
         }
 
         // Only process archived log files (threshold.log.*)
-        let filename = path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
         if !filename.starts_with("threshold.log.") {
             continue;
@@ -160,8 +158,9 @@ fn cleanup_old_logs(log_dir: &Path, keep_days: u64) -> crate::Result<()> {
 
         if modified < cutoff {
             tracing::debug!("Removing old log file: {}", path.display());
-            std::fs::remove_file(&path)
-                .map_err(|e| crate::ThresholdError::LoggingInit(format!("remove old log: {}", e)))?;
+            std::fs::remove_file(&path).map_err(|e| {
+                crate::ThresholdError::LoggingInit(format!("remove old log: {}", e))
+            })?;
         }
     }
 

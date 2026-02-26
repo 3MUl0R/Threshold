@@ -134,12 +134,16 @@ impl CliProcess {
         use tokio::io::AsyncReadExt;
         let stdout_task = tokio::spawn(async move {
             let mut buf = Vec::new();
-            let _ = tokio::io::BufReader::new(stdout).read_to_end(&mut buf).await;
+            let _ = tokio::io::BufReader::new(stdout)
+                .read_to_end(&mut buf)
+                .await;
             buf
         });
         let stderr_task = tokio::spawn(async move {
             let mut buf = Vec::new();
-            let _ = tokio::io::BufReader::new(stderr).read_to_end(&mut buf).await;
+            let _ = tokio::io::BufReader::new(stderr)
+                .read_to_end(&mut buf)
+                .await;
             buf
         });
 
@@ -250,7 +254,9 @@ impl CliProcess {
         let stderr_task = tokio::spawn(async move {
             use tokio::io::AsyncReadExt;
             let mut buf = Vec::new();
-            let _ = tokio::io::BufReader::new(stderr).read_to_end(&mut buf).await;
+            let _ = tokio::io::BufReader::new(stderr)
+                .read_to_end(&mut buf)
+                .await;
             String::from_utf8_lossy(&buf).to_string()
         });
 
@@ -341,10 +347,7 @@ impl CliProcess {
             if !saw_result {
                 // Process exited without emitting a `result` event —
                 // classify using exit code + stderr, same as non-streaming path.
-                let exit_code = exit_status
-                    .ok()
-                    .and_then(|s| s.code())
-                    .unwrap_or(-1);
+                let exit_code = exit_status.ok().and_then(|s| s.code()).unwrap_or(-1);
 
                 if exit_code != 0 || !stderr_output.is_empty() {
                     let stderr_lower = stderr_output.to_lowercase();
@@ -352,13 +355,9 @@ impl CliProcess {
                         || stderr_lower.contains("unauthorized")
                     {
                         "Authentication expired. Please re-authenticate.".to_string()
-                    } else if stderr_lower.contains("402")
-                        || stderr_lower.contains("payment")
-                    {
+                    } else if stderr_lower.contains("402") || stderr_lower.contains("payment") {
                         "Billing issue detected.".to_string()
-                    } else if stderr_lower.contains("429")
-                        || stderr_lower.contains("rate limit")
-                    {
+                    } else if stderr_lower.contains("429") || stderr_lower.contains("rate limit") {
                         "Rate limited. Please try again later.".to_string()
                     } else if stderr_output.is_empty() {
                         format!("CLI process exited with code {exit_code}")
@@ -523,10 +522,7 @@ mod tests {
         let process = CliProcess::new("sh").with_timeout(10);
         let result = process
             .run(
-                &[
-                    "-c".to_string(),
-                    "yes | head -c 100000".to_string(),
-                ],
+                &["-c".to_string(), "yes | head -c 100000".to_string()],
                 None,
                 None,
             )
@@ -557,12 +553,7 @@ mod tests {
         let abort = CancellationToken::new();
         let jsonl = r#"printf '{"type":"assistant","message":{"content":[{"type":"text","text":"Hello"}]}}\n{"type":"result","subtype":"success","result":"Hello World","session_id":"abc","is_error":false}\n'"#;
         let handle = process
-            .run_streaming(
-                &["-c".to_string(), jsonl.to_string()],
-                None,
-                None,
-                abort,
-            )
+            .run_streaming(&["-c".to_string(), jsonl.to_string()], None, None, abort)
             .await
             .unwrap();
 
@@ -572,11 +563,17 @@ mod tests {
             events.push(event);
         }
 
-        assert!(events.len() >= 2, "expected at least 2 events, got {}", events.len());
+        assert!(
+            events.len() >= 2,
+            "expected at least 2 events, got {}",
+            events.len()
+        );
         // First event should be TextDelta (from assistant message content)
         assert!(matches!(&events[0], StreamEvent::TextDelta { text } if text == "Hello"));
         // Last event should be Result
-        assert!(matches!(&events[events.len() - 1], StreamEvent::Result { text, .. } if text == "Hello World"));
+        assert!(
+            matches!(&events[events.len() - 1], StreamEvent::Result { text, .. } if text == "Hello World")
+        );
     }
 
     #[tokio::test]
@@ -585,12 +582,7 @@ mod tests {
         let process = CliProcess::new("sleep").with_timeout(0);
         let abort = CancellationToken::new();
         let handle = process
-            .run_streaming(
-                &["60".to_string()],
-                None,
-                None,
-                abort.clone(),
-            )
+            .run_streaming(&["60".to_string()], None, None, abort.clone())
             .await
             .unwrap();
 
@@ -616,12 +608,7 @@ mod tests {
         let process = CliProcess::new("echo").with_timeout(10);
         let abort = CancellationToken::new();
         let handle = process
-            .run_streaming(
-                &["not-json".to_string()],
-                None,
-                None,
-                abort,
-            )
+            .run_streaming(&["not-json".to_string()], None, None, abort)
             .await
             .unwrap();
 
@@ -642,12 +629,7 @@ mod tests {
         // Produce streaming JSONL output continuously (assistant events with text)
         let jsonl = r#"while true; do echo '{"type":"assistant","message":{"content":[{"type":"text","text":"x"}]}}'; done"#;
         let handle = process
-            .run_streaming(
-                &["-c".to_string(), jsonl.to_string()],
-                None,
-                None,
-                abort,
-            )
+            .run_streaming(&["-c".to_string(), jsonl.to_string()], None, None, abort)
             .await
             .unwrap();
 

@@ -79,10 +79,11 @@ impl TaskStore {
                 })?;
         }
 
-        let data = serde_json::to_string_pretty(&self.items).map_err(|e| ThresholdError::IoError {
-            path: self.path.display().to_string(),
-            message: format!("JSON serialize error: {}", e),
-        })?;
+        let data =
+            serde_json::to_string_pretty(&self.items).map_err(|e| ThresholdError::IoError {
+                path: self.path.display().to_string(),
+                message: format!("JSON serialize error: {}", e),
+            })?;
 
         tokio::fs::write(&self.path, data)
             .await
@@ -115,13 +116,11 @@ impl TaskStore {
         id: &Uuid,
         status: WorkItemStatus,
     ) -> Result<(), ThresholdError> {
-        let item = self
-            .items
-            .iter_mut()
-            .find(|i| i.id == *id)
-            .ok_or_else(|| ThresholdError::NotFound {
+        let item = self.items.iter_mut().find(|i| i.id == *id).ok_or_else(|| {
+            ThresholdError::NotFound {
                 message: format!("work item {}", id),
-            })?;
+            }
+        })?;
         item.status = status;
         item.updated_at = Utc::now();
         Ok(())

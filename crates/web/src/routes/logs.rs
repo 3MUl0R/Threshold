@@ -1,9 +1,9 @@
 //! Log viewer routes: structured log file browser with filtering.
 
+use axum::Router;
 use axum::extract::{Query, State};
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
-use axum::Router;
 use serde::Deserialize;
 
 use crate::error::WebError;
@@ -88,19 +88,19 @@ async fn entries_partial(
 ) -> Result<impl IntoResponse, WebError> {
     let files = discover_log_files(&state.data_dir);
 
-    let file = query.file.unwrap_or_else(|| {
-        files.first().cloned().unwrap_or_default()
-    });
+    let file = query
+        .file
+        .unwrap_or_else(|| files.first().cloned().unwrap_or_default());
 
     if file.is_empty() {
-        return Ok(Html("<p class=\"empty-state\">No log files found.</p>".to_string()));
+        return Ok(Html(
+            "<p class=\"empty-state\">No log files found.</p>".to_string(),
+        ));
     }
 
     // Security: validate file against discovered log files
     if !validate_log_file(&file, &files) {
-        return Err(WebError::BadRequest(format!(
-            "Invalid log file: {file}"
-        )));
+        return Err(WebError::BadRequest(format!("Invalid log file: {file}")));
     }
 
     let log_path = state.data_dir.join("logs").join(&file);
@@ -131,7 +131,10 @@ async fn entries_partial(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_lowercase();
-                if !level_filters.iter().any(|l| l.eq_ignore_ascii_case(&entry_level)) {
+                if !level_filters
+                    .iter()
+                    .any(|l| l.eq_ignore_ascii_case(&entry_level))
+                {
                     return None;
                 }
             }

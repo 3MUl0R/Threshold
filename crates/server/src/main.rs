@@ -8,6 +8,7 @@ mod daemon_client;
 mod gmail;
 mod imagegen;
 mod output;
+mod portal;
 mod schedule;
 
 use std::path::{Path, PathBuf};
@@ -30,6 +31,11 @@ enum Commands {
     Schedule {
         #[command(subcommand)]
         command: schedule::ScheduleCommands,
+    },
+    /// List and manage portals (requires running daemon)
+    Portal {
+        #[command(subcommand)]
+        command: portal::PortalCommands,
     },
     /// Gmail integration — read, search, and send email
     Gmail(threshold_gmail::GmailArgs),
@@ -167,15 +173,13 @@ async fn main() -> anyhow::Result<()> {
                 DaemonAction::Install { data_dir } => {
                     let dir =
                         resolve_effective_data_dir(data_dir.as_deref(), config_arg.as_deref())?;
-                    run_daemon_install(
-                        &dir,
-                        config_arg.as_deref(),
-                    )
+                    run_daemon_install(&dir, config_arg.as_deref())
                 }
                 DaemonAction::Uninstall => run_daemon_uninstall(),
             }
         }
         Commands::Schedule { command } => schedule::handle_schedule_command(command).await,
+        Commands::Portal { command } => portal::handle_portal_command(command).await,
         Commands::Gmail(args) => gmail::handle_gmail_command(args).await,
         Commands::Imagegen(args) => imagegen::handle_imagegen_command(args).await,
     }
@@ -190,7 +194,7 @@ async fn run_daemon(config_arg: Option<String>) -> anyhow::Result<()> {
     use threshold_cli_wrapper::ClaudeClient;
     use threshold_conversation::ConversationEngine;
     use threshold_core::config::ThresholdConfig;
-    use threshold_core::{init_logging, DaemonState, HealthConfig, SecretStore, ThresholdError};
+    use threshold_core::{DaemonState, HealthConfig, SecretStore, ThresholdError, init_logging};
     use tokio::sync::RwLock;
     use tokio_util::sync::CancellationToken;
 
@@ -261,11 +265,12 @@ async fn run_daemon(config_arg: Option<String>) -> anyhow::Result<()> {
     // 5. Create Claude CLI client
     //    SessionManager and ConversationLockMap are created here and shared
     //    with both ClaudeClient and the always-on cleanup listener.
-    let session_manager = Arc::new(
-        threshold_cli_wrapper::session::SessionManager::new(
-            config.data_dir()?.join("cli-sessions").join("cli-sessions.json"),
-        ),
-    );
+    let session_manager = Arc::new(threshold_cli_wrapper::session::SessionManager::new(
+        config
+            .data_dir()?
+            .join("cli-sessions")
+            .join("cli-sessions.json"),
+    ));
     let conversation_locks = Arc::new(threshold_cli_wrapper::ConversationLockMap::new());
     let process_tracker = Arc::new(threshold_cli_wrapper::ProcessTracker::new());
     let timeout_secs = config.cli.claude.timeout_seconds.unwrap_or(21600);
@@ -286,22 +291,19 @@ async fn run_daemon(config_arg: Option<String>) -> anyhow::Result<()> {
         )
         .await?,
     );
-    tracing::info!(
-        timeout_secs,
-        "Claude CLI client configured."
-    );
+    tracing::info!(timeout_secs, "Claude CLI client configured.");
 
     // 6. Build tool prompt and create conversation engine
     let tool_prompt = {
         let prompt = threshold_tools::build_tool_prompt(&config);
-        if prompt.is_empty() { None } else { Some(prompt) }
+        if prompt.is_empty() {
+            None
+        } else {
+            Some(prompt)
+        }
     };
     let ack_enabled = config.cli.claude.ack_enabled.unwrap_or(true);
-    let status_interval_secs = config
-        .cli
-        .claude
-        .status_interval_seconds
-        .unwrap_or(30);
+    let status_interval_secs = config.cli.claude.status_interval_seconds.unwrap_or(30);
     // HaikuClient is needed for acknowledgments and/or periodic status updates
     let needs_haiku = ack_enabled || status_interval_secs > 0;
     let haiku = if needs_haiku {
@@ -319,7 +321,10 @@ async fn run_daemon(config_arg: Option<String>) -> anyhow::Result<()> {
         tracing::info!("Haiku acknowledgment enabled.");
     }
     if status_interval_secs > 0 {
-        tracing::info!(interval_secs = status_interval_secs, "Live status updates enabled.");
+        tracing::info!(
+            interval_secs = status_interval_secs,
+            "Live status updates enabled."
+        );
     }
     let active_conversations = Arc::new(threshold_core::ActiveConversations::new());
     let engine = Arc::new(
@@ -447,6 +452,7 @@ async fn run_daemon(config_arg: Option<String>) -> anyhow::Result<()> {
         let cancel = cancel.clone();
         let data_dir = data_dir.clone();
         let scheduler_cmd_handle = scheduler_cmd_handle.clone();
+        let engine_for_api = engine.clone();
         let health_config = health_config.clone();
         let daemon_state = daemon_state.clone();
 
@@ -455,6 +461,7 @@ async fn run_daemon(config_arg: Option<String>) -> anyhow::Result<()> {
                 threshold_scheduler::daemon_api::DaemonApi::default_socket_path(&data_dir);
             let daemon_api = threshold_scheduler::daemon_api::DaemonApi::new(
                 scheduler_cmd_handle,
+                Some(engine_for_api),
                 health_config,
                 daemon_state,
                 socket_path,
@@ -535,8 +542,7 @@ async fn run_daemon(config_arg: Option<String>) -> anyhow::Result<()> {
         let conv_locks = conversation_locks.clone();
         let sched_handle = scheduler_cmd_handle_for_cleanup;
         tokio::spawn(async move {
-            let mut sweep_interval =
-                tokio::time::interval(std::time::Duration::from_secs(600));
+            let mut sweep_interval = tokio::time::interval(std::time::Duration::from_secs(600));
             loop {
                 tokio::select! {
                     event = event_rx.recv() => {
@@ -579,11 +585,7 @@ async fn run_daemon(config_arg: Option<String>) -> anyhow::Result<()> {
 
     // 10b. Web interface task
     let web_handle = {
-        let web_enabled = config
-            .web
-            .as_ref()
-            .map(|w| w.enabled)
-            .unwrap_or(false);
+        let web_enabled = config.web.as_ref().map(|w| w.enabled).unwrap_or(false);
         let config = config.clone();
         let engine = engine.clone();
         let cancel = cancel.clone();
@@ -735,7 +737,10 @@ fn check_existing_daemon(data_dir: &Path) -> anyhow::Result<()> {
             if is_threshold_process(pid) {
                 return Err(ThresholdError::DaemonAlreadyRunning { pid }.into());
             }
-            tracing::warn!(pid, "PID file exists for non-Threshold process, removing stale file");
+            tracing::warn!(
+                pid,
+                "PID file exists for non-Threshold process, removing stale file"
+            );
         } else {
             tracing::info!(pid, "Stale PID file found, removing");
         }
@@ -752,7 +757,7 @@ fn check_existing_daemon(data_dir: &Path) -> anyhow::Result<()> {
 
 /// Wait for a SIGTERM signal (Unix only).
 async fn sigterm_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
     sigterm.recv().await;
 }
@@ -773,7 +778,10 @@ async fn run_daemon_status(data_dir_override: Option<String>) -> anyhow::Result<
             return Ok(());
         }
         Some(pid) if !is_process_alive(pid) => {
-            println!("Threshold daemon: not running (stale PID file, PID {})", pid);
+            println!(
+                "Threshold daemon: not running (stale PID file, PID {})",
+                pid
+            );
             return Ok(());
         }
         _ => {}
@@ -784,15 +792,24 @@ async fn run_daemon_status(data_dir_override: Option<String>) -> anyhow::Result<
     match client.send_health_check().await {
         Ok(resp) => {
             if let Some(data) = &resp.data {
-                let draining = data.get("draining").and_then(|v| v.as_bool()).unwrap_or(false);
+                let draining = data
+                    .get("draining")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let status_str = if draining { "Draining" } else { "Running" };
                 let pid = data.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
-                let uptime = data.get("uptime_secs").and_then(|v| v.as_u64()).unwrap_or(0);
+                let uptime = data
+                    .get("uptime_secs")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 let version = data
                     .get("version")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
-                let active_work = data.get("active_work").and_then(|v| v.as_u64()).unwrap_or(0);
+                let active_work = data
+                    .get("active_work")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 let scheduler_task_count = data.get("scheduler_task_count");
                 let scheduler_enabled_count = data.get("scheduler_enabled_count");
 
@@ -920,7 +937,10 @@ async fn run_daemon_stop(
     if !is_process_alive(pid) {
         println!("Daemon stopped.");
     } else {
-        println!("Warning: daemon process {} may still be shutting down.", pid);
+        println!(
+            "Warning: daemon process {} may still be shutting down.",
+            pid
+        );
     }
 
     Ok(())
@@ -947,9 +967,7 @@ async fn run_daemon_restart(
 
     // Validate follow-on args: both must be provided or neither
     if follow_on_conversation.is_some() != follow_on_prompt.is_some() {
-        anyhow::bail!(
-            "--follow-on-conversation and --follow-on-prompt must be used together"
-        );
+        anyhow::bail!("--follow-on-conversation and --follow-on-prompt must be used together");
     }
 
     let data_dir = daemon_client::resolve_data_dir(data_dir_override.as_deref())?;
@@ -993,9 +1011,9 @@ async fn run_daemon_restart(
     // Validate follow-on conversation ID up front (before drain) to avoid
     // leaving the daemon stuck in draining mode on a parse failure.
     let follow_on_conv_id = if let Some(conv_id_str) = &follow_on_conversation {
-        let conv_id: uuid::Uuid = conv_id_str.parse().map_err(|e| {
-            anyhow::anyhow!("Invalid conversation ID '{}': {}", conv_id_str, e)
-        })?;
+        let conv_id: uuid::Uuid = conv_id_str
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid conversation ID '{}': {}", conv_id_str, e))?;
         Some(conv_id)
     } else {
         None
@@ -1019,10 +1037,7 @@ async fn run_daemon_restart(
     let hooks_path = data_dir.join("state").join("restart-hooks.json");
     // Save original hooks for rollback — if we fail, we restore these
     let original_hooks = read_existing_hooks(&hooks_path);
-    if let (Some(conv_id), Some(prompt)) =
-        (follow_on_conv_id, &follow_on_prompt)
-    {
-
+    if let (Some(conv_id), Some(prompt)) = (follow_on_conv_id, &follow_on_prompt) {
         // Prepend drain summary to the prompt
         let full_prompt = if let Some(summary) = &drain_summary {
             format!(
@@ -1050,13 +1065,8 @@ async fn run_daemon_restart(
 
         if let Err(e) = write_hooks_atomic(&hooks_path, &all_hooks) {
             eprintln!("Error writing restart hooks: {}. Rolling back.", e);
-            rollback_on_failure_with_hooks(
-                &client,
-                &hooks_path,
-                &data_dir,
-                Some(&original_hooks),
-            )
-            .await;
+            rollback_on_failure_with_hooks(&client, &hooks_path, &data_dir, Some(&original_hooks))
+                .await;
             anyhow::bail!("Restart aborted: failed to write hooks");
         }
     }
@@ -1071,13 +1081,8 @@ async fn run_daemon_restart(
         });
         if let Err(e) = write_json_atomic(&restart_pending_path, &pending) {
             eprintln!("Error writing restart-pending: {}. Rolling back.", e);
-            rollback_on_failure_with_hooks(
-                &client,
-                &hooks_path,
-                &data_dir,
-                Some(&original_hooks),
-            )
-            .await;
+            rollback_on_failure_with_hooks(&client, &hooks_path, &data_dir, Some(&original_hooks))
+                .await;
             anyhow::bail!("Restart aborted: failed to write restart-pending");
         }
     }
@@ -1085,13 +1090,8 @@ async fn run_daemon_restart(
     // Step 6: Send SIGTERM
     if let Err(e) = send_sigterm(pid) {
         eprintln!("Error sending SIGTERM: {}. Rolling back.", e);
-        rollback_on_failure_with_hooks(
-            &client,
-            &hooks_path,
-            &data_dir,
-            Some(&original_hooks),
-        )
-        .await;
+        rollback_on_failure_with_hooks(&client, &hooks_path, &data_dir, Some(&original_hooks))
+            .await;
         anyhow::bail!("Restart aborted: failed to send SIGTERM");
     }
     println!("SIGTERM sent to PID {}.", pid);
@@ -1188,8 +1188,7 @@ async fn drain_and_wait(
         initial_work, timeout_secs
     );
 
-    let deadline = tokio::time::Instant::now()
-        + tokio::time::Duration::from_secs(timeout_secs);
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
 
     let mut last_work = initial_work;
     loop {
@@ -1255,8 +1254,7 @@ fn send_sigterm(pid: u32) -> anyhow::Result<()> {
 
 /// Wait for a process to exit, polling every 500ms up to `max_secs`.
 async fn wait_for_process_exit(pid: u32, max_secs: u64) {
-    let deadline = tokio::time::Instant::now()
-        + tokio::time::Duration::from_secs(max_secs);
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(max_secs);
 
     while tokio::time::Instant::now() < deadline {
         if !is_process_alive(pid) {
@@ -1272,8 +1270,7 @@ async fn wait_for_healthy(
     client: &daemon_client::DaemonClient,
     max_secs: u64,
 ) -> anyhow::Result<()> {
-    let deadline = tokio::time::Instant::now()
-        + tokio::time::Duration::from_secs(max_secs);
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(max_secs);
 
     while tokio::time::Instant::now() < deadline {
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -1298,8 +1295,7 @@ async fn wait_for_healthy_new_pid(
     old_pid: u32,
     max_secs: u64,
 ) -> anyhow::Result<u32> {
-    let deadline = tokio::time::Instant::now()
-        + tokio::time::Duration::from_secs(max_secs);
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(max_secs);
 
     while tokio::time::Instant::now() < deadline {
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -1362,10 +1358,7 @@ fn read_existing_hooks(path: &Path) -> Vec<threshold_core::RestartHook> {
 }
 
 /// Write restart hooks to disk atomically (write-then-rename).
-fn write_hooks_atomic(
-    path: &Path,
-    hooks: &[threshold_core::RestartHook],
-) -> anyhow::Result<()> {
+fn write_hooks_atomic(path: &Path, hooks: &[threshold_core::RestartHook]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1477,13 +1470,11 @@ fn detect_supervised(data_dir: &Path) -> bool {
                         // ps outputs local time — interpret it in the system timezone,
                         // then convert to UTC for comparison with the marker (which is UTC).
                         let local_tz = chrono::Local::now().timezone();
-                        if let Some(proc_local) =
-                            proc_naive.and_local_timezone(local_tz).earliest()
+                        if let Some(proc_local) = proc_naive.and_local_timezone(local_tz).earliest()
                         {
                             let proc_utc = proc_local.with_timezone(&chrono::Utc);
                             // Allow 5s of clock skew between marker write and ps output
-                            let diff =
-                                (marker_time - proc_utc).num_seconds().unsigned_abs();
+                            let diff = (marker_time - proc_utc).num_seconds().unsigned_abs();
                             if diff > 5 {
                                 // PID was reused — the marker's start time doesn't match
                                 let _ = std::fs::remove_file(&marker_path);
@@ -1571,7 +1562,12 @@ async fn process_restart_hooks(
         );
 
         match engine
-            .send_to_conversation(&hook.conversation_id, &hook.prompt)
+            .send_to_conversation(
+                &hook.conversation_id,
+                &hook.prompt,
+                Some("restart-hook"),
+                None,
+            )
             .await
         {
             Ok(_) => {
@@ -1668,10 +1664,7 @@ fn run_daemon_install(data_dir: &Path, config_arg: Option<&str>) -> anyhow::Resu
     println!("  Plist: {}", plist_path.display());
     println!("  Log:   {}/logs/launchd-stdout.log", data_dir.display());
     println!();
-    println!(
-        "To start now: launchctl load {}",
-        plist_path.display()
-    );
+    println!("To start now: launchctl load {}", plist_path.display());
 
     Ok(())
 }

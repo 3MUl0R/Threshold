@@ -26,10 +26,7 @@ pub enum StreamEvent {
     },
 
     /// Tool execution completed.
-    ToolResult {
-        tool_name: String,
-        is_error: bool,
-    },
+    ToolResult { tool_name: String, is_error: bool },
 
     /// Final result with complete response.
     Result {
@@ -170,7 +167,8 @@ mod tests {
 
     #[test]
     fn parse_assistant_text_only() {
-        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello World"}]}}"#;
+        let line =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello World"}]}}"#;
         let events = parse_stream_line(line);
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -228,8 +226,7 @@ mod tests {
 
     #[test]
     fn parse_result_error() {
-        let line =
-            r#"{"type":"result","is_error":true,"error":"Rate limited","session_id":"abc"}"#;
+        let line = r#"{"type":"result","is_error":true,"error":"Rate limited","session_id":"abc"}"#;
         let events = parse_stream_line(line);
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -274,8 +271,7 @@ mod tests {
 
     #[test]
     fn parse_result_without_usage() {
-        let line =
-            r#"{"type":"result","subtype":"success","result":"Done","is_error":false}"#;
+        let line = r#"{"type":"result","subtype":"success","result":"Done","is_error":false}"#;
         let events = parse_stream_line(line);
         assert_eq!(events.len(), 1);
         match &events[0] {
@@ -289,8 +285,7 @@ mod tests {
 
     #[test]
     fn parse_assistant_empty_text_skipped() {
-        let line =
-            r#"{"type":"assistant","message":{"content":[{"type":"text","text":""}]}}"#;
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":""}]}}"#;
         let events = parse_stream_line(line);
         assert!(events.is_empty());
     }

@@ -128,10 +128,7 @@ impl ToolRegistry {
 
         // 5. Write audit log
         let success = result.is_ok();
-        let result_size = result
-            .as_ref()
-            .map(|r| r.content.len())
-            .unwrap_or(0);
+        let result_size = result.as_ref().map(|r| r.content.len()).unwrap_or(0);
 
         self.audit
             .append_raw(&AuditEntry {
@@ -271,7 +268,10 @@ mod tests {
         let ctx = ToolContext::new("test-agent");
         let result = registry.execute("unknown", json!({}), &ctx).await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ThresholdError::ToolError { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            ThresholdError::ToolError { .. }
+        ));
     }
 
     #[tokio::test]

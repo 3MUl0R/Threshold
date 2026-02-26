@@ -6,7 +6,7 @@ use crate::portals::resolve_or_create_portal;
 use crate::security::is_authorized;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use threshold_conversation::ConversationEvent;
+use threshold_conversation::{ConversationEvent, DeliveryFilter};
 use threshold_core::{ConversationId, PortalId, RunId, ThresholdError};
 use tokio::sync::RwLock;
 
@@ -63,12 +63,8 @@ async fn handle_message(
     }
 
     // 3. Find or create portal for this channel
-    let portal_id = resolve_or_create_portal(
-        &data.engine,
-        guild_id.unwrap_or(0),
-        msg.channel_id.get(),
-    )
-    .await;
+    let portal_id =
+        resolve_or_create_portal(&data.engine, guild_id.unwrap_or(0), msg.channel_id.get()).await;
 
     // 4. Ensure portal listener is running
     ensure_portal_listener(
@@ -144,6 +140,7 @@ async fn ensure_portal_listener(
         receiver,
         http,
         outbound,
+        engine,
     ));
 
     listeners.insert(portal_id, handle);
@@ -153,6 +150,14 @@ async fn ensure_portal_listener(
         conversation_id = ?conversation_id,
         "Started portal listener"
     );
+}
+
+/// Check if this portal should receive an event based on the delivery filter.
+fn should_deliver(filter: &DeliveryFilter, portal_id: &PortalId, is_primary: bool) -> bool {
+    match filter {
+        DeliveryFilter::Portal(target) => target == portal_id,
+        DeliveryFilter::PrimaryOnly => is_primary,
+    }
 }
 
 /// Background listener for a portal
@@ -166,6 +171,7 @@ async fn portal_listener(
     mut receiver: tokio::sync::broadcast::Receiver<ConversationEvent>,
     http: Arc<serenity::all::Http>,
     outbound: Arc<crate::outbound::DiscordOutbound>,
+    engine: Arc<threshold_conversation::ConversationEngine>,
 ) {
     // Track completed runs so we can suppress stale ack events that arrive
     // after a run has already finished or been aborted. Uses a set rather than
@@ -236,8 +242,13 @@ async fn portal_listener(
                 run_id,
                 content,
                 artifacts,
+                delivery_target,
                 ..
             } if cid == conversation_id => {
+                let is_primary = engine.is_primary_portal(&portal_id).await;
+                if !should_deliver(&delivery_target, &portal_id, is_primary) {
+                    continue;
+                }
                 completed_runs.insert(run_id);
                 latest_completed = Some(run_id);
                 // Delete status message for this run (task complete)
@@ -280,8 +291,12 @@ async fn portal_listener(
                 conversation_id: cid,
                 run_id,
                 error,
-                ..
+                delivery_target,
             } if cid == conversation_id => {
+                let is_primary = engine.is_primary_portal(&portal_id).await;
+                if !should_deliver(&delivery_target, &portal_id, is_primary) {
+                    continue;
+                }
                 if let Some(rid) = run_id {
                     completed_runs.insert(rid);
                     latest_completed = Some(rid);
@@ -303,8 +318,12 @@ async fn portal_listener(
             ConversationEvent::Aborted {
                 conversation_id: cid,
                 run_id,
-                ..
+                delivery_target,
             } if cid == conversation_id => {
+                let is_primary = engine.is_primary_portal(&portal_id).await;
+                if !should_deliver(&delivery_target, &portal_id, is_primary) {
+                    continue;
+                }
                 completed_runs.insert(run_id);
                 latest_completed = Some(run_id);
                 // Delete status message for this run (aborted)
@@ -325,12 +344,14 @@ async fn portal_listener(
                 conversation_id: cid,
                 run_id,
                 content,
+                delivery_target,
             } if cid == conversation_id => {
+                let is_primary = engine.is_primary_portal(&portal_id).await;
+                if !should_deliver(&delivery_target, &portal_id, is_primary) {
+                    continue;
+                }
                 if completed_runs.contains(&run_id) {
-                    tracing::info!(
-                        ?run_id,
-                        "Suppressed stale ack (run already completed)"
-                    );
+                    tracing::info!(?run_id, "Suppressed stale ack (run already completed)");
                 } else {
                     // Truncate to Discord's 2000-char limit (UTF-8 safe via chunk_message)
                     let chunks = chunk_message(&content, 2000);
@@ -352,7 +373,12 @@ async fn portal_listener(
                 run_id,
                 summary,
                 elapsed_secs,
+                delivery_target,
             } if cid == conversation_id => {
+                let is_primary = engine.is_primary_portal(&portal_id).await;
+                if !should_deliver(&delivery_target, &portal_id, is_primary) {
+                    continue;
+                }
                 if completed_runs.contains(&run_id) {
                     // Run already completed — suppress stale status update
                     continue;

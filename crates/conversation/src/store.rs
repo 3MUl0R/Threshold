@@ -108,6 +108,7 @@ impl ConversationStore {
             agent_id,
             created_at: now,
             last_active: now,
+            primary_portal: None,
         };
 
         let id = conversation.id;
@@ -177,10 +178,7 @@ impl ConversationStore {
     /// Safe to call multiple times — only creates if missing.
     /// Used for backfilling pre-Milestone-12 conversations that lack directories.
     pub(crate) fn ensure_conversation_dir(&self, id: &ConversationId, mode: &ConversationMode) {
-        let conv_dir = self
-            .data_dir
-            .join("conversations")
-            .join(id.0.to_string());
+        let conv_dir = self.data_dir.join("conversations").join(id.0.to_string());
 
         if let Err(e) = std::fs::create_dir_all(&conv_dir) {
             tracing::warn!(
@@ -424,7 +422,10 @@ mod tests {
         );
 
         let conv_dir = dir.path().join("conversations").join(id.0.to_string());
-        assert!(conv_dir.exists(), "conversation directory should be created");
+        assert!(
+            conv_dir.exists(),
+            "conversation directory should be created"
+        );
         assert!(conv_dir.is_dir());
     }
 
@@ -645,5 +646,64 @@ mod tests {
         let permissions = metadata.permissions();
 
         assert_eq!(permissions.mode() & 0o777, 0o600);
+    }
+
+    #[tokio::test]
+    async fn primary_portal_persists() {
+        let dir = tempdir().unwrap();
+        let path = dir.path();
+
+        let (id, portal_id) = {
+            let mut store = ConversationStore::load(path).await.unwrap();
+            let id = store.create(
+                ConversationMode::General,
+                CliProvider::Claude {
+                    model: "sonnet".to_string(),
+                },
+                "default".to_string(),
+            );
+            let portal_id = threshold_core::PortalId::new();
+            store.get_mut(&id).unwrap().primary_portal = Some(portal_id);
+            store.save().await.unwrap();
+            (id, portal_id)
+        };
+
+        // Reload and verify primary_portal survived
+        let store = ConversationStore::load(path).await.unwrap();
+        let conv = store.get(&id).unwrap();
+        assert_eq!(
+            conv.primary_portal,
+            Some(portal_id),
+            "primary_portal should survive save/load round-trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn backward_compat_no_primary() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("conversations.json");
+
+        // Write old-format JSON without primary_portal field
+        let old_json = r#"{
+            "conversations": {
+                "00000000-0000-0000-0000-000000000001": {
+                    "id": "00000000-0000-0000-0000-000000000001",
+                    "mode": "General",
+                    "cli_provider": {"Claude": {"model": "sonnet"}},
+                    "agent_id": "default",
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "last_active": "2025-01-01T00:00:00Z"
+                }
+            }
+        }"#;
+        tokio::fs::write(&path, old_json).await.unwrap();
+
+        let store = ConversationStore::load(dir.path()).await.unwrap();
+        let convs = store.list();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(
+            convs[0].primary_portal, None,
+            "old JSON without primary_portal should deserialize as None"
+        );
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! These commands communicate with the running daemon via Unix socket.
 
-use threshold_core::{ConversationId, ScheduledAction};
+use threshold_core::{ConversationId, PortalId, ScheduledAction};
 use threshold_scheduler::task::{DeliveryTarget, ScheduledTask};
 
 use crate::daemon_client::{DaemonClient, DaemonCommand};
@@ -112,6 +112,9 @@ pub enum ScheduleCommands {
         /// IANA timezone (e.g., "America/Los_Angeles"). Cron is evaluated in this timezone.
         #[arg(long)]
         timezone: Option<String>,
+        /// Portal ID to target for output delivery (default: primary portal)
+        #[arg(long)]
+        portal_id: Option<String>,
         /// Output format
         #[arg(short = 'f', long, value_enum, default_value_t = OutputFormat::default())]
         format: OutputFormat,
@@ -227,12 +230,21 @@ pub async fn handle_schedule_command(command: ScheduleCommands) -> anyhow::Resul
             conversation_id,
             prompt,
             timezone,
+            portal_id,
             ..
         } => {
             let conv_id = ConversationId(
                 uuid::Uuid::parse_str(conversation_id)
                     .map_err(|e| anyhow::anyhow!("Invalid conversation ID: {}", e))?,
             );
+            let parsed_portal_id = portal_id
+                .as_ref()
+                .map(|s| {
+                    uuid::Uuid::parse_str(s)
+                        .map(PortalId)
+                        .map_err(|e| anyhow::anyhow!("Invalid portal ID: {}", e))
+                })
+                .transpose()?;
             let mut task = build_task(
                 name.clone(),
                 cron.clone(),
@@ -245,6 +257,7 @@ pub async fn handle_schedule_command(command: ScheduleCommands) -> anyhow::Resul
             // Mark as conversation-attached so deliver_result() skips
             // duplicate delivery — output goes through the portal system.
             task.conversation_id = Some(conv_id);
+            task.portal_id = parsed_portal_id;
             DaemonCommand::ScheduleCreate(task)
         }
         ScheduleCommands::List { .. } => DaemonCommand::ScheduleList,

@@ -46,7 +46,9 @@ pub async fn handle_imagegen_command(
     secret_store: Arc<SecretStore>,
 ) -> anyhow::Result<()> {
     if !config.enabled {
-        anyhow::bail!("Image generation is disabled. Set tools.image_gen.enabled = true in your config.");
+        anyhow::bail!(
+            "Image generation is disabled. Set tools.image_gen.enabled = true in your config."
+        );
     }
 
     match args.command {
@@ -103,12 +105,16 @@ pub async fn handle_imagegen_command(
             println!("{}", serde_json::to_string_pretty(&output)?);
 
             // Audit log
-            audit_log(audit_path, &serde_json::json!({
-                "action": "generate",
-                "prompt": prompt,
-                "file_path": file_path_str,
-                "size_bytes": size_bytes,
-            })).await;
+            audit_log(
+                audit_path,
+                &serde_json::json!({
+                    "action": "generate",
+                    "prompt": prompt,
+                    "file_path": file_path_str,
+                    "size_bytes": size_bytes,
+                }),
+            )
+            .await;
         }
     }
 
@@ -285,7 +291,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("imagegen.jsonl");
 
-        audit_log(Some(&path), &serde_json::json!({"action": "generate", "prompt": "a cat"})).await;
+        audit_log(
+            Some(&path),
+            &serde_json::json!({"action": "generate", "prompt": "a cat"}),
+        )
+        .await;
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("generate"));

@@ -1,10 +1,10 @@
 //! Config editor and credentials management routes.
 
+use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::header;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
-use axum::Router;
 use serde::Deserialize;
 
 use crate::csrf;
@@ -45,7 +45,8 @@ async fn editor(State(state): State<AppState>) -> Result<impl IntoResponse, WebE
 
     let cookie = format!(
         "{}={}; Path=/; HttpOnly; SameSite=Strict",
-        csrf::COOKIE_NAME, csrf_token
+        csrf::COOKIE_NAME,
+        csrf_token
     );
     Ok(([(header::SET_COOKIE, cookie)], Html(rendered)))
 }
@@ -66,15 +67,13 @@ async fn save_config(
     validate_csrf(&headers, &form._csrf)?;
 
     // Parse the TOML to validate it
-    let new_config: threshold_core::config::ThresholdConfig =
-        toml::from_str(&form.config_toml).map_err(|e| {
-            WebError::BadRequest(format!("Invalid TOML: {e}"))
-        })?;
+    let new_config: threshold_core::config::ThresholdConfig = toml::from_str(&form.config_toml)
+        .map_err(|e| WebError::BadRequest(format!("Invalid TOML: {e}")))?;
 
     // Validate the config
-    new_config.validate().map_err(|e| {
-        WebError::BadRequest(format!("Config validation failed: {e}"))
-    })?;
+    new_config
+        .validate()
+        .map_err(|e| WebError::BadRequest(format!("Config validation failed: {e}")))?;
 
     // Atomic write: write to tmp file, then rename
     let config_path = &state.config_path;
@@ -92,9 +91,8 @@ async fn save_config(
             WebError::Internal(format!("Failed to save config: {e}"))
         })?;
 
-    let flash = FlashMessage::success(
-        "Config saved. Restart the daemon for changes to take effect.",
-    );
+    let flash =
+        FlashMessage::success("Config saved. Restart the daemon for changes to take effect.");
     let flash_cookie = format!(
         "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=10",
         crate::flash::COOKIE_NAME,
@@ -185,7 +183,8 @@ async fn credentials(State(state): State<AppState>) -> Result<impl IntoResponse,
 
     let cookie = format!(
         "{}={}; Path=/; HttpOnly; SameSite=Strict",
-        csrf::COOKIE_NAME, csrf_token
+        csrf::COOKIE_NAME,
+        csrf_token
     );
     Ok(([(header::SET_COOKIE, cookie)], Html(rendered)))
 }
@@ -212,7 +211,9 @@ async fn set_credential(
     }
 
     if form.value.is_empty() {
-        return Err(WebError::BadRequest("Credential value cannot be empty".into()));
+        return Err(WebError::BadRequest(
+            "Credential value cannot be empty".into(),
+        ));
     }
 
     tokio::time::timeout(
@@ -299,7 +300,9 @@ fn is_valid_credential_key(key: &str) -> bool {
         && !key.contains('/')
         && !key.contains('\\')
         && !key.contains("..")
-        && key.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '.' | '@'))
+        && key
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '.' | '@'))
 }
 
 fn validate_csrf(headers: &axum::http::HeaderMap, form_token: &str) -> Result<(), WebError> {

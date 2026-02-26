@@ -12,9 +12,7 @@ pub async fn handle_gmail_command(args: threshold_gmail::GmailArgs) -> anyhow::R
     let config = ThresholdConfig::load()?;
 
     let gmail_config = config.tools.gmail.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "Gmail is not configured. Add [tools.gmail] section to your config file."
-        )
+        anyhow::anyhow!("Gmail is not configured. Add [tools.gmail] section to your config file.")
     })?;
 
     let audit_path = match config.data_dir() {

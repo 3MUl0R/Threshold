@@ -1,15 +1,15 @@
 //! Audit trail integration - per-conversation JSONL logs.
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use threshold_cli_wrapper::response::Usage;
-use threshold_core::{ConversationId, ConversationMode, PortalId, Result};
+use threshold_core::{ConversationId, ConversationMode, MessageSource, PortalId, Result};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 
 /// Audit events written to per-conversation JSONL files
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ConversationAuditEvent {
     UserMessage {
@@ -23,6 +23,8 @@ pub enum ConversationAuditEvent {
         usage: Option<Usage>,
         duration_ms: u64,
         timestamp: DateTime<Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<MessageSource>,
     },
     ModeSwitch {
         portal_id: PortalId,
@@ -40,17 +42,23 @@ pub enum ConversationAuditEvent {
     Error {
         error: String,
         timestamp: DateTime<Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<MessageSource>,
     },
     Acknowledgment {
         run_id: String,
         content: String,
         timestamp: DateTime<Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<MessageSource>,
     },
     StatusUpdate {
         run_id: String,
         summary: String,
         elapsed_secs: u64,
         timestamp: DateTime<Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<MessageSource>,
     },
 }
 
@@ -154,6 +162,7 @@ mod tests {
         let event = ConversationAuditEvent::Error {
             error: "test error".to_string(),
             timestamp: Utc::now(),
+            source: None,
         };
 
         write_audit_event(&audit_dir, &conversation_id, &event)
@@ -195,5 +204,68 @@ mod tests {
         let permissions = metadata.permissions();
 
         assert_eq!(permissions.mode() & 0o777, 0o600);
+    }
+
+    // --- Phase 15B tests ---
+
+    #[tokio::test]
+    async fn source_field_round_trip() {
+        let dir = tempdir().unwrap();
+        let audit_dir = dir.path().to_path_buf();
+        let conversation_id = ConversationId::new();
+
+        let source = MessageSource::Portal {
+            portal_id: PortalId::new(),
+            platform: "Discord".to_string(),
+        };
+        let event = ConversationAuditEvent::AssistantMessage {
+            content: "Hello!".to_string(),
+            usage: None,
+            duration_ms: 1234,
+            timestamp: Utc::now(),
+            source: Some(source),
+        };
+
+        write_audit_event(&audit_dir, &conversation_id, &event)
+            .await
+            .unwrap();
+
+        let file_path = audit_dir.join(format!("{}.jsonl", conversation_id.0));
+        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        let restored: ConversationAuditEvent =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        match restored {
+            ConversationAuditEvent::AssistantMessage { source, .. } => {
+                let source = source.unwrap();
+                assert!(
+                    matches!(source, MessageSource::Portal { platform, .. } if platform == "Discord")
+                );
+            }
+            _ => panic!("expected AssistantMessage"),
+        }
+    }
+
+    #[tokio::test]
+    async fn backward_compat_no_source() {
+        // Old-format JSONL without source field should still deserialize
+        let old_json = r#"{"type":"AssistantMessage","content":"Hi","usage":null,"duration_ms":100,"timestamp":"2025-01-01T00:00:00Z"}"#;
+        let event: ConversationAuditEvent = serde_json::from_str(old_json).unwrap();
+        match event {
+            ConversationAuditEvent::AssistantMessage {
+                source, content, ..
+            } => {
+                assert!(source.is_none(), "old events without source should be None");
+                assert_eq!(content, "Hi");
+            }
+            _ => panic!("expected AssistantMessage"),
+        }
+
+        // Also verify Error backward compat
+        let old_error = r#"{"type":"Error","error":"test","timestamp":"2025-01-01T00:00:00Z"}"#;
+        let event: ConversationAuditEvent = serde_json::from_str(old_error).unwrap();
+        assert!(matches!(
+            event,
+            ConversationAuditEvent::Error { source: None, .. }
+        ));
     }
 }

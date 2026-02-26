@@ -182,12 +182,8 @@ impl ClaudeClient {
                 "starting new CLI session"
             );
 
-            let args = self.build_new_session_args(
-                session_id,
-                message,
-                system_prompt,
-                &resolved_model,
-            );
+            let args =
+                self.build_new_session_args(session_id, message, system_prompt, &resolved_model);
             let res = self.process.run(&args, None, None).await;
 
             // If "already in use", fall back to resume
@@ -198,8 +194,7 @@ impl ClaudeClient {
                         session_id = %session_id,
                         "session ID collision, retrying with --resume"
                     );
-                    let retry_args =
-                        self.build_resume_args(&session_id.to_string(), message);
+                    let retry_args = self.build_resume_args(&session_id.to_string(), message);
                     self.process.run(&retry_args, None, None).await
                 } else {
                     res

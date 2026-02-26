@@ -36,6 +36,8 @@ pub async fn schedule(
     #[description = "Model override (optional)"] model: Option<String>,
     #[description = "Conversation ID (for Resume action)"] conversation_id: Option<String>,
     #[description = "IANA timezone (e.g. 'America/Los_Angeles')"] timezone: Option<String>,
+    #[description = "Target portal for output delivery (uses this channel's portal if 'here')"]
+    portal: Option<String>,
 ) -> Result {
     let scheduler = match &ctx.data().scheduler {
         Some(s) => s,
@@ -62,11 +64,11 @@ pub async fn schedule(
                     return Ok(());
                 }
             };
-            let conv_id = ConversationId(
-                uuid::Uuid::parse_str(conv_id_str).map_err(|e| ThresholdError::InvalidInput {
+            let conv_id = ConversationId(uuid::Uuid::parse_str(conv_id_str).map_err(|e| {
+                ThresholdError::InvalidInput {
                     message: format!("Invalid conversation ID: {}", e),
-                })?,
-            );
+                }
+            })?);
             ScheduledAction::ResumeConversation {
                 conversation_id: conv_id,
                 prompt: value,
@@ -86,15 +88,20 @@ pub async fn schedule(
 
     // Extract conversation_id from the action before moving it into the task
     let resume_conv_id = match &action {
-        ScheduledAction::ResumeConversation { conversation_id: cid, .. } => Some(*cid),
+        ScheduledAction::ResumeConversation {
+            conversation_id: cid,
+            ..
+        } => Some(*cid),
         _ => None,
     };
 
     let mut task = match &timezone {
-        Some(tz) => ScheduledTask::new_with_timezone(name.clone(), cron.clone(), action, tz.clone())
-            .map_err(|e| ThresholdError::InvalidInput {
-                message: e.to_string(),
-            })?,
+        Some(tz) => {
+            ScheduledTask::new_with_timezone(name.clone(), cron.clone(), action, tz.clone())
+                .map_err(|e| ThresholdError::InvalidInput {
+                    message: e.to_string(),
+                })?
+        }
         None => ScheduledTask::new(name.clone(), cron.clone(), action).map_err(|e| {
             ThresholdError::InvalidInput {
                 message: e.to_string(),
@@ -106,6 +113,20 @@ pub async fn schedule(
     // to prevent duplicate delivery in deliver_result().
     if let Some(conv_id) = resume_conv_id {
         task.conversation_id = Some(conv_id);
+        // Resolve optional portal targeting
+        if let Some(portal_str) = &portal {
+            let portal_id = if portal_str == "here" {
+                let guild_id = ctx.guild_id().map(|g| g.get()).unwrap_or(0);
+                resolve_or_create_portal(&ctx.data().engine, guild_id, channel_id).await
+            } else {
+                threshold_core::PortalId(uuid::Uuid::parse_str(portal_str).map_err(|e| {
+                    ThresholdError::InvalidInput {
+                        message: format!("Invalid portal ID: {}", e),
+                    }
+                })?)
+            };
+            task.portal_id = Some(portal_id);
+        }
     } else {
         task.delivery = DeliveryTarget::DiscordChannel { channel_id };
     }
@@ -257,7 +278,11 @@ pub async fn heartbeat(
     let guild_id = ctx.guild_id().map(|g| g.get()).unwrap_or(0);
     let channel_id = ctx.channel_id().get();
     let portal_id = resolve_or_create_portal(&ctx.data().engine, guild_id, channel_id).await;
-    let conversation_id = ctx.data().engine.get_portal_conversation(&portal_id).await?;
+    let conversation_id = ctx
+        .data()
+        .engine
+        .get_portal_conversation(&portal_id)
+        .await?;
 
     let tasks = scheduler.list_tasks().await?;
     let heartbeat_task = find_heartbeat_for_conversation(&tasks, &conversation_id);
@@ -324,11 +349,14 @@ pub async fn heartbeat(
                 prompt: String::new(), // replaced at fire time by dynamic prompt
             };
 
-            let mut task =
-                ScheduledTask::new(format!("heartbeat-{}", &conversation_id.0), cron_expr.clone(), action)
-                    .map_err(|e| ThresholdError::InvalidInput {
-                        message: e.to_string(),
-                    })?;
+            let mut task = ScheduledTask::new(
+                format!("heartbeat-{}", &conversation_id.0),
+                cron_expr.clone(),
+                action,
+            )
+            .map_err(|e| ThresholdError::InvalidInput {
+                message: e.to_string(),
+            })?;
             task.kind = TaskKind::Heartbeat;
             task.skip_if_running = true;
             task.conversation_id = Some(conversation_id);
@@ -369,8 +397,7 @@ pub async fn heartbeat(
                     conversation_id.0,
                     hb.enabled,
                     hb.cron_expression,
-                    hb.last_run
-                        .map_or("never".to_string(), |t| t.to_rfc3339()),
+                    hb.last_run.map_or("never".to_string(), |t| t.to_rfc3339()),
                     hb.next_run
                         .map_or("unknown".to_string(), |t| t.to_rfc3339()),
                 ))

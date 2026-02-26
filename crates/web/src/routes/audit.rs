@@ -1,9 +1,9 @@
 //! Audit log browser routes: tabbed view of all audit JSONL files.
 
+use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
-use axum::Router;
 use serde::Deserialize;
 
 use crate::error::WebError;
@@ -113,13 +113,12 @@ async fn tab_partial(
 
     // Security: validate source against discovered files (path traversal prevention)
     if !validate_source(&source, &stems) {
-        return Err(WebError::NotFound(format!("Audit source not found: {source}")));
+        return Err(WebError::NotFound(format!(
+            "Audit source not found: {source}"
+        )));
     }
 
-    let audit_path = state
-        .data_dir
-        .join("audit")
-        .join(format!("{source}.jsonl"));
+    let audit_path = state.data_dir.join("audit").join(format!("{source}.jsonl"));
 
     let (entries, total) =
         crate::helpers::jsonl::read_jsonl_page(&audit_path, query.offset, query.limit).await?;

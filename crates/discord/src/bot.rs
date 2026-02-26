@@ -49,6 +49,7 @@ pub async fn build_and_start(
                 commands::conversations(),
                 commands::join(),
                 commands::abort(),
+                commands::primary(),
                 scheduler_commands::schedule(),
                 scheduler_commands::schedules(),
                 scheduler_commands::heartbeat(),

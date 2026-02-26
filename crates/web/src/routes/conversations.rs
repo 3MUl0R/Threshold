@@ -1,10 +1,10 @@
 //! Conversation routes: list, detail, audit trail, delete.
 
+use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::header;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
-use axum::Router;
 use serde::Deserialize;
 
 use crate::csrf;
@@ -177,7 +177,8 @@ async fn detail(
     // Set CSRF cookie
     let cookie = format!(
         "{}={}; Path=/; HttpOnly; SameSite=Strict",
-        csrf::COOKIE_NAME, csrf_token
+        csrf::COOKIE_NAME,
+        csrf_token
     );
     Ok(([(header::SET_COOKIE, cookie)], Html(rendered)))
 }
@@ -205,9 +206,13 @@ async fn audit_partial(
         .map_err(|_| WebError::NotFound(format!("Invalid conversation ID: {id}")))?;
 
     // Read audit entries from JSONL file
-    let audit_path = state.data_dir.join("audit").join(format!("{conv_id}.jsonl"));
+    let audit_path = state
+        .data_dir
+        .join("audit")
+        .join(format!("{conv_id}.jsonl"));
 
-    let (entries, total) = crate::helpers::jsonl::read_jsonl_page(&audit_path, query.offset, query.limit).await?;
+    let (entries, total) =
+        crate::helpers::jsonl::read_jsonl_page(&audit_path, query.offset, query.limit).await?;
 
     let has_more = query.offset + entries.len() < total;
     let next_offset = query.offset + entries.len();

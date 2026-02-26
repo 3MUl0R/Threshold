@@ -5,8 +5,8 @@
 
 use std::sync::Arc;
 
-use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
+use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use threshold_core::SecretStore;
@@ -104,12 +104,7 @@ impl GmailClient {
     }
 
     /// Send a new email.
-    pub async fn send(
-        &self,
-        to: &str,
-        subject: &str,
-        body: &str,
-    ) -> Result<(), GmailApiError> {
+    pub async fn send(&self, to: &str, subject: &str, body: &str) -> Result<(), GmailApiError> {
         let token = self.get_token().await?;
         let from = self.auth.inbox();
 
@@ -123,11 +118,7 @@ impl GmailClient {
     }
 
     /// Reply to an existing message.
-    pub async fn reply(
-        &self,
-        message_id: &str,
-        body: &str,
-    ) -> Result<(), GmailApiError> {
+    pub async fn reply(&self, message_id: &str, body: &str) -> Result<(), GmailApiError> {
         let id = validate_message_id(message_id)?;
         let token = self.get_token().await?;
 
@@ -155,8 +146,13 @@ impl GmailClient {
         };
 
         let from = self.auth.inbox();
-        let raw_message =
-            build_rfc2822_message(from, &reply_to, &reply_subject, body, original_message_id.as_deref());
+        let raw_message = build_rfc2822_message(
+            from,
+            &reply_to,
+            &reply_subject,
+            body,
+            original_message_id.as_deref(),
+        );
 
         let encoded = URL_SAFE_NO_PAD.encode(raw_message.as_bytes());
 
@@ -448,7 +444,10 @@ fn extract_headers(raw: &RawMessage) -> std::collections::HashMap<String, String
 
 /// Parse a date, trying the Date header first, then internalDate (epoch millis),
 /// and falling back to Utc::now() as last resort.
-fn parse_date(raw: &RawMessage, headers: &std::collections::HashMap<String, String>) -> DateTime<Utc> {
+fn parse_date(
+    raw: &RawMessage,
+    headers: &std::collections::HashMap<String, String>,
+) -> DateTime<Utc> {
     // Try Date header (RFC 2822)
     if let Some(date_str) = headers.get("date")
         && let Ok(dt) = DateTime::parse_from_rfc2822(date_str)
@@ -640,8 +639,9 @@ mod tests {
 
     #[test]
     fn parse_address_list_multiple() {
-        let addrs =
-            parse_address_list(Some("alice@example.com, bob@example.com, charlie@example.com"));
+        let addrs = parse_address_list(Some(
+            "alice@example.com, bob@example.com, charlie@example.com",
+        ));
         assert_eq!(addrs.len(), 3);
         assert_eq!(addrs[0], "alice@example.com");
         assert_eq!(addrs[1], "bob@example.com");
@@ -663,7 +663,10 @@ mod tests {
         assert!(!encoded.contains(' '));
     }
 
-    fn make_raw_message_with_date(date_header: Option<&str>, internal_date: Option<&str>) -> RawMessage {
+    fn make_raw_message_with_date(
+        date_header: Option<&str>,
+        internal_date: Option<&str>,
+    ) -> RawMessage {
         let headers = date_header.map(|d| {
             vec![Header {
                 name: "Date".into(),
@@ -687,10 +690,7 @@ mod tests {
 
     #[test]
     fn parse_date_valid_rfc2822() {
-        let raw = make_raw_message_with_date(
-            Some("Tue, 17 Feb 2026 12:00:00 +0000"),
-            None,
-        );
+        let raw = make_raw_message_with_date(Some("Tue, 17 Feb 2026 12:00:00 +0000"), None);
         let headers = extract_headers(&raw);
         let dt = parse_date(&raw, &headers);
         assert_eq!(dt.year(), 2026);
@@ -710,10 +710,7 @@ mod tests {
 
     #[test]
     fn parse_date_no_header_uses_internal_date() {
-        let raw = make_raw_message_with_date(
-            None,
-            Some("1708185600000"),
-        );
+        let raw = make_raw_message_with_date(None, Some("1708185600000"));
         let headers = extract_headers(&raw);
         let dt = parse_date(&raw, &headers);
         assert_eq!(dt.year(), 2024);
@@ -814,10 +811,22 @@ mod tests {
             snippet: Some("Hello...".into()),
             payload: Some(MessagePayload {
                 headers: Some(vec![
-                    Header { name: "From".into(), value: "alice@example.com".into() },
-                    Header { name: "To".into(), value: "bob@example.com".into() },
-                    Header { name: "Subject".into(), value: "Test".into() },
-                    Header { name: "Date".into(), value: "Mon, 15 Jun 2025 12:00:00 +0000".into() },
+                    Header {
+                        name: "From".into(),
+                        value: "alice@example.com".into(),
+                    },
+                    Header {
+                        name: "To".into(),
+                        value: "bob@example.com".into(),
+                    },
+                    Header {
+                        name: "Subject".into(),
+                        value: "Test".into(),
+                    },
+                    Header {
+                        name: "Date".into(),
+                        value: "Mon, 15 Jun 2025 12:00:00 +0000".into(),
+                    },
                 ]),
                 mime_type: Some("text/plain".into()),
                 body: Some(MessageBody {
@@ -849,9 +858,18 @@ mod tests {
             snippet: None,
             payload: Some(MessagePayload {
                 headers: Some(vec![
-                    Header { name: "From".into(), value: "sender@example.com".into() },
-                    Header { name: "To".into(), value: "recipient@example.com".into() },
-                    Header { name: "Subject".into(), value: "Multipart".into() },
+                    Header {
+                        name: "From".into(),
+                        value: "sender@example.com".into(),
+                    },
+                    Header {
+                        name: "To".into(),
+                        value: "recipient@example.com".into(),
+                    },
+                    Header {
+                        name: "Subject".into(),
+                        value: "Multipart".into(),
+                    },
                 ]),
                 mime_type: Some("multipart/alternative".into()),
                 body: None,
@@ -897,8 +915,14 @@ mod tests {
             snippet: None,
             payload: Some(MessagePayload {
                 headers: Some(vec![
-                    Header { name: "From".into(), value: "sender@example.com".into() },
-                    Header { name: "Subject".into(), value: "With attachment".into() },
+                    Header {
+                        name: "From".into(),
+                        value: "sender@example.com".into(),
+                    },
+                    Header {
+                        name: "Subject".into(),
+                        value: "With attachment".into(),
+                    },
                 ]),
                 mime_type: Some("multipart/mixed".into()),
                 body: None,

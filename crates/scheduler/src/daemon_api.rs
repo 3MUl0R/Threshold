@@ -20,6 +20,7 @@ use threshold_core::{DaemonState, HealthConfig};
 
 use crate::engine::SchedulerHandle;
 use crate::task::ScheduledTask;
+use threshold_conversation::ConversationEngine;
 
 /// Protocol version for daemon communication.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -49,6 +50,8 @@ pub enum DaemonCommand {
     /// Exit drain mode: resume accepting new work. Used for rollback if
     /// restart/stop fails after Drain but before SIGTERM.
     Undrain,
+    /// List all active portals with their conversation assignments.
+    PortalList,
 }
 
 /// Response envelope sent from daemon to CLI.
@@ -112,6 +115,7 @@ impl DaemonResponse {
 /// but health/drain commands still work.
 pub struct DaemonApi {
     scheduler: Option<SchedulerHandle>,
+    engine: Option<Arc<ConversationEngine>>,
     health_config: HealthConfig,
     daemon_state: Arc<DaemonState>,
     socket_path: PathBuf,
@@ -121,12 +125,14 @@ impl DaemonApi {
     /// Create a new daemon API server.
     pub fn new(
         scheduler: Option<SchedulerHandle>,
+        engine: Option<Arc<ConversationEngine>>,
         health_config: HealthConfig,
         daemon_state: Arc<DaemonState>,
         socket_path: PathBuf,
     ) -> Self {
         Self {
             scheduler,
+            engine,
             health_config,
             daemon_state,
             socket_path,
@@ -150,11 +156,12 @@ impl DaemonApi {
                     match result {
                         Ok((stream, _)) => {
                             let scheduler = self.scheduler.clone();
+                            let engine = self.engine.clone();
                             let health_config = self.health_config.clone();
                             let daemon_state = self.daemon_state.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = Self::handle_connection(
-                                    stream, scheduler, health_config, daemon_state,
+                                    stream, scheduler, engine, health_config, daemon_state,
                                 ).await {
                                     tracing::debug!("Connection handler error: {}", e);
                                 }
@@ -199,10 +206,7 @@ impl DaemonApi {
             }
             Err(_) => {
                 // Stale socket — remove it
-                tracing::info!(
-                    "Removing stale socket: {}",
-                    self.socket_path.display()
-                );
+                tracing::info!("Removing stale socket: {}", self.socket_path.display());
                 tokio::fs::remove_file(&self.socket_path).await?;
             }
         }
@@ -217,6 +221,7 @@ impl DaemonApi {
     async fn handle_connection(
         stream: UnixStream,
         scheduler: Option<SchedulerHandle>,
+        engine: Option<Arc<ConversationEngine>>,
         health_config: HealthConfig,
         daemon_state: Arc<DaemonState>,
     ) -> Result<(), anyhow::Error> {
@@ -240,6 +245,7 @@ impl DaemonApi {
                     Self::dispatch_command(
                         request.command,
                         &scheduler,
+                        &engine,
                         &health_config,
                         &daemon_state,
                     )
@@ -261,6 +267,7 @@ impl DaemonApi {
     async fn dispatch_command(
         command: DaemonCommand,
         scheduler: &Option<SchedulerHandle>,
+        engine: &Option<Arc<ConversationEngine>>,
         health_config: &HealthConfig,
         daemon_state: &Arc<DaemonState>,
     ) -> DaemonResponse {
@@ -319,7 +326,6 @@ impl DaemonApi {
             }
 
             // --- Scheduler commands: require scheduler to be enabled ---
-
             DaemonCommand::ScheduleCreate(task) => {
                 let Some(sched) = scheduler else {
                     return DaemonResponse::error(
@@ -361,7 +367,7 @@ impl DaemonApi {
                         return DaemonResponse::error(
                             "invalid_input",
                             &format!("Invalid task ID: {}", id),
-                        )
+                        );
                     }
                 };
                 match sched.remove_task(uuid).await {
@@ -382,7 +388,7 @@ impl DaemonApi {
                         return DaemonResponse::error(
                             "invalid_input",
                             &format!("Invalid task ID: {}", id),
-                        )
+                        );
                     }
                 };
                 match sched.toggle_task(uuid, enabled).await {
@@ -392,6 +398,31 @@ impl DaemonApi {
                     }
                     Err(e) => DaemonResponse::error("not_found", &e.to_string()),
                 }
+            }
+
+            // --- Portal commands: require engine ---
+            DaemonCommand::PortalList => {
+                let Some(eng) = engine else {
+                    return DaemonResponse::error(
+                        "engine_unavailable",
+                        "Conversation engine is not available",
+                    );
+                };
+                let portals = eng.list_portals().await;
+                let json: Vec<serde_json::Value> = portals
+                    .iter()
+                    .map(|p| {
+                        serde_json::json!({
+                            "portal_id": p.portal_id.0.to_string(),
+                            "portal_type": format!("{:?}", p.portal_type),
+                            "conversation_id": p.conversation_id.0.to_string(),
+                            "conversation_mode": p.conversation_mode.as_ref().map(|m| format!("{:?}", m)),
+                            "is_primary": p.is_primary,
+                            "connected_at": p.connected_at.to_rfc3339(),
+                        })
+                    })
+                    .collect();
+                DaemonResponse::ok(serde_json::json!(json))
             }
         }
     }
@@ -494,7 +525,10 @@ mod tests {
     #[test]
     fn default_socket_path() {
         let path = DaemonApi::default_socket_path(Path::new("/home/user/.threshold"));
-        assert_eq!(path.to_str().unwrap(), "/home/user/.threshold/threshold.sock");
+        assert_eq!(
+            path.to_str().unwrap(),
+            "/home/user/.threshold/threshold.sock"
+        );
     }
 
     #[tokio::test]
@@ -510,6 +544,7 @@ mod tests {
         let resp = DaemonApi::dispatch_command(
             DaemonCommand::Health,
             &None,
+            &None,
             &health_config,
             &daemon_state,
         )
@@ -524,6 +559,7 @@ mod tests {
         // ScheduleList should fail without scheduler
         let resp = DaemonApi::dispatch_command(
             DaemonCommand::ScheduleList,
+            &None,
             &None,
             &health_config,
             &daemon_state,
@@ -545,6 +581,7 @@ mod tests {
 
         let resp = DaemonApi::dispatch_command(
             DaemonCommand::Drain,
+            &None,
             &None,
             &health_config,
             &daemon_state,
@@ -569,6 +606,7 @@ mod tests {
         DaemonApi::dispatch_command(
             DaemonCommand::Drain,
             &None,
+            &None,
             &health_config,
             &daemon_state,
         )
@@ -577,6 +615,7 @@ mod tests {
         // Health should show draining: true
         let resp = DaemonApi::dispatch_command(
             DaemonCommand::Health,
+            &None,
             &None,
             &health_config,
             &daemon_state,
@@ -599,6 +638,7 @@ mod tests {
         DaemonApi::dispatch_command(
             DaemonCommand::Drain,
             &None,
+            &None,
             &health_config,
             &daemon_state,
         )
@@ -608,6 +648,7 @@ mod tests {
         // Undrain
         let resp = DaemonApi::dispatch_command(
             DaemonCommand::Undrain,
+            &None,
             &None,
             &health_config,
             &daemon_state,
@@ -619,6 +660,7 @@ mod tests {
         // Health should confirm not draining
         let resp = DaemonApi::dispatch_command(
             DaemonCommand::Health,
+            &None,
             &None,
             &health_config,
             &daemon_state,

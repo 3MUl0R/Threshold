@@ -272,9 +272,7 @@ impl ThresholdConfig {
 
 /// Check if a bind address string refers to a loopback interface.
 pub fn is_loopback_address(addr: &str) -> bool {
-    addr == "::1"
-        || addr.starts_with("127.")
-        || addr == "localhost"
+    addr == "::1" || addr.starts_with("127.") || addr == "localhost"
 }
 
 #[cfg(test)]
@@ -718,6 +716,11 @@ bind = "0.0.0.0"
         let _ = std::fs::remove_dir_all(&dir);
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("invalid secret_backend"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid secret_backend")
+        );
     }
 }

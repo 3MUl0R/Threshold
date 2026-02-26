@@ -9,7 +9,7 @@ mod store;
 
 // Re-export main types
 pub use audit::ConversationAuditEvent;
-pub use engine::{Artifact, ConversationEngine, ConversationEvent};
+pub use engine::{Artifact, ConversationEngine, ConversationEvent, DeliveryFilter, PortalInfo};
 pub use portals::PortalRegistry;
 pub use store::ConversationStore;
 

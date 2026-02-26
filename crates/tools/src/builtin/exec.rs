@@ -98,14 +98,20 @@ impl Tool for ExecTool {
             })?;
 
         // Capture stdout and stderr
-        let stdout = child.stdout.take().ok_or_else(|| ThresholdError::ToolError {
-            tool: "exec".to_string(),
-            message: "Failed to capture stdout".to_string(),
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| ThresholdError::ToolError {
-            tool: "exec".to_string(),
-            message: "Failed to capture stderr".to_string(),
-        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ThresholdError::ToolError {
+                tool: "exec".to_string(),
+                message: "Failed to capture stdout".to_string(),
+            })?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| ThresholdError::ToolError {
+                tool: "exec".to_string(),
+                message: "Failed to capture stderr".to_string(),
+            })?;
 
         let mut stdout_reader = BufReader::new(stdout).lines();
         let mut stderr_reader = BufReader::new(stderr).lines();

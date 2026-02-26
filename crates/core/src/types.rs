@@ -72,6 +72,9 @@ pub struct Conversation {
     pub agent_id: String,
     pub created_at: DateTime<Utc>,
     pub last_active: DateTime<Utc>,
+    /// The portal that receives scheduled/unprompted output by default.
+    #[serde(default)]
+    pub primary_portal: Option<PortalId>,
     // NOTE: cli_session_id is NOT stored here. The SessionManager in the
     // cli-wrapper crate is the single source of truth for CLI session IDs,
     // keyed by ConversationId. This avoids two sources of truth drifting.
@@ -111,12 +114,38 @@ pub enum PortalType {
     // Phone { number: String },
 }
 
+impl PortalType {
+    /// Human-readable platform name for display and tagging.
+    pub fn platform_name(&self) -> &'static str {
+        match self {
+            PortalType::Discord { .. } => "Discord",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Portal {
     pub id: PortalId,
     pub portal_type: PortalType,
     pub conversation_id: ConversationId,
     pub connected_at: DateTime<Utc>,
+}
+
+/// Metadata about where a message originated.
+///
+/// Carried through the audit trail and used for timestamp injection
+/// (e.g., `[2026-02-25 12:00 PST via Discord]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MessageSource {
+    /// Message from a user via a portal.
+    Portal {
+        portal_id: PortalId,
+        platform: String,
+    },
+    /// Message from the scheduler (scheduled task, heartbeat).
+    Scheduler { task_name: String },
+    /// Message from an internal system action.
+    System,
 }
 
 // ──── Agents ────
@@ -195,7 +224,11 @@ pub enum ScheduledAction {
 #[async_trait::async_trait]
 pub trait ResultSender: Send + Sync {
     /// Send a message to a Discord channel (or other channel-like destination).
-    async fn send_to_channel(&self, channel_id: u64, message: &str) -> Result<(), crate::ThresholdError>;
+    async fn send_to_channel(
+        &self,
+        channel_id: u64,
+        message: &str,
+    ) -> Result<(), crate::ThresholdError>;
     /// Send a direct message to a user.
     async fn send_dm(&self, user_id: u64, message: &str) -> Result<(), crate::ThresholdError>;
 }
@@ -259,8 +292,7 @@ impl DaemonState {
     }
 
     pub fn active_work(&self) -> u32 {
-        self.active_work
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.active_work.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn increment_work(&self) -> u32 {
@@ -407,6 +439,7 @@ mod tests {
             agent_id: "default".into(),
             created_at: Utc::now(),
             last_active: Utc::now(),
+            primary_portal: None,
         };
         let json = serde_json::to_string(&conv).unwrap();
         let restored: Conversation = serde_json::from_str(&json).unwrap();
@@ -450,7 +483,11 @@ mod tests {
 
     #[test]
     fn tool_profile_serde_round_trip() {
-        for profile in [ToolProfile::Minimal, ToolProfile::Standard, ToolProfile::Full] {
+        for profile in [
+            ToolProfile::Minimal,
+            ToolProfile::Standard,
+            ToolProfile::Full,
+        ] {
             let json = serde_json::to_string(&profile).unwrap();
             let restored: ToolProfile = serde_json::from_str(&json).unwrap();
             assert_eq!(profile, restored);
@@ -671,5 +708,43 @@ mod tests {
         let restored: DrainSummary = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.finished, 5);
         assert_eq!(restored.aborted, 2);
+    }
+
+    // --- Phase 15B tests ---
+
+    #[test]
+    fn portal_type_platform_name() {
+        let discord = PortalType::Discord {
+            guild_id: 123,
+            channel_id: 456,
+        };
+        assert_eq!(discord.platform_name(), "Discord");
+    }
+
+    #[test]
+    fn message_source_serde_round_trip() {
+        let portal_source = MessageSource::Portal {
+            portal_id: PortalId::new(),
+            platform: "Discord".to_string(),
+        };
+        let json = serde_json::to_string(&portal_source).unwrap();
+        let restored: MessageSource = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(restored, MessageSource::Portal { platform, .. } if platform == "Discord")
+        );
+
+        let scheduler_source = MessageSource::Scheduler {
+            task_name: "daily-summary".to_string(),
+        };
+        let json = serde_json::to_string(&scheduler_source).unwrap();
+        let restored: MessageSource = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(restored, MessageSource::Scheduler { task_name } if task_name == "daily-summary")
+        );
+
+        let system_source = MessageSource::System;
+        let json = serde_json::to_string(&system_source).unwrap();
+        let restored: MessageSource = serde_json::from_str(&json).unwrap();
+        assert!(matches!(restored, MessageSource::System));
     }
 }

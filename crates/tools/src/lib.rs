@@ -4,9 +4,9 @@
 //! web access) with profile-based permission control and audit logging.
 
 pub mod builtin;
-pub mod prompt;
 mod context;
 mod profiles;
+pub mod prompt;
 mod registry;
 
 pub use context::ToolContext;

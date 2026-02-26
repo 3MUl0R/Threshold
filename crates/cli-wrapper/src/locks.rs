@@ -70,7 +70,11 @@ impl ConversationLockMap {
         map.retain(|_id, mutex| Arc::strong_count(mutex) > 1);
         let removed = before - map.len();
         if removed > 0 {
-            tracing::debug!(removed, remaining = map.len(), "swept idle conversation locks");
+            tracing::debug!(
+                removed,
+                remaining = map.len(),
+                "swept idle conversation locks"
+            );
         }
     }
 
@@ -178,7 +182,10 @@ mod tests {
         let conv = Uuid::new_v4();
 
         let result = locks.try_lock(conv).await;
-        assert!(result.is_some(), "try_lock should succeed when lock is free");
+        assert!(
+            result.is_some(),
+            "try_lock should succeed when lock is free"
+        );
     }
 
     #[tokio::test]

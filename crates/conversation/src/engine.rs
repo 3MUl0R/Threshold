@@ -15,9 +15,33 @@ use threshold_cli_wrapper::response::Usage;
 use threshold_core::config::{AgentConfigToml, ThresholdConfig};
 use threshold_core::{
     ActiveConversations, AgentConfig, CliProvider, Conversation, ConversationId, ConversationMode,
-    DaemonState, PortalId, PortalType, Result, RunId, ThresholdError, ToolProfile, WorkGuard,
+    DaemonState, MessageSource, PortalId, PortalType, Result, RunId, ThresholdError, ToolProfile,
+    WorkGuard,
 };
 use tokio::sync::{RwLock, broadcast};
+
+/// Controls which portal(s) should deliver a response event.
+///
+/// Non-optional on all response event variants — forces every code path to
+/// explicitly choose a target. No silent broadcast-all fallback.
+#[derive(Debug, Clone)]
+pub enum DeliveryFilter {
+    /// Only deliver to this specific portal (user-initiated or explicit target).
+    Portal(PortalId),
+    /// Only deliver to the primary portal of the conversation.
+    PrimaryOnly,
+}
+
+/// Summary of a portal's state, used by `list_portals()`.
+#[derive(Debug, Clone)]
+pub struct PortalInfo {
+    pub portal_id: PortalId,
+    pub portal_type: PortalType,
+    pub conversation_id: ConversationId,
+    pub conversation_mode: Option<ConversationMode>,
+    pub is_primary: bool,
+    pub connected_at: DateTime<Utc>,
+}
 
 /// Events emitted by the engine
 #[derive(Debug, Clone)]
@@ -29,11 +53,13 @@ pub enum ConversationEvent {
         artifacts: Vec<Artifact>,
         usage: Option<Usage>,
         timestamp: DateTime<Utc>,
+        delivery_target: DeliveryFilter,
     },
     Error {
         conversation_id: ConversationId,
         run_id: Option<RunId>,
         error: String,
+        delivery_target: DeliveryFilter,
     },
     ConversationCreated {
         conversation: Conversation,
@@ -54,6 +80,7 @@ pub enum ConversationEvent {
         conversation_id: ConversationId,
         run_id: RunId,
         content: String,
+        delivery_target: DeliveryFilter,
     },
     /// Periodic status update during processing (Phase 14D).
     StatusUpdate {
@@ -61,11 +88,13 @@ pub enum ConversationEvent {
         run_id: RunId,
         summary: String,
         elapsed_secs: u64,
+        delivery_target: DeliveryFilter,
     },
     /// Task was aborted by user.
     Aborted {
         conversation_id: ConversationId,
         run_id: RunId,
+        delivery_target: DeliveryFilter,
     },
 }
 
@@ -149,7 +178,7 @@ impl ConversationEngine {
             })
             .collect::<Result<_>>()?;
 
-        Ok(Self {
+        let engine = Self {
             conversations,
             portals,
             claude,
@@ -164,7 +193,12 @@ impl ConversationEngine {
             ack_enabled,
             status_interval_secs,
             daemon_state,
-        })
+        };
+
+        // Backfill primary portals for existing conversations that lack one
+        engine.backfill_primary_portals().await;
+
+        Ok(engine)
     }
 
     /// Transform AgentConfigToml to AgentConfig
@@ -218,10 +252,7 @@ impl ConversationEngine {
     /// Reads the conversation's `memory.md` file and formats it as a system
     /// prompt supplement. Returns `None` if the file doesn't exist or is empty.
     /// Truncates at 4KB with a notice if the file is larger.
-    fn build_memory_prompt(
-        conversation_id: &ConversationId,
-        data_dir: &Path,
-    ) -> Option<String> {
+    fn build_memory_prompt(conversation_id: &ConversationId, data_dir: &Path) -> Option<String> {
         let memory_path = data_dir
             .join("conversations")
             .join(conversation_id.0.to_string())
@@ -287,6 +318,15 @@ impl ConversationEngine {
         self.event_tx.subscribe()
     }
 
+    /// Build a source label for timestamp injection (e.g., " via Discord").
+    fn source_label(source: &MessageSource) -> String {
+        match source {
+            MessageSource::Portal { platform, .. } => format!(" via {}", platform),
+            MessageSource::Scheduler { task_name } => format!(" via Scheduler:{}", task_name),
+            MessageSource::System => " via System".to_string(),
+        }
+    }
+
     /// Handle an incoming user message.
     ///
     /// Uses streaming mode to read Claude CLI output line-by-line. This avoids
@@ -308,12 +348,17 @@ impl ConversationEngine {
 
         let run_id = RunId::new();
 
-        // 1. Look up portal → get conversation_id
-        let conversation_id = {
+        // 1. Look up portal → get conversation_id and platform name
+        let (conversation_id, message_source) = {
             let portals = self.portals.read().await;
-            *portals
-                .get_conversation(portal_id)
-                .ok_or(ThresholdError::PortalNotFound { id: portal_id.0 })?
+            let portal = portals
+                .get(portal_id)
+                .ok_or(ThresholdError::PortalNotFound { id: portal_id.0 })?;
+            let source = MessageSource::Portal {
+                portal_id: *portal_id,
+                platform: portal.portal_type.platform_name().to_string(),
+            };
+            (portal.conversation_id, source)
         };
 
         // 2. Look up conversation → get agent_id, cli_provider
@@ -334,10 +379,8 @@ impl ConversationEngine {
 
         let effective_prompt = self.effective_system_prompt(agent);
         let memory_prompt = Self::build_memory_prompt(&conversation_id, &self.data_dir);
-        let combined_prompt = Self::combine_prompts(
-            effective_prompt.as_deref(),
-            memory_prompt.as_deref(),
-        );
+        let combined_prompt =
+            Self::combine_prompts(effective_prompt.as_deref(), memory_prompt.as_deref());
         let (system_prompt, model) = match &cli_provider {
             CliProvider::Claude { model } => (combined_prompt.as_deref(), model.as_str()),
         };
@@ -363,7 +406,9 @@ impl ConversationEngine {
                 let event_tx = self.event_tx.clone();
                 let ack_conversation_id = conversation_id;
                 let ack_run_id = run_id;
+                let ack_portal_id = *portal_id;
                 let ack_audit_dir = self.audit_dir.clone();
+                let ack_source = message_source.clone();
                 let ack_prompt = format!(
                     "You are generating a brief acknowledgment for a Discord chat message. \
                      The user just sent a message to an AI assistant. Generate a short (1-2 sentence) \
@@ -392,6 +437,7 @@ impl ConversationEngine {
                                     run_id: ack_run_id.0.to_string(),
                                     content: ack_text.clone(),
                                     timestamp: Utc::now(),
+                                    source: Some(ack_source.clone()),
                                 },
                             )
                             .await
@@ -402,6 +448,7 @@ impl ConversationEngine {
                                 conversation_id: ack_conversation_id,
                                 run_id: ack_run_id,
                                 content: ack_text,
+                                delivery_target: DeliveryFilter::Portal(ack_portal_id),
                             });
                         }
                         Ok(Err(e)) => {
@@ -411,9 +458,7 @@ impl ConversationEngine {
                             );
                         }
                         Err(_) => {
-                            tracing::info!(
-                                "Haiku acknowledgment timed out after 30s (dropped)"
-                            );
+                            tracing::info!("Haiku acknowledgment timed out after 30s (dropped)");
                         }
                     }
                 });
@@ -439,6 +484,7 @@ impl ConversationEngine {
                         summary: "Queued \u{2014} waiting for previous message to complete\u{2026}"
                             .to_string(),
                         elapsed_secs: 0,
+                        delivery_target: DeliveryFilter::Portal(*portal_id),
                     });
                 }
                 self.claude.locks().lock(conversation_id.0).await
@@ -449,14 +495,15 @@ impl ConversationEngine {
         self.active_conversations.insert(conversation_id).await;
         let start = std::time::Instant::now();
 
-        // Prefix the message with a timestamp so the agent knows the current
-        // date/time. This prevents confusion when conversations resume after
-        // hours or days. Cost: ~10 tokens per message — negligible.
+        // Prefix the message with a timestamp and source tag so the agent knows
+        // the current date/time and which platform sent the message. Cost: ~10 tokens.
         let now = chrono::Local::now();
+        let source_label = Self::source_label(&message_source);
         let timestamped_content = format!(
-            "[{} {}]\n{}",
+            "[{} {}{}]\n{}",
             now.format("%Y-%m-%d %H:%M"),
             now.format("%Z"),
+            source_label,
             content,
         );
 
@@ -476,7 +523,13 @@ impl ConversationEngine {
             Err(e) => {
                 self.active_conversations.remove(&conversation_id).await;
                 self.claude.tracker().deregister(&run_id).await;
-                self.broadcast_error(&conversation_id, Some(run_id), &e).await;
+                self.broadcast_error(
+                    &conversation_id,
+                    Some(run_id),
+                    &e,
+                    DeliveryFilter::Portal(*portal_id),
+                )
+                .await;
                 return Err(e);
             }
         };
@@ -519,8 +572,13 @@ impl ConversationEngine {
                         code: -1,
                         stderr: message,
                     };
-                    self.broadcast_error(&conversation_id, Some(run_id), &err)
-                        .await;
+                    self.broadcast_error(
+                        &conversation_id,
+                        Some(run_id),
+                        &err,
+                        DeliveryFilter::Portal(*portal_id),
+                    )
+                    .await;
                     return Err(err);
                 }
                 StreamEvent::TextDelta { text } => {
@@ -542,7 +600,10 @@ impl ConversationEngine {
                         has_notable_events = true;
                     }
                 }
-                StreamEvent::ToolResult { tool_name, is_error } => {
+                StreamEvent::ToolResult {
+                    tool_name,
+                    is_error,
+                } => {
                     if status_interval > 0 {
                         if is_error {
                             event_log.push(format!("Tool {} returned error", tool_name));
@@ -559,13 +620,11 @@ impl ConversationEngine {
             // stale/out-of-order edits when Haiku is slow.
             if status_interval > 0
                 && has_notable_events
-                && last_status.elapsed()
-                    >= std::time::Duration::from_secs(status_interval)
+                && last_status.elapsed() >= std::time::Duration::from_secs(status_interval)
                 && !status_in_flight.load(std::sync::atomic::Ordering::Relaxed)
             {
                 if let Some(haiku) = &self.haiku {
-                    status_in_flight
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    status_in_flight.store(true, std::sync::atomic::Ordering::Relaxed);
                     let elapsed_secs = start.elapsed().as_secs();
                     let summary_prompt = format!(
                         "Summarize the AI assistant's live activity for a short status line.\n\
@@ -586,8 +645,10 @@ impl ConversationEngine {
                     let event_tx = self.event_tx.clone();
                     let status_cid = conversation_id;
                     let status_rid = run_id;
+                    let status_portal_id = *portal_id;
                     let in_flight = status_in_flight.clone();
                     let status_audit_dir = self.audit_dir.clone();
+                    let status_source = message_source.clone();
                     tokio::spawn(async move {
                         let result = tokio::time::timeout(
                             std::time::Duration::from_secs(30),
@@ -611,6 +672,7 @@ impl ConversationEngine {
                                     summary: summary.clone(),
                                     elapsed_secs,
                                     timestamp: Utc::now(),
+                                    source: Some(status_source),
                                 },
                             )
                             .await
@@ -622,6 +684,7 @@ impl ConversationEngine {
                                 run_id: status_rid,
                                 summary,
                                 elapsed_secs,
+                                delivery_target: DeliveryFilter::Portal(status_portal_id),
                             });
                         }
                         in_flight.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -649,6 +712,7 @@ impl ConversationEngine {
                 &ConversationAuditEvent::Error {
                     error: "Task aborted by user".to_string(),
                     timestamp: Utc::now(),
+                    source: Some(message_source.clone()),
                 },
             )
             .await?;
@@ -656,6 +720,7 @@ impl ConversationEngine {
             let _ = self.event_tx.send(ConversationEvent::Aborted {
                 conversation_id,
                 run_id,
+                delivery_target: DeliveryFilter::Portal(*portal_id),
             });
 
             return Err(ThresholdError::Aborted);
@@ -668,8 +733,13 @@ impl ConversationEngine {
                 code: -1,
                 stderr: "CLI process exited without producing a result".into(),
             };
-            self.broadcast_error(&conversation_id, Some(run_id), &err)
-                .await;
+            self.broadcast_error(
+                &conversation_id,
+                Some(run_id),
+                &err,
+                DeliveryFilter::Portal(*portal_id),
+            )
+            .await;
             return Err(err);
         }
 
@@ -691,6 +761,7 @@ impl ConversationEngine {
                 usage: final_usage.clone(),
                 duration_ms: duration.as_millis() as u64,
                 timestamp: Utc::now(),
+                source: Some(message_source.clone()),
             },
         )
         .await?;
@@ -715,6 +786,7 @@ impl ConversationEngine {
             artifacts: Vec::new(),
             usage: final_usage,
             timestamp: Utc::now(),
+            delivery_target: DeliveryFilter::Portal(*portal_id),
         });
 
         Ok(())
@@ -726,6 +798,7 @@ impl ConversationEngine {
         conversation_id: &ConversationId,
         run_id: Option<RunId>,
         error: &ThresholdError,
+        delivery_target: DeliveryFilter,
     ) {
         let _ = self
             .write_audit_event(
@@ -733,6 +806,7 @@ impl ConversationEngine {
                 &ConversationAuditEvent::Error {
                     error: error.to_string(),
                     timestamp: Utc::now(),
+                    source: None,
                 },
             )
             .await;
@@ -741,6 +815,7 @@ impl ConversationEngine {
             conversation_id: *conversation_id,
             run_id,
             error: error.to_string(),
+            delivery_target,
         });
     }
 
@@ -787,6 +862,9 @@ impl ConversationEngine {
             conversation_id,
         });
 
+        // Set as primary if conversation doesn't have one yet
+        self.maybe_set_primary(conversation_id, portal.id).await;
+
         Ok(portal.id)
     }
 
@@ -808,6 +886,10 @@ impl ConversationEngine {
                 portal_id: *portal_id,
                 conversation_id,
             });
+
+            // Reassign primary if the detached portal was primary
+            self.maybe_reassign_primary(conversation_id, *portal_id)
+                .await;
         }
 
         Ok(())
@@ -830,11 +912,12 @@ impl ConversationEngine {
         // 0. Look up conversation and reject General
         let general_id = {
             let conversations = self.conversations.read().await;
-            let conv = conversations
-                .get(conversation_id)
-                .ok_or(ThresholdError::ConversationNotFound {
-                    id: conversation_id.0,
-                })?;
+            let conv =
+                conversations
+                    .get(conversation_id)
+                    .ok_or(ThresholdError::ConversationNotFound {
+                        id: conversation_id.0,
+                    })?;
             if conv.mode == ConversationMode::General {
                 return Err(ThresholdError::InvalidInput {
                     message: "Cannot delete the General conversation".into(),
@@ -879,6 +962,8 @@ impl ConversationEngine {
                     conversation_id: general_id,
                 });
             }
+            // Set primary on General if it doesn't have one (use first moved portal)
+            self.maybe_set_primary(general_id, portals_to_move[0]).await;
         }
 
         // 2. Remove conversation from store
@@ -929,6 +1014,209 @@ impl ConversationEngine {
         }
 
         Ok(())
+    }
+
+    /// Save conversations to disk (acquires read lock, calls store.save()).
+    async fn save_conversations(&self) -> Result<()> {
+        let conversations = self.conversations.read().await;
+        conversations.save().await
+    }
+
+    /// If the conversation has no primary portal, set the given portal as primary.
+    ///
+    /// Called after portal attach (register, switch, join). Lock-safe: acquires
+    /// conversations write lock, drops it, then persists outside any lock.
+    async fn maybe_set_primary(&self, conversation_id: ConversationId, portal_id: PortalId) {
+        let changed = {
+            let mut conversations = self.conversations.write().await;
+            if let Some(conv) = conversations.get_mut(&conversation_id) {
+                if conv.primary_portal.is_none() {
+                    conv.primary_portal = Some(portal_id);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }; // conversations lock dropped
+
+        if changed {
+            if let Err(e) = self.save_conversations().await {
+                tracing::warn!("Failed to persist primary portal assignment: {}", e);
+            }
+        }
+    }
+
+    /// If the detached portal was primary, reassign to the oldest remaining portal.
+    ///
+    /// Lock-safe: reads portals first (dropped), then acquires conversations write lock
+    /// (dropped), then persists outside any lock.
+    async fn maybe_reassign_primary(
+        &self,
+        conversation_id: ConversationId,
+        detached_portal: PortalId,
+    ) {
+        // Read portals FIRST (before acquiring conversations lock)
+        let next_primary = {
+            let portals = self.portals.read().await;
+            portals
+                .get_portals_for_conversation(&conversation_id)
+                .iter()
+                .filter(|p| p.id != detached_portal)
+                .min_by_key(|p| p.connected_at)
+                .map(|p| p.id)
+        }; // portals lock dropped
+
+        let changed = {
+            let mut conversations = self.conversations.write().await;
+            if let Some(conv) = conversations.get_mut(&conversation_id) {
+                if conv.primary_portal == Some(detached_portal) {
+                    conv.primary_portal = next_primary;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }; // conversations lock dropped
+
+        if changed {
+            if let Err(e) = self.save_conversations().await {
+                tracing::warn!("Failed to persist primary portal reassignment: {}", e);
+            }
+        }
+    }
+
+    /// Explicitly set the primary portal for a conversation.
+    ///
+    /// Verifies the portal is attached to the conversation. Returns an error if
+    /// the portal doesn't exist or belongs to a different conversation.
+    pub async fn set_primary_portal(
+        &self,
+        conversation_id: ConversationId,
+        portal_id: PortalId,
+    ) -> Result<()> {
+        // Verify portal is attached to this conversation (portals lock only)
+        {
+            let portals = self.portals.read().await;
+            let portal = portals
+                .get(&portal_id)
+                .ok_or(ThresholdError::PortalNotFound { id: portal_id.0 })?;
+            if portal.conversation_id != conversation_id {
+                return Err(ThresholdError::InvalidInput {
+                    message: "Portal is not attached to this conversation".into(),
+                });
+            }
+        } // portals lock dropped
+
+        {
+            let mut conversations = self.conversations.write().await;
+            if let Some(conv) = conversations.get_mut(&conversation_id) {
+                conv.primary_portal = Some(portal_id);
+            }
+            conversations.save().await?;
+        }
+        Ok(())
+    }
+
+    /// Check if a portal is the primary portal for its conversation.
+    pub async fn is_primary_portal(&self, portal_id: &PortalId) -> bool {
+        let conversation_id = {
+            let portals = self.portals.read().await;
+            match portals.get_conversation(portal_id) {
+                Some(id) => *id,
+                None => return false,
+            }
+        };
+
+        let conversations = self.conversations.read().await;
+        conversations
+            .get(&conversation_id)
+            .map(|conv| conv.primary_portal == Some(*portal_id))
+            .unwrap_or(false)
+    }
+
+    /// List all portals with their conversation assignments and primary status.
+    pub async fn list_portals(&self) -> Vec<PortalInfo> {
+        let portals = self.portals.read().await;
+        let conversations = self.conversations.read().await;
+
+        portals
+            .iter()
+            .map(|(id, portal)| {
+                let is_primary = conversations
+                    .get(&portal.conversation_id)
+                    .map(|conv| conv.primary_portal == Some(*id))
+                    .unwrap_or(false);
+                let conversation_mode = conversations
+                    .get(&portal.conversation_id)
+                    .map(|conv| conv.mode.clone());
+                PortalInfo {
+                    portal_id: *id,
+                    portal_type: portal.portal_type.clone(),
+                    conversation_id: portal.conversation_id,
+                    conversation_mode,
+                    is_primary,
+                    connected_at: portal.connected_at,
+                }
+            })
+            .collect()
+    }
+
+    /// Backfill primary portals for existing conversations on startup.
+    ///
+    /// For each conversation with `primary_portal: None` that has attached portals,
+    /// assigns the oldest portal (by `connected_at`) as primary. Three-phase approach
+    /// to avoid holding locks across .await:
+    /// 1. Collect assignments under read locks (both dropped)
+    /// 2. Apply under conversations write lock (dropped)
+    /// 3. Persist outside any lock
+    async fn backfill_primary_portals(&self) {
+        // Phase 1: Collect backfill assignments while holding read locks briefly.
+        let assignments: Vec<(ConversationId, PortalId)> = {
+            let portals = self.portals.read().await;
+            let conversations = self.conversations.read().await;
+            conversations
+                .list()
+                .iter()
+                .filter(|conv| conv.primary_portal.is_none())
+                .filter_map(|conv| {
+                    portals
+                        .get_portals_for_conversation(&conv.id)
+                        .iter()
+                        .min_by_key(|p| p.connected_at)
+                        .map(|p| (conv.id, p.id))
+                })
+                .collect()
+        }; // both locks dropped here
+
+        if assignments.is_empty() {
+            return;
+        }
+
+        // Phase 2: Apply assignments under conversations write lock (no portals lock needed).
+        {
+            let mut conversations = self.conversations.write().await;
+            for (conv_id, portal_id) in &assignments {
+                if let Some(conv) = conversations.get_mut(conv_id) {
+                    if conv.primary_portal.is_none() {
+                        conv.primary_portal = Some(*portal_id);
+                    }
+                }
+            }
+        } // conversations lock dropped
+
+        // Phase 3: Persist outside any lock.
+        if let Err(e) = self.save_conversations().await {
+            tracing::warn!("Failed to persist backfilled primary portals: {}", e);
+        }
+
+        tracing::info!(
+            count = assignments.len(),
+            "backfilled primary portals for existing conversations"
+        );
     }
 
     /// Get access to portals (for portal listener management)
@@ -1028,7 +1316,13 @@ impl ConversationEngine {
             conversation_id: target_conversation_id,
         });
 
-        // 6. Write mode switch to audit trail
+        // 6. Primary portal maintenance: reassign old, set new
+        self.maybe_reassign_primary(old_conversation_id, *portal_id)
+            .await;
+        self.maybe_set_primary(target_conversation_id, *portal_id)
+            .await;
+
+        // 7. Write mode switch to audit trail
         self.write_audit_event(
             &target_conversation_id,
             &ConversationAuditEvent::ModeSwitch {
@@ -1053,11 +1347,12 @@ impl ConversationEngine {
         // Verify conversation exists and backfill directory if needed
         {
             let conversations = self.conversations.read().await;
-            let conv = conversations
-                .get(conversation_id)
-                .ok_or(ThresholdError::ConversationNotFound {
-                    id: conversation_id.0,
-                })?;
+            let conv =
+                conversations
+                    .get(conversation_id)
+                    .ok_or(ThresholdError::ConversationNotFound {
+                        id: conversation_id.0,
+                    })?;
             conversations.ensure_conversation_dir(conversation_id, &conv.mode);
         }
 
@@ -1092,6 +1387,11 @@ impl ConversationEngine {
             conversation_id: *conversation_id,
         });
 
+        // Primary portal maintenance: reassign old, set new
+        self.maybe_reassign_primary(old_conversation_id, *portal_id)
+            .await;
+        self.maybe_set_primary(*conversation_id, *portal_id).await;
+
         Ok(())
     }
 
@@ -1108,6 +1408,8 @@ impl ConversationEngine {
         &self,
         conversation_id: &ConversationId,
         content: &str,
+        task_name: Option<&str>,
+        portal_id: Option<PortalId>,
     ) -> Result<String> {
         use threshold_cli_wrapper::stream::StreamEvent;
 
@@ -1123,6 +1425,17 @@ impl ConversationEngine {
         let _work_guard = self.daemon_state.as_ref().map(WorkGuard::acquire);
 
         let run_id = RunId::new();
+        let delivery_target = match portal_id {
+            Some(pid) => DeliveryFilter::Portal(pid),
+            None => DeliveryFilter::PrimaryOnly,
+        };
+
+        let message_source = match task_name {
+            Some(name) => MessageSource::Scheduler {
+                task_name: name.to_string(),
+            },
+            None => MessageSource::System,
+        };
 
         // 1. Look up conversation
         let (agent_id, cli_provider) = {
@@ -1144,10 +1457,8 @@ impl ConversationEngine {
 
         let effective_prompt = self.effective_system_prompt(agent);
         let memory_prompt = Self::build_memory_prompt(conversation_id, &self.data_dir);
-        let combined_prompt = Self::combine_prompts(
-            effective_prompt.as_deref(),
-            memory_prompt.as_deref(),
-        );
+        let combined_prompt =
+            Self::combine_prompts(effective_prompt.as_deref(), memory_prompt.as_deref());
         let (system_prompt, model) = match &cli_provider {
             CliProvider::Claude { model } => (combined_prompt.as_deref(), model.as_str()),
         };
@@ -1178,10 +1489,12 @@ impl ConversationEngine {
         let start = std::time::Instant::now();
 
         let now = chrono::Local::now();
+        let source_label = Self::source_label(&message_source);
         let timestamped_content = format!(
-            "[{} {}]\n{}",
+            "[{} {}{}]\n{}",
             now.format("%Y-%m-%d %H:%M"),
             now.format("%Z"),
+            source_label,
             content,
         );
 
@@ -1201,7 +1514,8 @@ impl ConversationEngine {
             Err(e) => {
                 self.active_conversations.remove(conversation_id).await;
                 self.claude.tracker().deregister(&run_id).await;
-                self.broadcast_error(conversation_id, Some(run_id), &e).await;
+                self.broadcast_error(conversation_id, Some(run_id), &e, delivery_target.clone())
+                    .await;
                 return Err(e);
             }
         };
@@ -1239,8 +1553,13 @@ impl ConversationEngine {
                         code: -1,
                         stderr: message,
                     };
-                    self.broadcast_error(conversation_id, Some(run_id), &err)
-                        .await;
+                    self.broadcast_error(
+                        conversation_id,
+                        Some(run_id),
+                        &err,
+                        delivery_target.clone(),
+                    )
+                    .await;
                     return Err(err);
                 }
                 StreamEvent::TextDelta { text } => {
@@ -1258,7 +1577,10 @@ impl ConversationEngine {
                         has_notable_events = true;
                     }
                 }
-                StreamEvent::ToolResult { tool_name, is_error } => {
+                StreamEvent::ToolResult {
+                    tool_name,
+                    is_error,
+                } => {
                     if status_interval > 0 {
                         if is_error {
                             event_log.push(format!("Tool {} returned error", tool_name));
@@ -1273,13 +1595,11 @@ impl ConversationEngine {
             // Periodic status updates (same as handle_message)
             if status_interval > 0
                 && has_notable_events
-                && last_status.elapsed()
-                    >= std::time::Duration::from_secs(status_interval)
+                && last_status.elapsed() >= std::time::Duration::from_secs(status_interval)
                 && !status_in_flight.load(std::sync::atomic::Ordering::Relaxed)
             {
                 if let Some(haiku) = &self.haiku {
-                    status_in_flight
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    status_in_flight.store(true, std::sync::atomic::Ordering::Relaxed);
                     let elapsed_secs = start.elapsed().as_secs();
                     let summary_prompt = format!(
                         "Summarize the AI assistant's live activity for a short status line.\n\
@@ -1301,6 +1621,8 @@ impl ConversationEngine {
                     let status_rid = run_id;
                     let in_flight = status_in_flight.clone();
                     let status_audit_dir = self.audit_dir.clone();
+                    let status_source = message_source.clone();
+                    let status_delivery_target = delivery_target.clone();
                     tokio::spawn(async move {
                         let result = tokio::time::timeout(
                             std::time::Duration::from_secs(30),
@@ -1324,6 +1646,7 @@ impl ConversationEngine {
                                     summary: summary.clone(),
                                     elapsed_secs,
                                     timestamp: Utc::now(),
+                                    source: Some(status_source),
                                 },
                             )
                             .await
@@ -1335,6 +1658,7 @@ impl ConversationEngine {
                                 run_id: status_rid,
                                 summary,
                                 elapsed_secs,
+                                delivery_target: status_delivery_target,
                             });
                         }
                         in_flight.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1360,6 +1684,7 @@ impl ConversationEngine {
                 &ConversationAuditEvent::Error {
                     error: "Scheduled task aborted by user".to_string(),
                     timestamp: Utc::now(),
+                    source: Some(message_source.clone()),
                 },
             )
             .await?;
@@ -1367,6 +1692,7 @@ impl ConversationEngine {
             let _ = self.event_tx.send(ConversationEvent::Aborted {
                 conversation_id: *conversation_id,
                 run_id,
+                delivery_target: delivery_target.clone(),
             });
 
             return Err(ThresholdError::Aborted);
@@ -1379,7 +1705,7 @@ impl ConversationEngine {
                 code: -1,
                 stderr: "CLI process exited without producing a result".into(),
             };
-            self.broadcast_error(conversation_id, Some(run_id), &err)
+            self.broadcast_error(conversation_id, Some(run_id), &err, delivery_target.clone())
                 .await;
             return Err(err);
         }
@@ -1402,6 +1728,7 @@ impl ConversationEngine {
                 usage: final_usage.clone(),
                 duration_ms: duration.as_millis() as u64,
                 timestamp: Utc::now(),
+                source: Some(message_source),
             },
         )
         .await?;
@@ -1426,6 +1753,7 @@ impl ConversationEngine {
             artifacts: Vec::new(),
             usage: final_usage,
             timestamp: Utc::now(),
+            delivery_target,
         });
 
         Ok(final_text)
@@ -1662,7 +1990,9 @@ mod tests {
             .unwrap(),
         );
 
-        let engine = ConversationEngine::new(&config, claude, None, None, None, false, 0, None).await.unwrap();
+        let engine = ConversationEngine::new(&config, claude, None, None, None, false, 0, None)
+            .await
+            .unwrap();
 
         let agent = engine.resolve_agent_for_mode(&ConversationMode::Coding {
             project: "test".to_string(),
@@ -1694,7 +2024,9 @@ mod tests {
             .unwrap(),
         );
 
-        let engine = ConversationEngine::new(&config, claude, None, None, None, false, 0, None).await.unwrap();
+        let engine = ConversationEngine::new(&config, claude, None, None, None, false, 0, None)
+            .await
+            .unwrap();
 
         let agent = engine.resolve_agent_for_mode(&ConversationMode::General);
 
@@ -1715,10 +2047,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let conv_id = ConversationId::new();
 
-        let conv_dir = dir
-            .path()
-            .join("conversations")
-            .join(conv_id.0.to_string());
+        let conv_dir = dir.path().join("conversations").join(conv_id.0.to_string());
         std::fs::create_dir_all(&conv_dir).unwrap();
         std::fs::write(conv_dir.join("memory.md"), "").unwrap();
 
@@ -1731,10 +2060,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let conv_id = ConversationId::new();
 
-        let conv_dir = dir
-            .path()
-            .join("conversations")
-            .join(conv_id.0.to_string());
+        let conv_dir = dir.path().join("conversations").join(conv_id.0.to_string());
         std::fs::create_dir_all(&conv_dir).unwrap();
         std::fs::write(conv_dir.join("memory.md"), "# My Memory\nSome notes here").unwrap();
 
@@ -1752,10 +2078,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let conv_id = ConversationId::new();
 
-        let conv_dir = dir
-            .path()
-            .join("conversations")
-            .join(conv_id.0.to_string());
+        let conv_dir = dir.path().join("conversations").join(conv_id.0.to_string());
         std::fs::create_dir_all(&conv_dir).unwrap();
 
         // Write content larger than 4KB
@@ -1775,10 +2098,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let conv_id = ConversationId::new();
 
-        let conv_dir = dir
-            .path()
-            .join("conversations")
-            .join(conv_id.0.to_string());
+        let conv_dir = dir.path().join("conversations").join(conv_id.0.to_string());
         std::fs::create_dir_all(&conv_dir).unwrap();
 
         // Create content where byte 4096 falls in the middle of a multibyte char.
@@ -1825,7 +2145,10 @@ mod tests {
 
     async fn make_engine_with_dir(
         dir: &std::path::Path,
-    ) -> (Arc<ConversationEngine>, broadcast::Receiver<ConversationEvent>) {
+    ) -> (
+        Arc<ConversationEngine>,
+        broadcast::Receiver<ConversationEvent>,
+    ) {
         use threshold_core::config::{ClaudeCliConfig, CliConfig, ToolsConfig};
 
         let sessions = Arc::new(threshold_cli_wrapper::session::SessionManager::new(
@@ -1887,7 +2210,11 @@ mod tests {
             scheduler: None,
             web: None,
         };
-        let engine = Arc::new(ConversationEngine::new(&config, claude, None, None, None, false, 0, None).await.unwrap());
+        let engine = Arc::new(
+            ConversationEngine::new(&config, claude, None, None, None, false, 0, None)
+                .await
+                .unwrap(),
+        );
         let rx = engine.subscribe();
         (engine, rx)
     }
@@ -1916,7 +2243,8 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            err.to_string().contains("Cannot delete the General conversation"),
+            err.to_string()
+                .contains("Cannot delete the General conversation"),
             "expected InvalidInput error, got: {}",
             err
         );
@@ -1974,7 +2302,10 @@ mod tests {
         );
 
         // Verify directory is removed
-        assert!(!conv_dir.exists(), "conversation directory should be removed");
+        assert!(
+            !conv_dir.exists(),
+            "conversation directory should be removed"
+        );
 
         // Verify events: PortalAttached (re-attach to General) then ConversationDeleted
         let event1 = rx.try_recv().unwrap();
@@ -2135,5 +2466,408 @@ mod tests {
             super::sanitize_status_summary(raw),
             "Running test suite — verifying changes"
         );
+    }
+
+    // --- Primary Portal tests (Phase 15A) ---
+
+    #[tokio::test]
+    async fn first_portal_becomes_primary() {
+        let dir = tempdir().unwrap();
+        let (engine, _rx) = make_engine_with_dir(dir.path()).await;
+
+        // Register a portal (creates General + attaches)
+        let portal_id = engine
+            .register_portal(PortalType::Discord {
+                guild_id: 1,
+                channel_id: 100,
+            })
+            .await
+            .unwrap();
+
+        // The portal should be set as primary for the General conversation
+        let conversations = engine.list_conversations().await;
+        let general = conversations
+            .iter()
+            .find(|c| c.mode == ConversationMode::General)
+            .unwrap();
+
+        assert_eq!(
+            general.primary_portal,
+            Some(portal_id),
+            "first portal should become primary"
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_reassigned_on_detach() {
+        let dir = tempdir().unwrap();
+        let (engine, _rx) = make_engine_with_dir(dir.path()).await;
+
+        // Register two portals (both attach to General)
+        let portal_a = engine
+            .register_portal(PortalType::Discord {
+                guild_id: 1,
+                channel_id: 100,
+            })
+            .await
+            .unwrap();
+        let portal_b = engine
+            .register_portal(PortalType::Discord {
+                guild_id: 1,
+                channel_id: 200,
+            })
+            .await
+            .unwrap();
+
+        // portal_a should be primary (first registered)
+        let conversations = engine.list_conversations().await;
+        let general = conversations
+            .iter()
+            .find(|c| c.mode == ConversationMode::General)
+            .unwrap();
+        assert_eq!(general.primary_portal, Some(portal_a));
+
+        // Unregister portal_a
+        engine.unregister_portal(&portal_a).await.unwrap();
+
+        // portal_b should now be primary
+        let conversations = engine.list_conversations().await;
+        let general = conversations
+            .iter()
+            .find(|c| c.mode == ConversationMode::General)
+            .unwrap();
+        assert_eq!(
+            general.primary_portal,
+            Some(portal_b),
+            "oldest remaining portal should become primary after detach"
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_not_reassigned_if_not_primary() {
+        let dir = tempdir().unwrap();
+        let (engine, _rx) = make_engine_with_dir(dir.path()).await;
+
+        // Register two portals
+        let portal_a = engine
+            .register_portal(PortalType::Discord {
+                guild_id: 1,
+                channel_id: 100,
+            })
+            .await
+            .unwrap();
+        let portal_b = engine
+            .register_portal(PortalType::Discord {
+                guild_id: 1,
+                channel_id: 200,
+            })
+            .await
+            .unwrap();
+
+        // portal_a is primary
+        let conversations = engine.list_conversations().await;
+        let general = conversations
+            .iter()
+            .find(|c| c.mode == ConversationMode::General)
+            .unwrap();
+        assert_eq!(general.primary_portal, Some(portal_a));
+
+        // Unregister portal_b (NOT the primary)
+        engine.unregister_portal(&portal_b).await.unwrap();
+
+        // portal_a should still be primary
+        let conversations = engine.list_conversations().await;
+        let general = conversations
+            .iter()
+            .find(|c| c.mode == ConversationMode::General)
+            .unwrap();
+        assert_eq!(
+            general.primary_portal,
+            Some(portal_a),
+            "primary should not change when non-primary portal is detached"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_set_primary() {
+        let dir = tempdir().unwrap();
+        let (engine, _rx) = make_engine_with_dir(dir.path()).await;
+
+        // Register two portals
+        let portal_a = engine
+            .register_portal(PortalType::Discord {
+                guild_id: 1,
+                channel_id: 100,
+            })
+            .await
+            .unwrap();
+        let portal_b = engine
+            .register_portal(PortalType::Discord {
+                guild_id: 1,
+                channel_id: 200,
+            })
+            .await
+            .unwrap();
+
+        // portal_a is primary by default
+        let conversations = engine.list_conversations().await;
+        let general = conversations
+            .iter()
+            .find(|c| c.mode == ConversationMode::General)
+            .unwrap();
+        let general_id = general.id;
+        assert_eq!(general.primary_portal, Some(portal_a));
+
+        // Explicitly set portal_b as primary
+        engine
+            .set_primary_portal(general_id, portal_b)
+            .await
+            .unwrap();
+
+        let conversations = engine.list_conversations().await;
+        let general = conversations
+            .iter()
+            .find(|c| c.mode == ConversationMode::General)
+            .unwrap();
+        assert_eq!(
+            general.primary_portal,
+            Some(portal_b),
+            "explicit set_primary_portal should override"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_primary_rejects_unattached_portal() {
+        let dir = tempdir().unwrap();
+        let (engine, _rx) = make_engine_with_dir(dir.path()).await;
+
+        // Register a portal (creates General)
+        let _portal_a = engine
+            .register_portal(PortalType::Discord {
+                guild_id: 1,
+                channel_id: 100,
+            })
+            .await
+            .unwrap();
+
+        let conversations = engine.list_conversations().await;
+        let general_id = conversations
+            .iter()
+            .find(|c| c.mode == ConversationMode::General)
+            .unwrap()
+            .id;
+
+        // Create a second portal, switch it to a different conversation
+        let portal_b = engine
+            .register_portal(PortalType::Discord {
+                guild_id: 1,
+                channel_id: 200,
+            })
+            .await
+            .unwrap();
+        engine
+            .switch_mode(
+                &portal_b,
+                ConversationMode::Coding {
+                    project: "test".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Try to set portal_b as primary for General — should fail
+        let result = engine.set_primary_portal(general_id, portal_b).await;
+        assert!(
+            result.is_err(),
+            "should reject portal from different conversation"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not attached to this conversation"),
+            "expected 'not attached' error, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_sets_primary_for_existing_conversations() {
+        let dir = tempdir().unwrap();
+
+        // Step 1: Create engine, register portal, set primary, then clear it manually
+        let (conversation_id, portal_id) = {
+            let (engine, _rx) = make_engine_with_dir(dir.path()).await;
+
+            let portal_id = engine
+                .register_portal(PortalType::Discord {
+                    guild_id: 1,
+                    channel_id: 100,
+                })
+                .await
+                .unwrap();
+
+            let conversations = engine.list_conversations().await;
+            let general = conversations
+                .iter()
+                .find(|c| c.mode == ConversationMode::General)
+                .unwrap();
+            assert_eq!(general.primary_portal, Some(portal_id));
+
+            let conv_id = general.id;
+
+            // Clear primary_portal manually and save
+            {
+                let mut conversations = engine.conversations.write().await;
+                if let Some(conv) = conversations.get_mut(&conv_id) {
+                    conv.primary_portal = None;
+                }
+                conversations.save().await.unwrap();
+            }
+
+            // Save portal state too
+            engine.save_state().await.unwrap();
+
+            (conv_id, portal_id)
+        };
+
+        // Step 2: Create a new engine from same dir — backfill should run
+        let (engine2, _rx) = make_engine_with_dir(dir.path()).await;
+
+        let conversations = engine2.list_conversations().await;
+        let general = conversations
+            .iter()
+            .find(|c| c.id == conversation_id)
+            .unwrap();
+        assert_eq!(
+            general.primary_portal,
+            Some(portal_id),
+            "backfill should set primary to the oldest portal"
+        );
+    }
+
+    // --- Phase 15B tests ---
+
+    #[test]
+    fn source_label_portal() {
+        let source = MessageSource::Portal {
+            portal_id: PortalId::new(),
+            platform: "Discord".to_string(),
+        };
+        assert_eq!(ConversationEngine::source_label(&source), " via Discord");
+    }
+
+    #[test]
+    fn source_label_scheduler() {
+        let source = MessageSource::Scheduler {
+            task_name: "daily-summary".to_string(),
+        };
+        assert_eq!(
+            ConversationEngine::source_label(&source),
+            " via Scheduler:daily-summary"
+        );
+    }
+
+    #[test]
+    fn source_label_system() {
+        let source = MessageSource::System;
+        assert_eq!(ConversationEngine::source_label(&source), " via System");
+    }
+
+    // --- Phase 15C tests ---
+
+    #[test]
+    fn delivery_filter_portal_matches_target() {
+        let target_id = PortalId::new();
+        let other_id = PortalId::new();
+        let filter = DeliveryFilter::Portal(target_id);
+
+        // Should match the target portal
+        assert!(matches!(&filter, DeliveryFilter::Portal(id) if *id == target_id));
+        // Should not match a different portal
+        assert!(!matches!(&filter, DeliveryFilter::Portal(id) if *id == other_id));
+    }
+
+    #[test]
+    fn delivery_filter_primary_only_variant() {
+        let filter = DeliveryFilter::PrimaryOnly;
+        assert!(matches!(filter, DeliveryFilter::PrimaryOnly));
+    }
+
+    #[tokio::test]
+    async fn list_portals_returns_portal_info() {
+        let dir = tempdir().unwrap();
+        let (engine, _rx) = make_engine_with_dir(dir.path()).await;
+
+        // Register a portal
+        let portal_id = engine
+            .register_portal(PortalType::Discord {
+                guild_id: 100,
+                channel_id: 200,
+            })
+            .await
+            .unwrap();
+
+        let portals = engine.list_portals().await;
+        assert_eq!(portals.len(), 1);
+        assert_eq!(portals[0].portal_id, portal_id);
+        assert!(matches!(
+            portals[0].portal_type,
+            PortalType::Discord {
+                guild_id: 100,
+                channel_id: 200
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn list_portals_includes_primary_flag() {
+        let dir = tempdir().unwrap();
+        let (engine, _rx) = make_engine_with_dir(dir.path()).await;
+
+        // Register two portals (both auto-attach to General)
+        let portal1 = engine
+            .register_portal(PortalType::Discord {
+                guild_id: 1,
+                channel_id: 1,
+            })
+            .await
+            .unwrap();
+        let portal2 = engine
+            .register_portal(PortalType::Discord {
+                guild_id: 2,
+                channel_id: 2,
+            })
+            .await
+            .unwrap();
+
+        let portals = engine.list_portals().await;
+        assert_eq!(portals.len(), 2);
+
+        // First portal should be primary (first attached)
+        let p1 = portals.iter().find(|p| p.portal_id == portal1).unwrap();
+        let p2 = portals.iter().find(|p| p.portal_id == portal2).unwrap();
+        assert!(p1.is_primary);
+        assert!(!p2.is_primary);
+    }
+
+    #[tokio::test]
+    async fn list_portals_shows_conversation_mode() {
+        let dir = tempdir().unwrap();
+        let (engine, _rx) = make_engine_with_dir(dir.path()).await;
+
+        let portal_id = engine
+            .register_portal(PortalType::Discord {
+                guild_id: 1,
+                channel_id: 1,
+            })
+            .await
+            .unwrap();
+
+        let portals: Vec<PortalInfo> = engine.list_portals().await;
+        let p = portals.iter().find(|p| p.portal_id == portal_id).unwrap();
+        assert!(matches!(
+            p.conversation_mode,
+            Some(ConversationMode::General)
+        ));
     }
 }

@@ -50,9 +50,7 @@ mod tests {
     #[ignore] // Requires claude CLI installed
     async fn generate_returns_text() {
         let client = HaikuClient::new("claude".to_string());
-        let result = client
-            .generate("Say hello in one word", None)
-            .await;
+        let result = client.generate("Say hello in one word", None).await;
         assert!(result.is_ok());
         assert!(!result.unwrap().is_empty());
     }

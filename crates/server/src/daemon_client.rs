@@ -12,7 +12,7 @@ use tokio::net::UnixStream;
 
 // Re-export protocol types from the scheduler crate for convenience.
 pub use threshold_scheduler::daemon_api::{
-    DaemonCommand, DaemonRequest, DaemonResponse, ResponseStatus, PROTOCOL_VERSION,
+    DaemonCommand, DaemonRequest, DaemonResponse, PROTOCOL_VERSION, ResponseStatus,
 };
 
 /// Client for sending commands to the Threshold daemon.
@@ -45,10 +45,7 @@ impl DaemonClient {
     ///
     /// The daemon must be running (`threshold daemon`) for this to succeed.
     /// Uses a 5-second connect timeout and 30-second response timeout.
-    pub async fn send_command(
-        &self,
-        command: &DaemonCommand,
-    ) -> anyhow::Result<DaemonResponse> {
+    pub async fn send_command(&self, command: &DaemonCommand) -> anyhow::Result<DaemonResponse> {
         // Connect with timeout
         let stream = tokio::time::timeout(
             Duration::from_secs(5),
@@ -128,9 +125,8 @@ pub fn resolve_data_dir(explicit: Option<&str>) -> anyhow::Result<PathBuf> {
 
     // 3. THRESHOLD_CONFIG env var → load config → data_dir
     if let Ok(config_path) = std::env::var("THRESHOLD_CONFIG") {
-        let config = threshold_core::config::ThresholdConfig::load_from(
-            std::path::Path::new(&config_path),
-        )?;
+        let config =
+            threshold_core::config::ThresholdConfig::load_from(std::path::Path::new(&config_path))?;
         return config
             .data_dir()
             .map_err(|e| anyhow::anyhow!("Failed to resolve data dir from config: {}", e));

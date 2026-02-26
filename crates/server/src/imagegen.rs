@@ -8,9 +8,7 @@ use threshold_core::config::ThresholdConfig;
 use threshold_core::{SecretBackend, SecretStore};
 
 /// Handle the `threshold imagegen` command.
-pub async fn handle_imagegen_command(
-    args: threshold_imagegen::ImagegenArgs,
-) -> anyhow::Result<()> {
+pub async fn handle_imagegen_command(args: threshold_imagegen::ImagegenArgs) -> anyhow::Result<()> {
     let config = ThresholdConfig::load()?;
 
     let imagegen_config = config.tools.image_gen.as_ref().ok_or_else(|| {
@@ -35,5 +33,11 @@ pub async fn handle_imagegen_command(
     };
     let secrets = Arc::new(SecretStore::with_backend(backend, data_dir)?);
 
-    threshold_imagegen::handle_imagegen_command(args, imagegen_config, audit_path.as_deref(), secrets).await
+    threshold_imagegen::handle_imagegen_command(
+        args,
+        imagegen_config,
+        audit_path.as_deref(),
+        secrets,
+    )
+    .await
 }

@@ -75,9 +75,7 @@ mod integration_tests {
     /// Build a minimal AppState suitable for integration tests.
     /// Starts the web server on port 0 (OS-assigned) and returns the bound address.
     async fn start_test_server() -> (SocketAddr, tokio_util::sync::CancellationToken) {
-        use threshold_core::config::{
-            ClaudeCliConfig, CliConfig, ThresholdConfig, WebConfig,
-        };
+        use threshold_core::config::{ClaudeCliConfig, CliConfig, ThresholdConfig, WebConfig};
 
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().to_path_buf();
@@ -138,14 +136,7 @@ mod integration_tests {
 
         let engine = Arc::new(
             threshold_conversation::ConversationEngine::new(
-                &config,
-                claude,
-                None,
-                None,
-                None,
-                false,
-                0,
-                None,
+                &config, claude, None, None, None, false, 0, None,
             )
             .await
             .unwrap(),
@@ -172,9 +163,7 @@ mod integration_tests {
 
         let app = routes::build_router(state);
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
         let cancel_clone = cancel.clone();

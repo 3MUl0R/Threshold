@@ -50,12 +50,7 @@ pub fn build_tool_prompt(config: &ThresholdConfig) -> String {
         );
     }
 
-    if config
-        .tools
-        .image_gen
-        .as_ref()
-        .map_or(false, |i| i.enabled)
-    {
+    if config.tools.image_gen.as_ref().map_or(false, |i| i.enabled) {
         sections.push(
             "### Image Generation\n\
              Generate images from text descriptions.\n\

@@ -101,15 +101,19 @@ impl ProcessTracker {
         conversation_id: &ConversationId,
     ) -> Result<RunId, ThresholdError> {
         let inner = self.runs.read().await;
-        let run_id = inner
-            .by_conversation
-            .get(conversation_id)
+        let run_id =
+            inner
+                .by_conversation
+                .get(conversation_id)
+                .ok_or(ThresholdError::InvalidInput {
+                    message: "No running task for this conversation".into(),
+                })?;
+        let handle = inner
+            .by_run
+            .get(run_id)
             .ok_or(ThresholdError::InvalidInput {
                 message: "No running task for this conversation".into(),
             })?;
-        let handle = inner.by_run.get(run_id).ok_or(ThresholdError::InvalidInput {
-            message: "No running task for this conversation".into(),
-        })?;
         let run_id = *run_id;
         handle.abort_token.cancel();
         Ok(run_id)

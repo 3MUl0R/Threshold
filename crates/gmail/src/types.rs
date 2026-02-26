@@ -192,9 +192,6 @@ mod tests {
 
         let resp: TokenErrorResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.error, "invalid_grant");
-        assert_eq!(
-            resp.error_description.unwrap(),
-            "Token has been revoked."
-        );
+        assert_eq!(resp.error_description.unwrap(), "Token has been revoked.");
     }
 }

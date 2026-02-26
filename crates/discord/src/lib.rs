@@ -11,5 +11,5 @@ mod portals;
 mod scheduler_commands;
 mod security;
 
-pub use bot::{build_and_start, BotData};
+pub use bot::{BotData, build_and_start};
 pub use outbound::DiscordOutbound;

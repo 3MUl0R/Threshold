@@ -46,16 +46,14 @@ impl DiscordOutbound {
     }
 
     /// Create a new text channel in the guild.
-    pub async fn create_channel(
-        &self,
-        guild_id: u64,
-        name: &str,
-        topic: &str,
-    ) -> Result<u64> {
+    pub async fn create_channel(&self, guild_id: u64, name: &str, topic: &str) -> Result<u64> {
         let guild = serenity::all::GuildId::new(guild_id);
 
         let channel = guild
-            .create_channel(&self.http, serenity::all::CreateChannel::new(name).topic(topic))
+            .create_channel(
+                &self.http,
+                serenity::all::CreateChannel::new(name).topic(topic),
+            )
             .await
             .map_err(|e| threshold_core::ThresholdError::Discord(e.to_string()))?;
 
@@ -113,11 +111,7 @@ impl DiscordOutbound {
 /// `ResultSender` trait (in core), and Discord provides the concrete impl.
 #[async_trait::async_trait]
 impl threshold_core::ResultSender for DiscordOutbound {
-    async fn send_to_channel(
-        &self,
-        channel_id: u64,
-        message: &str,
-    ) -> threshold_core::Result<()> {
+    async fn send_to_channel(&self, channel_id: u64, message: &str) -> threshold_core::Result<()> {
         self.send_to_channel(channel_id, message).await
     }
 

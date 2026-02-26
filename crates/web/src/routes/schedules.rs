@@ -1,10 +1,10 @@
 //! Schedule routes: list, toggle, delete.
 
+use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::header;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
-use axum::Router;
 use serde::Deserialize;
 
 use crate::csrf;
@@ -26,18 +26,17 @@ async fn list(State(state): State<AppState>) -> Result<impl IntoResponse, WebErr
         .as_ref()
         .ok_or(WebError::SchedulerNotRunning)?;
 
-    let mut tasks = handle.list_tasks().await.map_err(|e| {
-        WebError::Internal(format!("Failed to list tasks: {e}"))
-    })?;
+    let mut tasks = handle
+        .list_tasks()
+        .await
+        .map_err(|e| WebError::Internal(format!("Failed to list tasks: {e}")))?;
 
     // Sort by next_run ascending (soonest first), None at end
-    tasks.sort_by(|a, b| {
-        match (a.next_run, b.next_run) {
-            (Some(a_next), Some(b_next)) => a_next.cmp(&b_next),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.name.cmp(&b.name),
-        }
+    tasks.sort_by(|a, b| match (a.next_run, b.next_run) {
+        (Some(a_next), Some(b_next)) => a_next.cmp(&b_next),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.name.cmp(&b.name),
     });
 
     let task_data: Vec<minijinja::Value> = tasks
@@ -105,7 +104,8 @@ async fn list(State(state): State<AppState>) -> Result<impl IntoResponse, WebErr
 
     let cookie = format!(
         "{}={}; Path=/; HttpOnly; SameSite=Strict",
-        csrf::COOKIE_NAME, csrf_token
+        csrf::COOKIE_NAME,
+        csrf_token
     );
     Ok(([(header::SET_COOKIE, cookie)], Html(rendered)))
 }
@@ -135,18 +135,20 @@ async fn toggle(
         .map_err(|_| WebError::NotFound(format!("Invalid task ID: {id}")))?;
 
     // Get current state to determine new toggle value
-    let tasks = handle.list_tasks().await.map_err(|e| {
-        WebError::Internal(format!("Failed to list tasks: {e}"))
-    })?;
+    let tasks = handle
+        .list_tasks()
+        .await
+        .map_err(|e| WebError::Internal(format!("Failed to list tasks: {e}")))?;
     let task = tasks
         .iter()
         .find(|t| t.id == task_id)
         .ok_or_else(|| WebError::NotFound(format!("Task not found: {id}")))?;
 
     let new_enabled = !task.enabled;
-    handle.toggle_task(task_id, new_enabled).await.map_err(|e| {
-        WebError::Internal(format!("Failed to toggle task: {e}"))
-    })?;
+    handle
+        .toggle_task(task_id, new_enabled)
+        .await
+        .map_err(|e| WebError::Internal(format!("Failed to toggle task: {e}")))?;
 
     let status = if new_enabled { "enabled" } else { "disabled" };
     let flash = FlashMessage::success(format!("Task '{}' {status}", task.name));
@@ -182,9 +184,10 @@ async fn delete(
         .parse::<uuid::Uuid>()
         .map_err(|_| WebError::NotFound(format!("Invalid task ID: {id}")))?;
 
-    handle.remove_task(task_id).await.map_err(|e| {
-        WebError::Internal(format!("Failed to remove task: {e}"))
-    })?;
+    handle
+        .remove_task(task_id)
+        .await
+        .map_err(|e| WebError::Internal(format!("Failed to remove task: {e}")))?;
 
     let flash = FlashMessage::success("Task deleted");
     let flash_cookie = format!(

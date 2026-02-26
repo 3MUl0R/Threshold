@@ -73,11 +73,7 @@ impl SchedulerHandle {
     pub async fn toggle_task(&self, id: Uuid, enabled: bool) -> Result<(), ThresholdError> {
         let (reply, rx) = oneshot::channel();
         self.command_tx
-            .send(SchedulerCommand::ToggleTask {
-                id,
-                enabled,
-                reply,
-            })
+            .send(SchedulerCommand::ToggleTask { id, enabled, reply })
             .map_err(|_| ThresholdError::SchedulerShutdown)?;
         rx.await.map_err(|_| ThresholdError::SchedulerShutdown)?
     }
@@ -192,15 +188,17 @@ impl Scheduler {
     /// that used randomly generated IDs, or deleted conversations).
     pub async fn validate_heartbeat_tasks(&mut self) {
         let conversations = self.engine.list_conversations().await;
-        let conv_ids: std::collections::HashSet<_> =
-            conversations.iter().map(|c| c.id).collect();
+        let conv_ids: std::collections::HashSet<_> = conversations.iter().map(|c| c.id).collect();
 
         let before = self.tasks.len();
         self.tasks.retain(|task| {
             if task.kind != crate::task::TaskKind::Heartbeat {
                 return true; // keep non-heartbeat tasks
             }
-            if let ScheduledAction::ResumeConversation { conversation_id, .. } = &task.action {
+            if let ScheduledAction::ResumeConversation {
+                conversation_id, ..
+            } = &task.action
+            {
                 if conv_ids.contains(conversation_id) {
                     return true; // conversation exists, keep
                 }
@@ -323,11 +321,7 @@ impl Scheduler {
                     self.persist().await;
                 }
             }
-            SchedulerCommand::ToggleTask {
-                id,
-                enabled,
-                reply,
-            } => {
+            SchedulerCommand::ToggleTask { id, enabled, reply } => {
                 let result = if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
                     task.enabled = enabled;
                     tracing::info!(
@@ -465,7 +459,9 @@ impl Scheduler {
                     task_snapshot.action,
                     ScheduledAction::ResumeConversation { .. }
                 ) {
-                    daemon_state.as_ref().map(threshold_core::WorkGuard::acquire)
+                    daemon_state
+                        .as_ref()
+                        .map(threshold_core::WorkGuard::acquire)
                 } else {
                     None
                 };
@@ -494,11 +490,7 @@ impl Scheduler {
                         result.duration_ms
                     );
                 } else {
-                    tracing::warn!(
-                        "Task '{}' failed: {}",
-                        task_snapshot.name,
-                        result.summary
-                    );
+                    tracing::warn!("Task '{}' failed: {}", task_snapshot.name, result.summary);
                 }
 
                 // Send completion back to scheduler loop to update last_run/last_result
@@ -538,23 +530,27 @@ mod tests {
         task
     }
 
-    async fn make_test_scheduler(
-        cancel: CancellationToken,
-    ) -> (Scheduler, SchedulerHandle) {
+    async fn make_test_scheduler(cancel: CancellationToken) -> (Scheduler, SchedulerHandle) {
         use threshold_core::config::{AgentConfigToml, ClaudeCliConfig, CliConfig, ToolsConfig};
 
         let tmp = tempfile::tempdir().unwrap();
-        let sessions = Arc::new(
-            threshold_cli_wrapper::session::SessionManager::new(
-                tmp.path().join("cli").join("cli-sessions.json"),
-            ),
-        );
+        let sessions = Arc::new(threshold_cli_wrapper::session::SessionManager::new(
+            tmp.path().join("cli").join("cli-sessions.json"),
+        ));
         let locks = Arc::new(threshold_cli_wrapper::ConversationLockMap::new());
         let tracker = Arc::new(threshold_cli_wrapper::ProcessTracker::new());
         let claude = Arc::new(
-            ClaudeClient::new("claude".into(), tmp.path().join("cli"), false, 300, sessions, locks, tracker)
-                .await
-                .unwrap(),
+            ClaudeClient::new(
+                "claude".into(),
+                tmp.path().join("cli"),
+                false,
+                300,
+                sessions,
+                locks,
+                tracker,
+            )
+            .await
+            .unwrap(),
         );
         let config = ThresholdConfig {
             data_dir: Some(tmp.path().to_path_buf()),

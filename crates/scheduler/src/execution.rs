@@ -55,7 +55,14 @@ pub async fn execute_task(
             } else {
                 prompt.clone()
             };
-            exec_resume_conversation(engine, conversation_id, &effective_prompt).await
+            exec_resume_conversation(
+                engine,
+                conversation_id,
+                &effective_prompt,
+                &task.name,
+                task.portal_id,
+            )
+            .await
         }
         ScheduledAction::Script {
             command,
@@ -65,7 +72,9 @@ pub async fn execute_task(
             command,
             prompt_template,
             model,
-        } => exec_script_then_conversation(claude, command, prompt_template, model.as_deref()).await,
+        } => {
+            exec_script_then_conversation(claude, command, prompt_template, model.as_deref()).await
+        }
     };
 
     let duration = start.elapsed();
@@ -161,15 +170,16 @@ async fn exec_resume_conversation(
     engine: &Arc<ConversationEngine>,
     conversation_id: &threshold_core::ConversationId,
     prompt: &str,
+    task_name: &str,
+    portal_id: Option<threshold_core::PortalId>,
 ) -> Result<String, ThresholdError> {
-    engine.send_to_conversation(conversation_id, prompt).await
+    engine
+        .send_to_conversation(conversation_id, prompt, Some(task_name), portal_id)
+        .await
 }
 
 /// Run a shell command directly (no Claude involved).
-async fn exec_script(
-    command: &str,
-    working_dir: Option<&str>,
-) -> Result<String, ThresholdError> {
+async fn exec_script(command: &str, working_dir: Option<&str>) -> Result<String, ThresholdError> {
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c").arg(command);
 

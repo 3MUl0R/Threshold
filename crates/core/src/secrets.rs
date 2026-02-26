@@ -180,7 +180,6 @@ impl FileStore {
     }
 
     fn set(&self, key: &str, value: &str) -> crate::Result<()> {
-
         // Acquire exclusive lock, re-read, modify, write back
         let lock_file = OpenOptions::new()
             .create(true)
@@ -258,10 +257,7 @@ impl FileStore {
             })?;
 
             file.flush().map_err(|e| {
-                crate::ThresholdError::Keychain(format!(
-                    "Failed to flush tmp secrets file: {}",
-                    e
-                ))
+                crate::ThresholdError::Keychain(format!("Failed to flush tmp secrets file: {}", e))
             })?;
         }
 
@@ -356,10 +352,7 @@ impl FileStore {
             })?;
 
             file.flush().map_err(|e| {
-                crate::ThresholdError::Keychain(format!(
-                    "Failed to flush tmp secrets file: {}",
-                    e
-                ))
+                crate::ThresholdError::Keychain(format!("Failed to flush tmp secrets file: {}", e))
             })?;
         }
 
@@ -459,10 +452,7 @@ impl SecretStore {
     ///
     /// Returns an error if `backend` is `File` and `data_dir` is `None`, or if
     /// file store initialization fails.
-    pub fn with_backend(
-        backend: SecretBackend,
-        data_dir: Option<PathBuf>,
-    ) -> crate::Result<Self> {
+    pub fn with_backend(backend: SecretBackend, data_dir: Option<PathBuf>) -> crate::Result<Self> {
         match backend {
             SecretBackend::File => {
                 let dir = data_dir.ok_or_else(|| {
@@ -501,12 +491,11 @@ impl SecretStore {
         match &self.inner {
             SecretBackendInner::File(store) => store.set(key, value),
             SecretBackendInner::Keychain(service_name) => {
-                let entry = Entry::new(service_name, key).map_err(|e| {
-                    crate::ThresholdError::Keychain(format!("create entry: {}", e))
-                })?;
-                entry.set_password(value).map_err(|e| {
-                    crate::ThresholdError::Keychain(format!("set password: {}", e))
-                })?;
+                let entry = Entry::new(service_name, key)
+                    .map_err(|e| crate::ThresholdError::Keychain(format!("create entry: {}", e)))?;
+                entry
+                    .set_password(value)
+                    .map_err(|e| crate::ThresholdError::Keychain(format!("set password: {}", e)))?;
                 Ok(())
             }
         }
@@ -523,9 +512,8 @@ impl SecretStore {
         match &self.inner {
             SecretBackendInner::File(store) => store.get(key),
             SecretBackendInner::Keychain(service_name) => {
-                let entry = Entry::new(service_name, key).map_err(|e| {
-                    crate::ThresholdError::Keychain(format!("create entry: {}", e))
-                })?;
+                let entry = Entry::new(service_name, key)
+                    .map_err(|e| crate::ThresholdError::Keychain(format!("create entry: {}", e)))?;
                 match entry.get_password() {
                     Ok(password) => Ok(Some(password)),
                     Err(keyring::Error::NoEntry) => Ok(None),
@@ -545,9 +533,8 @@ impl SecretStore {
         match &self.inner {
             SecretBackendInner::File(store) => store.delete(key),
             SecretBackendInner::Keychain(service_name) => {
-                let entry = Entry::new(service_name, key).map_err(|e| {
-                    crate::ThresholdError::Keychain(format!("create entry: {}", e))
-                })?;
+                let entry = Entry::new(service_name, key)
+                    .map_err(|e| crate::ThresholdError::Keychain(format!("create entry: {}", e)))?;
                 match entry.delete_credential() {
                     Ok(()) => Ok(()),
                     Err(keyring::Error::NoEntry) => Ok(()),
@@ -813,8 +800,7 @@ mod tests {
 
         fn temp_store() -> (tempfile::TempDir, SecretStore) {
             let dir = tempfile::tempdir().unwrap();
-            let store =
-                SecretStore::with_file_backend(dir.path().join("secrets.toml")).unwrap();
+            let store = SecretStore::with_file_backend(dir.path().join("secrets.toml")).unwrap();
             (dir, store)
         }
 
@@ -1132,10 +1118,12 @@ mod tests {
         fn with_backend_file_requires_data_dir() {
             let result = SecretStore::with_backend(SecretBackend::File, None);
             assert!(result.is_err());
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("data_dir required"));
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("data_dir required")
+            );
         }
 
         #[test]

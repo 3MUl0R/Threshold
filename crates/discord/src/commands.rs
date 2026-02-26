@@ -28,10 +28,7 @@ pub async fn general(ctx: Context<'_>) -> Result {
 
 /// Start or resume a coding conversation.
 #[poise::command(slash_command, prefix_command)]
-pub async fn coding(
-    ctx: Context<'_>,
-    #[description = "Project name"] project: String,
-) -> Result {
+pub async fn coding(ctx: Context<'_>, #[description = "Project name"] project: String) -> Result {
     let portal_id = resolve_portal(ctx).await;
     let mode = ConversationMode::Coding {
         project: project.clone(),
@@ -39,18 +36,18 @@ pub async fn coding(
 
     ctx.data().engine.switch_mode(&portal_id, mode).await?;
 
-    ctx.say(format!("Switched to **Coding** conversation for `{}`.", project))
-        .await
-        .ok();
+    ctx.say(format!(
+        "Switched to **Coding** conversation for `{}`.",
+        project
+    ))
+    .await
+    .ok();
     Ok(())
 }
 
 /// Start or resume a research conversation.
 #[poise::command(slash_command, prefix_command)]
-pub async fn research(
-    ctx: Context<'_>,
-    #[description = "Research topic"] topic: String,
-) -> Result {
+pub async fn research(ctx: Context<'_>, #[description = "Research topic"] topic: String) -> Result {
     let portal_id = resolve_portal(ctx).await;
     let mode = ConversationMode::Research {
         topic: topic.clone(),
@@ -58,9 +55,12 @@ pub async fn research(
 
     ctx.data().engine.switch_mode(&portal_id, mode).await?;
 
-    ctx.say(format!("Switched to **Research** conversation for `{}`.", topic))
-        .await
-        .ok();
+    ctx.say(format!(
+        "Switched to **Research** conversation for `{}`.",
+        topic
+    ))
+    .await
+    .ok();
     Ok(())
 }
 
@@ -107,9 +107,7 @@ pub async fn abort(ctx: Context<'_>) -> Result {
         .await
     {
         Ok(run_id) => {
-            ctx.say(format!("Aborting task {}...", run_id))
-                .await
-                .ok();
+            ctx.say(format!("Aborting task {}...", run_id)).await.ok();
         }
         Err(_) => {
             ctx.say("Nothing to abort — no task is running for this conversation.")
@@ -123,10 +121,7 @@ pub async fn abort(ctx: Context<'_>) -> Result {
 
 /// Join a specific conversation by ID.
 #[poise::command(slash_command, prefix_command)]
-pub async fn join(
-    ctx: Context<'_>,
-    #[description = "Conversation ID"] id: String,
-) -> Result {
+pub async fn join(ctx: Context<'_>, #[description = "Conversation ID"] id: String) -> Result {
     // Parse UUID from string
     let conversation_id = id
         .parse::<uuid::Uuid>()
@@ -141,5 +136,29 @@ pub async fn join(
         .await?;
 
     ctx.say(format!("Joined conversation `{}`.", id)).await.ok();
+    Ok(())
+}
+
+/// Set this channel's portal as the primary portal for its conversation.
+///
+/// The primary portal receives scheduled task output, heartbeat messages,
+/// and other non-user-initiated responses by default.
+#[poise::command(slash_command, prefix_command)]
+pub async fn primary(ctx: Context<'_>) -> Result {
+    let portal_id = resolve_portal(ctx).await;
+    let conversation_id = ctx
+        .data()
+        .engine
+        .get_portal_conversation(&portal_id)
+        .await?;
+
+    ctx.data()
+        .engine
+        .set_primary_portal(conversation_id, portal_id)
+        .await?;
+
+    ctx.say("This channel is now the **primary portal** for this conversation.")
+        .await
+        .ok();
     Ok(())
 }
