@@ -57,11 +57,12 @@ Agent (in conversation):
 
 threshold daemon restart (CLI process, outside the daemon):
   ├── 1. Read PID from $DATA_DIR/threshold.pid
-  ├── 2. Write follow-on hook to $DATA_DIR/state/restart-hooks.json
-  ├── 3. Send SIGTERM to daemon PID
-  ├── 4. Wait for daemon process to exit (poll PID, timeout 30s)
-  ├── 5. Run `cargo build -p threshold` from repo root
-  ├── 6. Start new daemon process (detached)
+  ├── 2. Run `cargo build -p threshold` from repo root
+  │      └── If build FAILS → abort restart, print compiler errors, daemon untouched
+  ├── 3. Write follow-on hook to $DATA_DIR/state/restart-hooks.json
+  ├── 4. Send SIGTERM to daemon PID
+  ├── 5. Wait for daemon process to exit (poll PID, timeout 30s)
+  ├── 6. Start new daemon process (detached, using freshly built binary)
   ├── 7. Poll Health command on Unix socket until ready (timeout 60s)
   └── 8. Print success: "Daemon restarted (PID 12345)"
 
@@ -261,28 +262,33 @@ threshold daemon restart [--skip-build] [--data-dir <path>] \
     [--follow-on-conversation <uuid> --follow-on-prompt <text>]
 ```
 
+**Critical safety invariant:** The build must succeed *before* the running daemon is stopped. If the build fails, the restart is aborted and the running daemon continues undisturbed. This prevents the failure mode where the daemon is stopped, the rebuild fails, and no daemon can be started — leaving the system dead.
+
 **Steps:**
 
 1. **Resolve data dir** — from `--data-dir`, `THRESHOLD_DATA_DIR`, or default `~/.threshold`
 2. **Verify daemon is running** — Read PID file, check process alive, validate it's a Threshold process (same `is_threshold_process()` check used at startup). Error if PID is stale or belongs to a different process.
-3. **Detect supervised mode** — Check for `$DATA_DIR/state/supervised` marker. If present, delegate to supervised restart (see below).
-4. **Write follow-on hook** (if provided) — Atomic write to `$DATA_DIR/state/restart-hooks.json` (write to temp file, then rename)
-5. **Send SIGTERM** — `kill(pid, SIGTERM)` (only after identity validation in step 2)
-6. **Wait for exit** — Poll process existence, timeout after 30 seconds
-7. **Build** (unless `--skip-build`) — Run `cargo build -p threshold` from the repository root
-8. **Start new daemon** — Spawn `threshold daemon start` as a detached process
+3. **Build first** (unless `--skip-build`) — Run `cargo build -p threshold` from the repository root. If the build fails, **abort the restart immediately** and return the compiler error output. The running daemon is never touched.
+4. **Detect supervised mode** — Check for `$DATA_DIR/state/supervised` marker. If present, delegate to supervised restart (see below).
+5. **Write follow-on hook** (if provided) — Atomic write to `$DATA_DIR/state/restart-hooks.json` (write to temp file, then rename)
+6. **Send SIGTERM** — `kill(pid, SIGTERM)` (only after identity validation in step 2)
+7. **Wait for exit** — Poll process existence, timeout after 30 seconds
+8. **Start new daemon** — Spawn `threshold daemon start` as a detached process (using the freshly built binary)
 9. **Wait for healthy** — Poll `Health` command via Unix socket, timeout after 60 seconds
 10. **Report success** — Print new PID, build time, startup time
 
 ### Restart Command (Supervised Mode)
 
+The same safety invariant applies: the build happens in the CLI *before* SIGTERM is sent. The wrapper does not need to rebuild because the CLI already produced a clean binary.
+
 When the supervised marker is detected:
 
-1. Write `restart-pending.json` to `$DATA_DIR/state/` (atomic write)
-2. Write follow-on hook (if provided)
-3. Send SIGTERM to daemon PID
-4. Print: "Restart signal sent. The supervisor will rebuild and restart the daemon."
-5. Exit — the wrapper script handles the rest
+1. Build already succeeded in step 3 above (before mode detection)
+2. Write `restart-pending.json` to `$DATA_DIR/state/` (atomic write) — with `skip_build: true` since the CLI already built successfully
+3. Write follow-on hook (if provided)
+4. Send SIGTERM to daemon PID
+5. Print: "Restart signal sent (build succeeded). The supervisor will restart the daemon."
+6. Exit — the wrapper starts the new binary without rebuilding
 
 ### Stop Command
 
@@ -471,7 +477,10 @@ while true; do
         break
     fi
 
-    # Check if a rebuild was requested
+    # Check if a restart was requested via CLI
+    # The CLI builds BEFORE sending SIGTERM, so skip_build is normally true.
+    # The wrapper retains build capability as a fallback for manual restarts
+    # (e.g., someone kills the daemon directly, or the daemon crashes).
     if [ -f "$STATE_DIR/restart-pending.json" ]; then
         SKIP_BUILD=$(python3 -c "
 import json, sys
@@ -487,6 +496,8 @@ except: print('false')
             (cd "$REPO_ROOT" && cargo build -p threshold) || {
                 echo "[wrapper] Build failed. Starting with existing binary."
             }
+        else
+            echo "[wrapper] Build already completed by CLI. Skipping rebuild."
         fi
     fi
 
@@ -682,13 +693,15 @@ Agent (in a Claude CLI conversation):
        --follow-on-prompt "Restart complete. Verifying the fix took effect."
 
   Standalone mode:
-    3. The CLI command blocks until restart completes (stop + build + start + health check)
-    4. Returns: "Daemon restarted (PID 12345, build: 8.2s, startup: 1.3s)"
+    3. The CLI builds first — if build fails, returns error and daemon stays running
+    4. On build success: CLI stops daemon, starts new binary, waits for health check
+    5. Returns: "Daemon restarted (PID 12345, build: 8.2s, startup: 1.3s)"
 
   Supervised mode:
-    3. The CLI writes restart-pending.json and sends SIGTERM
-    4. Returns: "Restart signal sent. The supervisor will rebuild and restart."
-    5. The wrapper handles build + restart asynchronously
+    3. The CLI builds first — if build fails, returns error and daemon stays running
+    4. On build success: writes restart-pending.json (skip_build: true) and sends SIGTERM
+    5. Returns: "Restart signal sent (build succeeded). The supervisor will restart."
+    6. The wrapper starts the new binary without rebuilding
 
 After restart (both modes):
   - New daemon processes the follow-on hook
@@ -754,6 +767,7 @@ The conversation ID is available to the agent via its conversation context. The 
 | `crates/scheduler/src/engine.rs` | After task completion, if `one_shot`, remove the task from `self.tasks` and persist. |
 
 **Tests:**
+- `daemon::restart_aborts_on_build_failure` — Start daemon, trigger restart with a simulated build failure (e.g., mock cargo returning non-zero), verify daemon is still running (PID unchanged, health check passes), verify CLI returned the build error.
 - `daemon::stop_sends_sigterm` — Start daemon in background, run stop, verify process exits.
 - `daemon::stop_writes_sentinel_in_supervised_mode` — Set supervised marker, run stop, verify sentinel file created.
 - `hooks::write_and_read_round_trip` — Write restart hooks atomically, read back, verify fields match.
@@ -849,7 +863,7 @@ Manual testing sequence:
 
 5. **How do `stop` and `restart` interact with the wrapper script?** — `threshold daemon stop` writes a `stop-sentinel` file before sending SIGTERM. The wrapper checks for this sentinel on each loop iteration and exits instead of restarting. `threshold daemon restart` writes `restart-pending.json` (with optional `skip_build`) instead of the stop sentinel, so the wrapper rebuilds and restarts.
 
-6. **What if the rebuild fails?** — In standalone mode, the restart command reports the build failure and does not start the daemon. The agent sees the error in the command output and can fix the issue. In supervised mode, the wrapper logs the build failure and starts the daemon with the existing (old) binary. The follow-on hook still fires, giving the agent context to investigate.
+6. **What if the rebuild fails?** — The build runs *before* the daemon is stopped, in both modes. If the build fails, the restart is aborted immediately — the running daemon is never touched. The agent sees the compiler error output and can fix the issue and retry. This is a critical safety invariant: we never stop a running daemon without a known-good binary ready to replace it.
 
 7. **What prevents infinite restart loops?** — The wrapper script has no built-in loop limit, but restart loops only happen on crashes (non-zero exit). A 5-second delay is added between crash restarts. The stop sentinel provides a reliable way to break out of the loop. A future enhancement could add a crash counter and exponential backoff.
 
