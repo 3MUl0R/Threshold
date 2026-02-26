@@ -1181,20 +1181,30 @@ impl ConversationEngine {
     /// 3. Persist outside any lock
     async fn backfill_primary_portals(&self) {
         // Phase 1: Collect backfill assignments while holding read locks briefly.
-        let assignments: Vec<(ConversationId, PortalId)> = {
+        // Includes conversations with no primary AND conversations whose primary
+        // portal is a sentinel (legacy backward-compat deserialization artifact).
+        let assignments: Vec<(ConversationId, Option<PortalId>)> = {
             let portals = self.portals.read().await;
             let conversations = self.conversations.read().await;
             conversations
                 .list()
                 .iter()
-                .filter(|conv| conv.primary_portal.is_none())
-                .filter_map(|conv| {
-                    portals
+                .filter(|conv| {
+                    // No primary at all
+                    conv.primary_portal.is_none()
+                    // OR primary is a sentinel portal
+                    || conv.primary_portal.is_some_and(|pid| {
+                        portals.get(&pid).map_or(true, |p| p.portal_type.is_sentinel())
+                    })
+                })
+                .map(|conv| {
+                    let best = portals
                         .get_portals_for_conversation(&conv.id)
                         .iter()
                         .filter(|p| !p.portal_type.is_sentinel())
                         .min_by_key(|p| p.connected_at)
-                        .map(|p| (conv.id, p.id))
+                        .map(|p| p.id);
+                    (conv.id, best)
                 })
                 .collect()
         }; // both locks dropped here
@@ -1206,11 +1216,9 @@ impl ConversationEngine {
         // Phase 2: Apply assignments under conversations write lock (no portals lock needed).
         {
             let mut conversations = self.conversations.write().await;
-            for (conv_id, portal_id) in &assignments {
+            for (conv_id, new_primary) in &assignments {
                 if let Some(conv) = conversations.get_mut(conv_id) {
-                    if conv.primary_portal.is_none() {
-                        conv.primary_portal = Some(*portal_id);
-                    }
+                    conv.primary_portal = *new_primary;
                 }
             }
         } // conversations lock dropped
