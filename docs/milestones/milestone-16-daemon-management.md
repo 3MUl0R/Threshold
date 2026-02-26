@@ -1,6 +1,6 @@
 # Milestone 16 — Daemon Management & Self-Update
 
-**Crates:** `core`, `server`, `scheduler`, `conversation`
+**Crates:** `core`, `server`, `scheduler`, `conversation`, `cli-wrapper`, `discord`, `web`
 **Complexity:** Medium-High
 **Dependencies:** Milestone 1 (daemon), Milestone 6 (scheduler), Milestone 14 (streaming/broadcast)
 
@@ -10,7 +10,7 @@ Infrastructure for agents to rebuild, restart, and manage the Threshold daemon �
 
 1. **PID file & daemon discovery** — The daemon writes a PID file on startup, enabling other processes to find and signal the running instance. A `threshold daemon status` command reports whether the daemon is running and its health.
 2. **Health check endpoint** — The daemon API gains a `Health` command returning uptime, version, and readiness via the existing Unix socket protocol. The web `/status` endpoint already provides HTTP-level health; this extends the socket API for CLI-level checks.
-3. **Graceful restart command** — `threshold daemon restart` orchestrates a full stop → build → start cycle. In supervised mode (wrapper/launchd), it delegates the restart to the supervisor. In standalone mode, it handles the full lifecycle directly.
+3. **Graceful restart with drain** — `threshold daemon restart` drains in-flight work (active agent conversations finish cleanly), then orchestrates a full stop → build → start cycle. In supervised mode (wrapper/launchd), it delegates the restart to the supervisor. In standalone mode, it handles the full lifecycle directly. A configurable drain timeout ensures restart won't hang forever.
 4. **Restart follow-on hook** — Before restarting, the agent can register a "follow-on" task: a prompt to inject into a conversation once the new daemon is ready. This gives agents continuity through restarts. Hooks are processed directly by the conversation engine on startup — no scheduler dependency.
 5. **Agent-triggered restart** — The agent triggers restart by calling `threshold daemon restart` via shell execution (the same pattern used for `threshold schedule`, `threshold gmail`, and other CLI commands). No new built-in tool is needed.
 6. **launchd integration** — `threshold daemon install` creates a macOS launchd plist for auto-start on boot. A wrapper script (`scripts/threshold-wrapper.sh`) handles rebuild-before-restart logic.
@@ -60,12 +60,15 @@ threshold daemon restart (CLI process, outside the daemon):
   ├── 2. Read PID from $DATA_DIR/threshold.pid
   ├── 3. Run `cargo build -p threshold` from repo root
   │      └── If build FAILS → abort restart, print compiler errors, daemon untouched
-  ├── 4. Write follow-on hook to $DATA_DIR/state/restart-hooks.json
-  ├── 5. Send SIGTERM to daemon PID
-  ├── 6. Wait for daemon process to exit (poll PID, timeout 30s)
-  ├── 7. Start new daemon: {repo_root}/target/debug/threshold daemon start (absolute path)
-  ├── 8. Poll Health command on Unix socket until ready (timeout 60s)
-  └── 9. Print success: "Daemon restarted (PID 12345)"
+  ├── 4. Send `Drain` command via Unix socket → daemon stops accepting new work
+  ├── 5. Poll Health until active_work == 0 (timeout: --drain-timeout, default 120s)
+  │      └── Print progress: "Draining: 2 active runs remaining..."
+  ├── 6. Write follow-on hook to $DATA_DIR/state/restart-hooks.json (with drain summary)
+  ├── 7. Send SIGTERM to daemon PID → remaining runs (if any) aborted during shutdown
+  ├── 8. Wait for daemon process to exit (poll PID, timeout 30s)
+  ├── 9. Start new daemon: {repo_root}/target/debug/threshold daemon start (absolute path)
+  ├── 10. Poll Health command on Unix socket until ready (timeout 60s)
+  └── 11. Print success: "Daemon restarted (PID 12345, 3 runs drained, 0 aborted)"
 
 New daemon starts:
   ├── Load state from disk (conversations, portals, schedules)
@@ -81,7 +84,7 @@ There are two modes, determined by how the daemon is running:
 
 **Standalone mode** (`threshold daemon start` invoked directly):
 - `threshold daemon restart` handles the full stop → build → start → health-check cycle.
-- `threshold daemon stop` sends SIGTERM and waits for exit. The daemon stays down.
+- `threshold daemon stop` drains active work, sends SIGTERM, and waits for exit. The daemon stays down.
 
 **Supervised mode** (running under `scripts/threshold-wrapper.sh` or launchd):
 - `threshold daemon restart` writes `$DATA_DIR/state/restart-pending.json`, then sends SIGTERM.
@@ -211,6 +214,8 @@ Health response uses the existing `DaemonResponse` envelope (`daemon_api.rs:42`)
         "pid": 12345,
         "uptime_secs": 3600,
         "version": "0.1.0",
+        "draining": false,
+        "active_work": 2,
         "scheduler_task_count": 8,
         "scheduler_enabled_count": 3
     }
@@ -227,8 +232,28 @@ When the scheduler is disabled, the task count fields are `null`:
         "pid": 12345,
         "uptime_secs": 3600,
         "version": "0.1.0",
+        "draining": false,
+        "active_work": 0,
         "scheduler_task_count": null,
         "scheduler_enabled_count": null
+    }
+}
+```
+
+During drain, Health reflects the draining state and remaining active runs:
+
+```json
+{
+    "version": 1,
+    "status": "ok",
+    "data": {
+        "pid": 12345,
+        "uptime_secs": 3600,
+        "version": "0.1.0",
+        "draining": true,
+        "active_work": 1,
+        "scheduler_task_count": 8,
+        "scheduler_enabled_count": 3
     }
 }
 ```
@@ -240,6 +265,19 @@ $ threshold daemon status [--data-dir <path>]
 
 Threshold Daemon
   Status:    Running
+  PID:       12345
+  Uptime:    2h 30m 15s
+  Version:   0.1.0
+  Active:    2 runs
+  Scheduler: 8 tasks (3 enabled)
+```
+
+When draining (restart/stop in progress):
+
+```
+$ threshold daemon status
+Threshold Daemon
+  Status:    Draining (1 active run)
   PID:       12345
   Uptime:    2h 30m 15s
   Version:   0.1.0
@@ -255,6 +293,7 @@ Threshold Daemon
   PID:       12345
   Uptime:    2h 30m 15s
   Version:   0.1.0
+  Active:    0 runs
   Scheduler: disabled
 ```
 
@@ -294,10 +333,145 @@ async fn sigterm_signal() {
 }
 ```
 
+### Graceful Drain Before Shutdown
+
+When restart or stop is triggered, in-flight work (active agent conversations, scheduled task executions) must be given time to complete rather than being abruptly terminated. The daemon enters a **draining** state before SIGTERM is sent.
+
+**Shared drain state:**
+
+```rust
+// crates/core/src/types.rs
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+#[derive(Debug)]
+pub struct DaemonState {
+    /// True when the daemon is preparing to shut down.
+    draining: AtomicBool,
+    /// Number of active work items (conversations, script tasks, etc.).
+    active_work: AtomicU32,
+}
+
+impl DaemonState {
+    pub fn new() -> Self {
+        Self {
+            draining: AtomicBool::new(false),
+            active_work: AtomicU32::new(0),
+        }
+    }
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
+    }
+    pub fn set_draining(&self, value: bool) {
+        self.draining.store(value, Ordering::Release);
+    }
+    pub fn active_work(&self) -> u32 {
+        self.active_work.load(Ordering::Acquire)
+    }
+    pub fn increment_work(&self) -> u32 {
+        self.active_work.fetch_add(1, Ordering::AcqRel) + 1
+    }
+    pub fn decrement_work(&self) -> u32 {
+        let prev = self.active_work.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |n| Some(n.saturating_sub(1)),
+        ).unwrap(); // fetch_update with Some always succeeds
+        debug_assert!(prev > 0, "active_work underflow: double-decrement bug");
+        prev.saturating_sub(1)
+    }
+}
+```
+
+An `Arc<DaemonState>` is created at daemon startup and passed to all subsystems.
+
+**Active work tracking:** `DaemonState.active_work` is a unified counter for ALL in-flight work — not just streaming Claude runs. `ProcessTracker` only tracks streaming Claude CLI processes (for abort support), which misses scheduler Script tasks, NewConversation (non-streaming path), and ScriptThenConversation. Instead, `active_work` is incremented/decremented at each work entry point:
+
+| Entry point | Tracks |
+|-------------|--------|
+| `ConversationEngine::handle_message()` | User-initiated streaming conversations (Discord messages, Web sends) |
+| `ConversationEngine::send_to_conversation()` | Scheduler `ResumeConversation` tasks, restart follow-on hooks |
+| `scheduler::exec_script()` | Shell script tasks |
+| `scheduler::exec_new_conversation()` | New conversation tasks (non-streaming path) |
+| `scheduler::exec_script_then_conversation()` | Composite script → conversation tasks |
+
+**Important:** `handle_message()` and `send_to_conversation()` are **separate streaming paths** — `send_to_conversation()` does NOT call `handle_message()`. Both independently manage locks, streaming, and process tracking. Both need their own `WorkGuard` for `active_work` tracking. `ResumeConversation` tasks go through `exec_resume_conversation()` → `engine.send_to_conversation()`, so they're tracked by the `send_to_conversation()` entry point — no double-counting with scheduler-level tracking (the scheduler does NOT separately instrument `exec_resume_conversation()` since the engine handles it).
+
+`ProcessTracker` is retained for its original purpose (abort support via `/abort`), but `DaemonState.active_work` is the single source of truth for drain completion.
+
+**Implementation note:** Each tracking site must guarantee `decrement_work()` runs on ALL exit paths — success, error, panic, and cancellation. Use a RAII drop guard pattern:
+
+```rust
+struct WorkGuard(Arc<DaemonState>);
+impl Drop for WorkGuard {
+    fn drop(&mut self) { self.0.decrement_work(); }
+}
+
+// Usage in handle_message(), send_to_conversation(), exec_script(), etc.:
+let _guard = WorkGuard(daemon_state.clone());
+daemon_state.increment_work();
+// ... do work — guard ensures decrement on any exit path
+```
+
+This prevents `active_work` from leaking on error or panic paths, which would cause drain to hang indefinitely.
+
+**Subsystem behavior during drain:**
+
+| Subsystem | Drain behavior |
+|-----------|---------------|
+| **ConversationEngine** | Checks `is_draining()` before accepting new work in both `handle_message()` and `send_to_conversation()`. Returns `DaemonDraining` error if draining. In-flight conversations (already streaming) continue to completion. |
+| **Scheduler** | Checks `is_draining()` before firing tasks in `run_ready_tasks()`. If draining, skips the task — it will fire on its next cron match after restart. |
+| **Discord bot** | Checks `is_draining()` before processing incoming messages. If draining, replies: "Threshold is restarting. Your message will not be processed — please retry in a moment." |
+| **Web server** | Checks `is_draining()` on action requests (conversation sends, schedule changes). Returns 503 Service Unavailable: "Daemon is restarting." Read-only pages (status, conversation list) continue working. |
+
+**New `DaemonCommand::Drain`:**
+
+```rust
+pub enum DaemonCommand {
+    // ... existing ...
+    Health,
+    /// Enter drain mode: stop accepting new work, let in-flight work finish.
+    Drain,
+    /// Exit drain mode: resume accepting new work. Used for rollback if
+    /// restart/stop fails after Drain but before SIGTERM.
+    Undrain,
+}
+```
+
+The `Drain` command sets `DaemonState.draining = true` and returns the current active work count:
+
+```json
+{
+    "version": 1,
+    "status": "ok",
+    "data": {
+        "draining": true,
+        "active_work": 3
+    }
+}
+```
+
+After sending `Drain`, the CLI polls `Health` (which now includes `draining` and `active_work`) until `active_work == 0` or the drain timeout expires. If the timeout expires, the CLI proceeds with SIGTERM — the daemon's shutdown path cancels streaming Claude runs via `ProcessTracker` (which sends `SIGTERM` to tracked child processes) and drops the `CancellationToken`. **Important caveat:** Script tasks (`exec_script()`) spawn children via `tokio::process::Command` without registering them in `ProcessTracker`. When the daemon's Tokio runtime shuts down, the `await` on the child process is cancelled, but the script's child process may continue running as an orphan (reparented to PID 1). This is acceptable because: (1) the drain phase gives scripts time to finish naturally, (2) orphaned scripts are short-lived cron-like jobs (not long-running daemons), and (3) adding a process group kill would add complexity for an edge case that rarely triggers. The drain summary's "aborted" count reflects tasks still tracked by `active_work` at SIGTERM time — it's a best-effort count since Script tasks may actually complete on their own after the daemon exits.
+
+**Drain rollback:** If the restart or stop command fails *after* sending `Drain` but *before* sending SIGTERM (e.g., hook write failure, signal failure), the CLI performs a full rollback:
+
+1. **Clean up control files** — Remove any files written during the failed attempt: `restart-hooks.json` (if written by this attempt), `restart-pending.json` (if written by this attempt), `stop-sentinel` (if written by this attempt). Without this, stale files could trigger unintended behavior: the wrapper could rebuild on next crash restart, or a follow-on hook could fire into the wrong context, or a stop sentinel could cause the wrapper to exit unexpectedly.
+2. **Send `Undrain`** — Restore `DaemonState.draining = false` so the daemon resumes accepting new work. Without this, a failed restart would leave the daemon alive but permanently rejecting new work.
+
+The `Undrain` command is a no-op if the daemon isn't draining. The CLI wraps the post-drain steps in error handling that performs both cleanup steps on any failure. Implementation: the CLI tracks which files it wrote (via a `Vec<PathBuf>` or similar) and removes them in the error handler before sending `Undrain`.
+
+**Drain timeout defaults:** 120s for restart (agents often take 30-60s per run), 30s for stop. Configurable via `--drain-timeout <secs>`.
+
+**Socket-down fallback:** If the Unix socket is unreachable (daemon API crashed, socket file missing, connection refused) but the process is alive (PID check passes), the CLI skips the drain phase entirely and proceeds directly to SIGTERM with a warning: "Warning: Could not connect to daemon socket. Skipping drain — active work may be interrupted." This handles the edge case where the daemon is alive but its socket listener is broken. The status command already has a socket-failure fallback (PID file check); stop and restart now follow the same pattern for the drain step.
+
+**Drain summary:** The CLI tracks drain progress and computes a summary: `initial_active_work` (from Drain response) minus `final_active_work` (from last Health poll before SIGTERM) = finished; `final_active_work` = aborted. This summary is prepended to the follow-on prompt (if any) and printed in the CLI output.
+
+**DaemonApi access to DaemonState:** The `DaemonApi` gains an `Arc<DaemonState>` parameter (in addition to `HealthConfig` and `Option<SchedulerHandle>`). It reads `daemon_state.active_work()` for the `active_work` field in Health responses, and `daemon_state.is_draining()` for the `draining` field. Both are lock-free atomic reads — no contention.
+
 ### Restart Command (Standalone Mode)
 
 ```
 threshold daemon restart [--skip-build] [--data-dir <path>] \
+    [--drain-timeout <secs>] \
     [--follow-on-conversation <uuid> --follow-on-prompt <text>]
 ```
 
@@ -307,17 +481,19 @@ threshold daemon restart [--skip-build] [--data-dir <path>] \
 
 **Steps:**
 
-1. **Resolve data dir** — from `--data-dir`, `THRESHOLD_DATA_DIR`, or default `~/.threshold`
+1. **Resolve data dir** — canonical chain: `--data-dir` → `THRESHOLD_DATA_DIR` → `THRESHOLD_CONFIG` (config file) → `~/.threshold`
 2. **Acquire restart lock** — `flock()` on `$DATA_DIR/state/restart.lock` (blocking, 60s timeout). If the lock cannot be acquired, error: "Another restart or stop operation is in progress."
 3. **Verify daemon is running** — Read PID file, check process alive, validate it's a Threshold process (same `is_threshold_process()` check used at startup). Error if PID is stale or belongs to a different process.
 4. **Build first** (unless `--skip-build`) — Run `cargo build -p threshold` from the repository root. If the build fails, **abort the restart immediately** and return the compiler error output. The running daemon is never touched.
 5. **Detect supervised mode** — Check for `$DATA_DIR/state/supervised` marker. If present, delegate to supervised restart (see below).
-6. **Write follow-on hook** (if provided) — Atomic write to `$DATA_DIR/state/restart-hooks.json` (write to temp file, then rename). The restart lock guarantees no concurrent writer.
-7. **Send SIGTERM** — `kill(pid, SIGTERM)` (only after identity validation in step 3)
-8. **Wait for exit** — Poll process existence, timeout after 30 seconds
-9. **Start new daemon** — Spawn the freshly built binary as a detached process using its **absolute path** (`{repo_root}/target/debug/threshold daemon start`), not a bare `threshold` that would resolve via PATH. The repo root is determined by `find_repo_root()`, which uses two strategies: (1) walk up from `cwd` looking for `Cargo.toml` with `[workspace]`, (2) if that fails, resolve the running binary's path via `std::env::current_exe()` and walk up from there (the binary is at `{repo_root}/target/debug/threshold`). This ensures restart works even when invoked from outside the repo directory.
-10. **Wait for healthy** — Poll `Health` command via Unix socket, timeout after 60 seconds
-11. **Report success** — Print new PID, build time, startup time
+6. **Drain active work** — Send `Drain` command via Unix socket. The daemon enters drain mode (stops accepting new work). Record `initial_active_work` from the response.
+7. **Wait for drain** — Poll `Health` until `active_work == 0` (timeout: `--drain-timeout`, default 120s). Print progress: "Draining: 2 active runs remaining..." If timeout expires, record `final_active_work` and proceed — remaining runs will be aborted during shutdown.
+8. **Write follow-on hook** (if provided) — Atomic write to `$DATA_DIR/state/restart-hooks.json` (write to temp file, then rename). If runs were active, prepend drain summary to follow-on prompt. The restart lock guarantees no concurrent writer.
+9. **Send SIGTERM** — `kill(pid, SIGTERM)` (only after identity validation in step 3). The daemon's shutdown path cancels streaming Claude runs via `ProcessTracker` and drops the `CancellationToken`. Script task children not tracked by `ProcessTracker` may outlive the daemon as orphans (see Drain section caveats).
+10. **Wait for exit** — Poll process existence, timeout after 30 seconds
+11. **Start new daemon** — Spawn the freshly built binary as a detached process using its **absolute path** (`{repo_root}/target/debug/threshold daemon start`), not a bare `threshold` that would resolve via PATH. The repo root is determined by `find_repo_root()`, which uses two strategies: (1) walk up from `cwd` looking for `Cargo.toml` with `[workspace]`, (2) if that fails, resolve the running binary's path via `std::env::current_exe()` and walk up from there (the binary is at `{repo_root}/target/debug/threshold`). This ensures restart works even when invoked from outside the repo directory.
+12. **Wait for healthy** — Poll `Health` command via Unix socket, timeout after 60 seconds
+13. **Report success** — Print new PID, build time, drain summary (e.g., "3 runs drained, 0 aborted"), startup time
 
 ### Restart Command (Supervised Mode)
 
@@ -325,25 +501,29 @@ The same safety invariant applies: the build happens in the CLI *before* SIGTERM
 
 When the supervised marker is detected:
 
-1. Build already succeeded in step 3 above (before mode detection)
-2. Write `restart-pending.json` to `$DATA_DIR/state/` (atomic write) — with `skip_build: true` since the CLI already built successfully
-3. Write follow-on hook (if provided)
-4. Send SIGTERM to daemon PID
-5. Print: "Restart signal sent (build succeeded). The supervisor will restart the daemon."
-6. Exit — the wrapper starts the new binary without rebuilding
+1. Build already succeeded in step 4 above (before mode detection)
+2. **Drain active work** — Send `Drain` command via Unix socket. Record `initial_active_work`.
+3. **Wait for drain** — Poll `Health` until `active_work == 0` (timeout: `--drain-timeout`, default 120s). Print progress. If timeout expires, proceed — streaming runs cancelled, script children may orphan.
+4. Write `restart-pending.json` to `$DATA_DIR/state/` (atomic write) — with `skip_build: true` since the CLI already built successfully
+5. Write follow-on hook (if provided, with drain summary prepended)
+6. Send SIGTERM to daemon PID
+7. Print: "Restart signal sent (build succeeded, N runs drained, M aborted). The supervisor will restart the daemon."
+8. Exit — the wrapper starts the new binary without rebuilding
 
 ### Stop Command
 
 ```
-threshold daemon stop [--data-dir <path>]
+threshold daemon stop [--data-dir <path>] [--drain-timeout <secs>]
 ```
 
 1. Acquire restart lock (`flock()` on `$DATA_DIR/state/restart.lock`, same as restart command)
 2. Read PID file, validate process identity (same `is_threshold_process()` check)
-3. If supervised mode: write `$DATA_DIR/state/stop-sentinel` file
-4. Send SIGTERM (only after identity validation)
-5. Wait for process exit (timeout 30s)
-6. Print: "Daemon stopped."
+3. **Drain active work** — Send `Drain` command via Unix socket. Record `initial_active_work`.
+4. **Wait for drain** — Poll `Health` until `active_work == 0` (timeout: `--drain-timeout`, default 30s). Print progress. If timeout expires, proceed — streaming Claude runs are cancelled via `ProcessTracker`; script task children may outlive the daemon as orphans.
+5. If supervised mode: write `$DATA_DIR/state/stop-sentinel` file
+6. Send SIGTERM (only after identity validation)
+7. Wait for process exit (timeout 30s)
+8. Print: "Daemon stopped. (N runs drained, M aborted)" — or just "Daemon stopped." if no runs were active.
 
 Under supervised mode, the stop sentinel tells the wrapper script to exit its loop instead of restarting the daemon.
 
@@ -365,12 +545,24 @@ A follow-on hook is a file-based message queue that survives daemon restarts. Be
 pub struct RestartHook {
     /// Conversation to resume after restart.
     pub conversation_id: ConversationId,
-    /// Prompt to inject into the conversation.
+    /// Prompt to inject into the conversation (drain summary is prepended by the CLI
+    /// before writing, so this field contains the full prompt including summary).
     pub prompt: String,
     /// When the hook was created.
     pub created_at: DateTime<Utc>,
     /// Who requested the restart (for audit trail).
     pub requested_by: Option<String>,
+    /// Drain statistics at the time of restart, if any work was active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_summary: Option<DrainSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrainSummary {
+    /// Number of active work items that completed during drain.
+    pub finished: u32,
+    /// Number of active work items aborted (drain timeout expired).
+    pub aborted: u32,
 }
 ```
 
@@ -620,11 +812,11 @@ exit 0
 
 ### Restart Pending File
 
-Written by `threshold daemon restart` in supervised mode:
+Written by `threshold daemon restart` in supervised mode. Since the CLI builds *before* signaling, `skip_build` is normally `true`:
 
 ```json
 {
-    "skip_build": false,
+    "skip_build": true,
     "requested_at": "2026-02-25T23:00:00Z",
     "requested_by": "agent:general-assistant"
 }
@@ -719,9 +911,11 @@ threshold imagegen <subcommand>
 
 ```
 threshold daemon start [--config <path>]           # Renamed from bare `daemon`
-threshold daemon stop [--data-dir <path>]           # Send SIGTERM, wait for exit
-threshold daemon restart [--data-dir <path>]        # Stop + optional build + start
+threshold daemon stop [--data-dir <path>]           # Drain + SIGTERM, wait for exit
+                      [--drain-timeout <secs>]
+threshold daemon restart [--data-dir <path>]        # Drain + stop + optional build + start
                          [--skip-build]
+                         [--drain-timeout <secs>]
                          [--follow-on-conversation <uuid>]
                          [--follow-on-prompt <text>]
 threshold daemon status [--data-dir <path>]         # Show daemon health info
@@ -740,23 +934,32 @@ enum DaemonAction {
         #[arg(short, long)]
         config: Option<String>,
     },
-    /// Stop the running daemon gracefully via SIGTERM
+    /// Stop the running daemon gracefully. Drains active runs before
+    /// sending SIGTERM — in-flight conversations finish cleanly.
     Stop {
-        /// Data directory (default: $THRESHOLD_DATA_DIR or ~/.threshold)
+        /// Data directory (default: $THRESHOLD_DATA_DIR / $THRESHOLD_CONFIG / ~/.threshold)
         #[arg(long)]
         data_dir: Option<String>,
+        /// Max seconds to wait for active runs to finish before forcing
+        /// shutdown (default: 30)
+        #[arg(long, default_value = "30")]
+        drain_timeout: u64,
     },
     /// Rebuild from source, then restart the daemon. Build runs BEFORE
-    /// shutdown — if it fails, the running daemon is untouched. Use
-    /// --follow-on-conversation and --follow-on-prompt to resume an
-    /// agent conversation after restart.
+    /// shutdown — if it fails, the running daemon is untouched. Active
+    /// runs are drained before SIGTERM. Use --follow-on-conversation
+    /// and --follow-on-prompt to resume an agent conversation after restart.
     Restart {
-        /// Data directory (default: $THRESHOLD_DATA_DIR or ~/.threshold)
+        /// Data directory (default: $THRESHOLD_DATA_DIR / $THRESHOLD_CONFIG / ~/.threshold)
         #[arg(long)]
         data_dir: Option<String>,
         /// Skip cargo build (restart with existing binary)
         #[arg(long)]
         skip_build: bool,
+        /// Max seconds to wait for active runs to finish before forcing
+        /// shutdown (default: 120)
+        #[arg(long, default_value = "120")]
+        drain_timeout: u64,
         /// Conversation ID to receive the follow-on prompt after restart
         #[arg(long, requires = "follow_on_prompt")]
         follow_on_conversation: Option<String>,
@@ -767,13 +970,13 @@ enum DaemonAction {
     },
     /// Show daemon status: PID, uptime, version, scheduler task counts
     Status {
-        /// Data directory (default: $THRESHOLD_DATA_DIR or ~/.threshold)
+        /// Data directory (default: $THRESHOLD_DATA_DIR / $THRESHOLD_CONFIG / ~/.threshold)
         #[arg(long)]
         data_dir: Option<String>,
     },
     /// Install as a macOS launchd service for auto-start on boot
     Install {
-        /// Data directory (default: $THRESHOLD_DATA_DIR or ~/.threshold)
+        /// Data directory (default: $THRESHOLD_DATA_DIR / $THRESHOLD_CONFIG / ~/.threshold)
         #[arg(long)]
         data_dir: Option<String>,
     },
@@ -782,13 +985,22 @@ enum DaemonAction {
 }
 ```
 
-All management actions (`stop`, `restart`, `status`, `install`) accept `--data-dir` for non-default data directory locations. The data dir is resolved in order: `--data-dir` flag → `THRESHOLD_DATA_DIR` env var → `~/.threshold` default. The PID file and socket path are derived from the data dir.
+All management actions (`stop`, `restart`, `status`, `install`) accept `--data-dir` for non-default data directory locations. The PID file and socket path are derived from the data dir.
 
-**Data dir consistency:** The daemon start command resolves data_dir from `ThresholdConfig.data_dir()` (config file field → `~/.threshold`). To ensure management commands can always find the running daemon, the daemon **exports `THRESHOLD_DATA_DIR`** as an environment variable on startup (set to its resolved data_dir value). This means child processes (including CLI commands spawned by agents) inherit the correct data dir.
+**Canonical data-dir resolution order** (used by all management commands and `DaemonClient`):
 
-However, the env var only propagates to child processes — it doesn't help a user running `threshold daemon status` from a separate shell. For this case, management commands use a full resolution chain: `--data-dir` flag → `THRESHOLD_DATA_DIR` env var → **`THRESHOLD_CONFIG` env var / `--config` flag** (load config, read `data_dir` field) → `~/.threshold` default. The config fallback step ensures that if someone has a custom data_dir in their config file, management commands can still find the daemon even without the env var being set. The `DaemonClient` uses the same resolution chain for its socket path (not hardcoded).
+1. `--data-dir` CLI flag (explicit override)
+2. `THRESHOLD_DATA_DIR` env var (set by daemon on startup, inherited by child processes)
+3. `THRESHOLD_CONFIG` env var → load config file → read `data_dir` field (fallback for separate shells)
+4. `~/.threshold` default
 
-In practice, the common cases are: (a) default `~/.threshold` — everything works with no flags, (b) agent-spawned commands — env var is inherited, (c) manual commands with custom data dir — user passes `--data-dir` or has `THRESHOLD_DATA_DIR` in their shell profile.
+This single chain is used everywhere: `resolve_data_dir()` helper, `DaemonClient` socket path, Phase 16B status, Phase 16C stop/restart. Management subcommands do not expose a `--config` flag — the `THRESHOLD_CONFIG` env var is checked automatically as step 3 in the resolution chain.
+
+**Data dir consistency:** The `daemon start` command resolves data_dir from `ThresholdConfig.data_dir()` (config file field → `~/.threshold`). On startup, the daemon **exports both `THRESHOLD_DATA_DIR` and `THRESHOLD_CONFIG`** as environment variables so child processes (including CLI commands spawned by agents) inherit the correct paths — steps 2 and 3 above.
+
+The env vars only propagate to child processes — they don't help a user running `threshold daemon status` from a separate shell. For that case, the user either: (a) relies on the `~/.threshold` default (step 4), (b) passes `--data-dir` explicitly (step 1), or (c) sets `THRESHOLD_DATA_DIR` or `THRESHOLD_CONFIG` in their shell profile (steps 2/3).
+
+In practice, the common cases are: (a) default `~/.threshold` — everything works with no flags, (b) agent-spawned commands — env vars inherited, (c) manual commands with custom data dir — user passes `--data-dir` or has env vars in their shell profile.
 
 **Help flags:** Clap auto-generates `-h` and `--help` for every subcommand. This is the primary discovery mechanism for agents — they don't need to memorize the CLI interface. An agent can run `threshold --help` to see all top-level commands, `threshold daemon --help` to see all daemon actions, and `threshold daemon restart --help` to see restart-specific flags. The `/// doc comments` on the `DaemonAction` variants and `#[arg(...)]` fields become the help text, so they should be written as clear, concise descriptions suitable for both human and agent consumption.
 
@@ -809,19 +1021,20 @@ Agent (in a Claude CLI conversation):
 
   Standalone mode:
     3. The CLI builds first — if build fails, returns error and daemon stays running
-    4. On build success: CLI stops daemon, starts new binary, waits for health check
-    5. Returns: "Daemon restarted (PID 12345, build: 8.2s, startup: 1.3s)"
+    4. On build success: CLI drains active work (other agents' runs finish)
+    5. CLI stops daemon, starts new binary, waits for health check
+    6. Returns: "Daemon restarted (PID 12345, build: 8.2s, 2 runs drained, startup: 1.3s)"
 
   Supervised mode:
     3. The CLI builds first — if build fails, returns error and daemon stays running
-    4. On build success: writes restart-pending.json (skip_build: true) and sends SIGTERM
-    5. Returns: "Restart signal sent (build succeeded). The supervisor will restart."
+    4. On build success: CLI drains active work, then writes restart-pending.json and sends SIGTERM
+    5. Returns: "Restart signal sent (build succeeded, 2 runs drained). The supervisor will restart."
     6. The wrapper starts the new binary without rebuilding
 
 After restart (both modes):
   - New daemon processes the follow-on hook
-  - Agent's conversation receives the follow-on prompt
-  - Agent picks up: "Restart confirmed. Running tests to verify the fix..."
+  - Agent's conversation receives the follow-on prompt (with drain summary if runs were active)
+  - Agent picks up: "2 runs drained, 0 aborted. Restart confirmed. Running tests to verify..."
 ```
 
 The conversation ID is available to the agent via its conversation context. The `memory.md` file for each conversation is at `$DATA_DIR/conversations/{conversation_id}/memory.md`, so the agent can look up or infer its own conversation ID.
@@ -856,18 +1069,41 @@ The conversation ID is available to the agent via its conversation context. The 
 
 | File | Change |
 |------|--------|
-| `crates/core/src/types.rs` | Add `HealthConfig` struct (pid, started_at, version). |
-| `crates/scheduler/src/daemon_api.rs` | Add `DaemonCommand::Health`. Change `scheduler` field to `Option<SchedulerHandle>`. Accept `HealthConfig` in `DaemonApi::new()`. Compute task counts dynamically via `list_tasks()` when scheduler is `Some`. Return `scheduler_disabled` error for schedule commands when `None`. Return health in `DaemonResponse` envelope. |
-| `crates/server/src/main.rs` | **Decouple DaemonApi from scheduler task** — spawn DaemonApi as independent top-level task in `tokio::select!`, not nested inside the scheduler block. Pass `Some(scheduler_handle)` when scheduler is enabled, `None` when disabled. Create `HealthConfig` at startup, pass to `DaemonApi`. Restructure `Commands::Daemon` to use `DaemonAction` subcommand enum. Implement `DaemonAction::Status` — connect to socket, send `Health`, format output. **Export `THRESHOLD_DATA_DIR`** env var on startup (resolved data_dir value) for child process consistency. |
-| `crates/server/src/daemon_client.rs` | Accept configurable socket path (resolve via `--data-dir` → `THRESHOLD_DATA_DIR` → `~/.threshold`, not hardcoded). Add `send_health_check()` method — connects to socket, sends `Health` command, returns parsed `DaemonResponse` with health JSON payload. |
+| `crates/core/src/types.rs` | Add `HealthConfig` struct (pid, started_at, version). Add `DaemonState` struct (draining: AtomicBool, active_work: AtomicU32). |
+| `crates/scheduler/src/daemon_api.rs` | Add `DaemonCommand::Health`, `DaemonCommand::Drain`, and `DaemonCommand::Undrain`. Change `scheduler` field to `Option<SchedulerHandle>`. Accept `HealthConfig` and `Arc<DaemonState>` in `DaemonApi::new()`. Compute task counts dynamically via `list_tasks()` when scheduler is `Some`. Include `draining` and `active_work` in Health response. `Drain` sets `DaemonState.draining = true`, `Undrain` resets to false. Return `scheduler_disabled` error for schedule commands when `None`. |
+| `crates/server/src/main.rs` | **Decouple DaemonApi from scheduler task** — spawn DaemonApi as independent top-level task in `tokio::select!`, not nested inside the scheduler block. Pass `Some(scheduler_handle)` when scheduler is enabled, `None` when disabled. Create `HealthConfig` and `Arc<DaemonState>` at startup, pass to `DaemonApi`. Pass `Arc<DaemonState>` to ConversationEngine, Scheduler, Discord, and Web for drain checks and active_work tracking. Restructure `Commands::Daemon` to use `DaemonAction` subcommand enum. Implement `DaemonAction::Status` — connect to socket, send `Health`, format output (including draining state and active work). **Export `THRESHOLD_DATA_DIR` and `THRESHOLD_CONFIG`** env vars on startup for child process consistency. |
+| `crates/server/src/daemon_client.rs` | Accept configurable socket path (canonical resolution chain: `--data-dir` → `THRESHOLD_DATA_DIR` → `THRESHOLD_CONFIG` → `~/.threshold`). Add `send_health_check()` method — connects to socket, sends `Health` command, returns parsed `DaemonResponse` with health JSON payload. Add `send_drain()` method — sends `Drain` command, returns response with initial active_work count. Add `send_undrain()` method — sends `Undrain` to roll back drain on failure. |
+| `crates/conversation/src/engine.rs` | Accept `Option<Arc<DaemonState>>` in constructor. Check `is_draining()` at start of both `handle_message()` and `send_to_conversation()` — return `DaemonDraining` error if draining. In-flight conversations (already streaming) continue to completion. Increment/decrement `DaemonState.active_work` via `WorkGuard` in both `handle_message()` and `send_to_conversation()` (these are separate streaming paths — both need independent tracking). |
+| `crates/scheduler/src/engine.rs` | Accept `Option<Arc<DaemonState>>` in `Scheduler::new()`. Check `is_draining()` in `run_ready_tasks()` — skip firing if draining. |
+| `crates/scheduler/src/execution.rs` | Increment/decrement `DaemonState.active_work` around `exec_script()`, `exec_new_conversation()`, and `exec_script_then_conversation()` — these don't go through ConversationEngine so need their own tracking. (`exec_resume_conversation()` delegates to `engine.send_to_conversation()` which has its own `WorkGuard` — no scheduler-level tracking needed for that path.) |
+| `crates/discord/src/bot.rs` | Accept `Option<Arc<DaemonState>>`. Check `is_draining()` before processing incoming messages. If draining, reply: "Threshold is restarting. Your message will not be processed — please retry in a moment." |
+| `crates/web/src/routes.rs` (or equivalent) | Accept `Arc<DaemonState>` in app state. Check `is_draining()` on action requests (conversation sends, schedule changes). Return 503: "Daemon is restarting." Read-only pages continue working. |
+| `crates/core/src/error.rs` | Add `DaemonDraining` error variant for rejected work during drain. |
 
 **Tests:**
-- `daemon_api::health_returns_uptime` — Send `Health` command to daemon API, verify response envelope includes pid, uptime, version, task counts in `data` field.
+- `daemon_api::health_returns_uptime` — Send `Health` command to daemon API, verify response envelope includes pid, uptime, version, draining, active_work, task counts in `data` field.
 - `daemon_api::health_counts_dynamic` — Add and remove tasks, verify health response reflects current counts.
 - `daemon_api::health_without_scheduler` — Create `DaemonApi` with `scheduler: None`, send `Health`, verify response succeeds with `scheduler_task_count: null`. Send `ScheduleList`, verify `scheduler_disabled` error.
-- `daemon::status_shows_running` — Start daemon, run `threshold daemon status`, verify output includes PID, uptime, version, task counts.
+- `daemon_api::drain_sets_draining_flag` — Send `Drain` command, verify `DaemonState.is_draining()` returns true, verify response includes `active_work`.
+- `daemon_api::health_reflects_draining` — Set draining via `Drain` command, send `Health`, verify `draining: true` in response.
+- `daemon_api::undrain_restores_normal` — Send `Drain`, verify draining. Send `Undrain`, verify `is_draining()` returns false and Health shows `draining: false`.
+- `daemon::restart_failure_undrains` — Start daemon, trigger restart, simulate failure after Drain but before SIGTERM (e.g., hook write error). Verify CLI sends `Undrain` and daemon resumes normal operation (accepts new work). Also verify any control files written before the failure (`restart-hooks.json`, `restart-pending.json`) are cleaned up.
+- `conversation::send_rejected_during_drain` — Set `DaemonState.draining = true`, call `send_to_conversation()`, verify `DaemonDraining` error returned.
+- `conversation::active_work_tracked` — Start a conversation via `handle_message()`, verify `DaemonState.active_work() > 0` during execution, verify it returns to 0 after completion.
+- `scheduler::skip_firing_during_drain` — Set draining, verify `run_ready_tasks()` skips task execution.
+- `scheduler::script_task_tracked` — Execute a Script task, verify `DaemonState.active_work() > 0` during execution.
+- `discord::message_rejected_during_drain` — Set draining, send a Discord message, verify the bot replies with "restarting" message and does NOT start a conversation.
+- `web::action_rejected_during_drain` — Set draining, POST to a conversation send endpoint, verify 503 response.
+- `web::readonly_allowed_during_drain` — Set draining, GET status page, verify 200 response.
+- `daemon::status_shows_running` — Start daemon, run `threshold daemon status`, verify output includes PID, uptime, version, active work, task counts.
 - `daemon::status_shows_not_running` — No daemon running, run status, verify "Not running" output.
 - `daemon::status_shows_scheduler_disabled` — Start daemon with scheduler disabled, run status, verify output shows "Scheduler: disabled".
+- `daemon::status_shows_draining` — Start daemon, send Drain, run status, verify output shows "Status: Draining".
+- `daemon_state::decrement_saturates_at_zero` — Call `decrement_work()` when `active_work == 0`, verify it stays at 0 (saturates) instead of wrapping to `u32::MAX`. In debug builds, verify the debug assertion fires.
+- `conversation::active_work_decrements_on_error` — Start `handle_message()` with input that causes an error (e.g., non-existent conversation ID), verify `active_work` returns to 0 after the error. Ensures the decrement runs even on the error path.
+- `scheduler::script_task_decrements_on_failure` — Execute a Script task that exits non-zero, verify `active_work` returns to 0. Ensures `decrement_work()` is in a `finally`-equivalent (drop guard or `scopeguard`).
+- `scheduler::new_conversation_decrements_on_error` — Execute a NewConversation task that fails (e.g., bad model config), verify `active_work` returns to 0.
+- `conversation::active_work_decrements_on_abort` — Start `handle_message()`, abort the run mid-stream via `ProcessTracker`, verify `active_work` returns to 0 after abort completes.
 - `daemon_api::health_config_serde_round_trip` — Serialize and deserialize `HealthConfig`.
 
 ### Phase 16C — Stop, Restart, and Follow-On Hooks
@@ -878,13 +1114,22 @@ The conversation ID is available to the agent via its conversation context. The 
 
 | File | Change |
 |------|--------|
-| `crates/core/src/types.rs` | Add `RestartHook` struct (conversation_id, prompt, created_at, requested_by). |
-| `crates/server/src/main.rs` | Implement `DaemonAction::Stop` (detect supervised mode, write stop sentinel if needed, send SIGTERM, wait for exit). Implement `DaemonAction::Restart` (detect mode, write hooks atomically, write restart-pending if supervised, stop + build + start if standalone, poll health). Add `resolve_data_dir()`, `find_repo_root()`, `write_hooks_atomic()`, `detect_supervised()`, `wait_for_process_exit()`, `wait_for_healthy()` helpers. Add `process_restart_hooks()` — on startup, read hooks, process sequentially via `send_to_conversation()`, preserve failed hooks. |
+| `crates/core/src/types.rs` | Add `RestartHook` struct (conversation_id, prompt, created_at, requested_by). Add optional `drain_summary` field to `RestartHook` (finished, aborted counts). |
+| `crates/server/src/main.rs` | Implement `DaemonAction::Stop` (send `Drain`, poll Health until drained or timeout, detect supervised mode, write stop sentinel if needed, send SIGTERM, wait for exit, print drain summary). Implement `DaemonAction::Restart` (build first, send `Drain`, poll Health until drained or timeout, detect mode, write hooks atomically with drain summary, write restart-pending if supervised, stop + start if standalone, poll health). Add `resolve_data_dir()`, `find_repo_root()`, `write_hooks_atomic()`, `detect_supervised()`, `wait_for_process_exit()`, `wait_for_healthy()`, `drain_and_wait()`, `rollback_on_failure()` helpers. `rollback_on_failure()` removes any control files written during the failed attempt and sends `Undrain`. Add `process_restart_hooks()` — on startup, read hooks, process sequentially via `send_to_conversation()`, preserve failed hooks. |
 | `crates/scheduler/src/task.rs` | Add `one_shot: bool` field to `ScheduledTask` (with `#[serde(default)]`). |
 | `crates/scheduler/src/engine.rs` | After task completion, if `one_shot`, remove the task from `self.tasks` and persist. |
 
 **Tests:**
 - `daemon::restart_aborts_on_build_failure` — Start daemon, trigger restart with a simulated build failure (e.g., mock cargo returning non-zero), verify daemon is still running (PID unchanged, health check passes), verify CLI returned the build error.
+- `daemon::restart_drains_before_sigterm` — Start daemon with an active run (mock long-running conversation), trigger restart. Verify Drain command sent, active_work polled via Health, SIGTERM sent only after active_work == 0.
+- `daemon::restart_drain_timeout_proceeds` — Start daemon with an active run that never finishes, trigger restart with `--drain-timeout 2`. Verify restart proceeds after timeout, drain summary shows aborted count.
+- `daemon::restart_drain_summary_in_follow_on` — Trigger restart with active runs and `--follow-on-prompt`. Verify the written hook includes drain summary prepended to the prompt.
+- `daemon::stop_drains_before_sigterm` — Start daemon with active runs, run stop. Verify Drain sent and waited for before SIGTERM.
+- `daemon::stop_failure_undrains` — Start daemon, trigger stop, simulate failure after Drain but before SIGTERM (e.g., signal send error). Verify CLI sends `Undrain` and daemon resumes normal operation. Also verify `stop-sentinel` (if written) is cleaned up.
+- `daemon::stop_skips_drain_on_socket_failure` — Start daemon, remove socket file, trigger stop. Verify stop proceeds (skips drain, sends SIGTERM directly) with warning message.
+- `daemon::restart_skips_drain_on_socket_failure` — Start daemon, remove socket file, trigger restart. Verify restart proceeds (skips drain, sends SIGTERM directly) with warning message.
+- `daemon::restart_rollback_cleans_hooks` — Trigger restart with `--follow-on-prompt`, simulate failure after hook file is written but before SIGTERM (e.g., inject signal send error). Verify `restart-hooks.json` is removed and `Undrain` is sent.
+- `daemon::restart_rollback_cleans_pending` — In supervised mode, trigger restart, simulate failure after `restart-pending.json` is written. Verify the file is removed and `Undrain` is sent.
 - `daemon::restart_lock_serializes_concurrent` — Acquire restart lock in test, spawn `threshold daemon restart` in background, verify it blocks (doesn't send SIGTERM while lock is held), release lock, verify restart proceeds.
 - `daemon::stop_sends_sigterm` — Start daemon in background, run stop, verify process exits.
 - `daemon::stop_writes_sentinel_in_supervised_mode` — Set supervised marker, run stop, verify sentinel file created.
@@ -928,6 +1173,7 @@ All new persisted fields use serde defaults:
 - `ScheduledTask.one_shot: bool` — `#[serde(default)]`, defaults to `false`. Existing tasks are unaffected.
 - `RestartHook` — New file, no backward compat concern.
 - `HealthConfig` — Static config struct, runtime-only (not persisted across restarts), no backward compat concern.
+- `DaemonState` — Runtime-only struct (`AtomicBool` + `AtomicU32`), no backward compat concern.
 - `restart-pending.json`, `restart-hooks.json`, `stop-sentinel` — New files, no backward compat concern.
 - `threshold.pid` — New file, no backward compat concern.
 
@@ -945,16 +1191,18 @@ cargo build --workspace               # Full compilation
 
 Manual testing sequence:
 1. Start daemon normally: `threshold daemon start` — verify PID file written
-2. Check status: `threshold daemon status` — verify health info displayed
-3. Stop daemon: `threshold daemon stop` — verify clean shutdown, PID file removed
-4. Restart (standalone): `threshold daemon restart` — verify rebuild, restart, health check
-5. Restart with follow-on: `threshold daemon restart --follow-on-conversation <id> --follow-on-prompt "test"` — verify hook processed after restart, conversation receives message
-6. Install launchd: `threshold daemon install` — verify plist created
-7. Wrapper test: run `scripts/threshold-wrapper.sh`, trigger restart via `threshold daemon restart`, verify wrapper rebuilds and restarts
-8. Wrapper stop: run `threshold daemon stop` under wrapper, verify wrapper exits (stop sentinel)
-9. Reboot test: restart machine, verify daemon starts automatically
-10. Agent restart: in a conversation, agent runs `threshold daemon restart --follow-on-conversation <id> --follow-on-prompt "Restart complete. Verify the fix took effect."` — verify daemon restarts and conversation resumes
-11. Uninstall: `threshold daemon uninstall` — verify plist removed
+2. Check status: `threshold daemon status` — verify health info displayed (including active runs)
+3. Drain test: start a conversation run, run `threshold daemon status`, verify "Active: 1 runs"
+4. Stop daemon: `threshold daemon stop` — verify drain phase (waits for runs), clean shutdown, PID file removed
+5. Stop with timeout: start a long-running conversation, `threshold daemon stop --drain-timeout 5` — verify it aborts after 5s and reports aborted count
+6. Restart (standalone): `threshold daemon restart` — verify rebuild, drain, restart, health check
+7. Restart with follow-on: `threshold daemon restart --follow-on-conversation <id> --follow-on-prompt "test"` — verify drain summary prepended to hook, hook processed after restart, conversation receives message
+8. Install launchd: `threshold daemon install` — verify plist created
+9. Wrapper test: run `scripts/threshold-wrapper.sh`, trigger restart via `threshold daemon restart`, verify wrapper rebuilds and restarts
+10. Wrapper stop: run `threshold daemon stop` under wrapper, verify wrapper exits (stop sentinel)
+11. Reboot test: restart machine, verify daemon starts automatically
+12. Agent restart: in a conversation, agent runs `threshold daemon restart --follow-on-conversation <id> --follow-on-prompt "Restart complete. Verify the fix took effect."` — verify daemon drains, restarts, and conversation resumes with drain summary
+13. Uninstall: `threshold daemon uninstall` — verify plist removed
 
 ---
 
@@ -962,13 +1210,17 @@ Manual testing sequence:
 
 | File | Action | Phase |
 |------|--------|-------|
-| `crates/server/src/main.rs` | PID file, SIGTERM, DaemonAction enum, status/stop/restart/install/uninstall commands, restart hook processing, health state creation | 16A, 16B, 16C, 16D |
-| `crates/core/src/error.rs` | Add `DaemonAlreadyRunning { pid: u32 }` variant | 16A |
-| `crates/core/src/types.rs` | Add `RestartHook` struct, add `HealthConfig` struct | 16B, 16C |
-| `crates/scheduler/src/daemon_api.rs` | Add `Health` command, accept `HealthConfig`, change `scheduler` to `Option<SchedulerHandle>`, handle scheduler-disabled errors | 16B |
+| `crates/server/src/main.rs` | PID file, SIGTERM, DaemonAction enum, status/stop/restart/install/uninstall commands, restart hook processing, health state creation, DaemonState wiring to all subsystems, drain in stop/restart | 16A, 16B, 16C, 16D |
+| `crates/core/src/error.rs` | Add `DaemonAlreadyRunning { pid: u32 }` variant, add `DaemonDraining` variant | 16A, 16B |
+| `crates/core/src/types.rs` | Add `HealthConfig` struct, add `DaemonState` struct (draining: `AtomicBool`, active_work: `AtomicU32`), add `RestartHook` struct with `DrainSummary` | 16B, 16C |
+| `crates/scheduler/src/daemon_api.rs` | Add `Health`, `Drain`, and `Undrain` commands, accept `HealthConfig`/`Arc<DaemonState>`, change `scheduler` to `Option<SchedulerHandle>`, include draining/active_work in Health, handle scheduler-disabled errors | 16B |
+| `crates/conversation/src/engine.rs` | Accept `Option<Arc<DaemonState>>`, check `is_draining()` in both `handle_message()` and `send_to_conversation()`, track `active_work` via `WorkGuard` in both paths | 16B |
+| `crates/scheduler/src/engine.rs` | Accept `Option<Arc<DaemonState>>`, check `is_draining()` in `run_ready_tasks()`. One-shot task auto-deletion after execution | 16B, 16C |
+| `crates/scheduler/src/execution.rs` | Track `active_work` for Script, NewConversation, ScriptThenConversation tasks | 16B |
+| `crates/discord/src/bot.rs` | Accept `Option<Arc<DaemonState>>`, reject messages during drain | 16B |
+| `crates/web/src/routes.rs` | Accept `Arc<DaemonState>` in app state, return 503 on actions during drain | 16B |
 | `crates/scheduler/src/task.rs` | Add `one_shot: bool` field (`#[serde(default)]`) | 16C |
-| `crates/scheduler/src/engine.rs` | One-shot task auto-deletion after execution | 16C |
-| `crates/server/src/daemon_client.rs` | Configurable socket path (not hardcoded), add `send_health_check()` | 16B |
+| `crates/server/src/daemon_client.rs` | Configurable socket path (canonical resolution chain), add `send_health_check()`, `send_drain()`, and `send_undrain()` | 16B |
 | `scripts/threshold-wrapper.sh` | New: restart loop wrapper script with stop sentinel, supervised marker, rebuild support | 16D |
 | `Cargo.toml` (server) | Add `libc` dependency | 16A |
 
@@ -996,10 +1248,22 @@ Manual testing sequence:
 
 10. **Why a wrapper script instead of pure launchd KeepAlive?** — launchd's `KeepAlive` would restart the daemon immediately, but it can't run `cargo build` first. The wrapper checks `restart-pending.json` and conditionally rebuilds before restarting. It also handles the stop sentinel logic. The plist uses `KeepAlive/SuccessfulExit=false` so launchd restarts the *wrapper* if it crashes unexpectedly (non-zero exit), but leaves it down on intentional stop (exit 0 via stop sentinel).
 
-11. **How are health check fields scoped?** — `HealthConfig` stores static fields set at startup: PID, start time, version. Scheduler task counts are computed dynamically per health request by calling `list_tasks()` on the `SchedulerHandle`, so they always reflect the current state. Fields requiring cross-crate queries (Discord connection status, active conversation count) are deferred to a future milestone to avoid coupling the daemon API to every subsystem.
+11. **How are health check fields scoped?** — `HealthConfig` stores static fields set at startup: PID, start time, version. Scheduler task counts are computed dynamically per health request by calling `list_tasks()` on the `SchedulerHandle`, so they always reflect the current state. `active_work` and `draining` are read from `DaemonState` (lock-free atomics). Fields requiring other cross-crate queries (Discord connection status) are deferred to a future milestone.
 
 12. **Should daemon management work when the scheduler is disabled?** — Yes. The DaemonApi (Unix socket listener) is decoupled from the scheduler and always starts as an independent top-level task. Health, status, stop, and restart all work regardless of scheduler config. Scheduler-specific commands return a `scheduler_disabled` error when the scheduler is not enabled. See the Health Check section for details.
 
-13. **What is the single source of truth for data dir?** — The resolution order is: `--data-dir` CLI flag → `THRESHOLD_DATA_DIR` env var → `~/.threshold` default. The config file's `data_dir` field is used by `daemon start` to resolve the working data dir, which is then exported as `THRESHOLD_DATA_DIR` so child processes (CLI commands spawned by agents) inherit it. Management commands use the same resolution order. The env var is the bridge between config-driven and flag-driven resolution.
+13. **What is the single source of truth for data dir?** — The canonical resolution chain is: (1) `--data-dir` CLI flag → (2) `THRESHOLD_DATA_DIR` env var → (3) `THRESHOLD_CONFIG` env var (load config, read `data_dir` field) → (4) `~/.threshold` default. This single chain is used by all management commands and `DaemonClient`. The daemon exports both `THRESHOLD_DATA_DIR` and `THRESHOLD_CONFIG` at startup so child processes inherit them (steps 2 and 3). See "Canonical data-dir resolution order" in the CLI Subcommand Changes section for full details.
 
-14. **In supervised mode, does restart return only after health is green?** — No. In supervised mode, the CLI returns immediately after signaling (SIGTERM sent, wrapper will handle the rest). The agent gets continuity via the follow-on hook, not via the CLI's return value. In standalone mode, the CLI blocks until health is green. This is intentional: the supervised wrapper is the authority in supervised mode, and having the CLI also wait would create two processes competing to verify startup.
+14. **In supervised mode, does restart return only after health is green?** — No. In supervised mode, the CLI returns immediately after signaling (SIGTERM sent, wrapper will handle the rest). The agent gets continuity via the follow-on hook, not via the CLI's return value. In standalone mode, the CLI blocks until health is green. This is intentional: the supervised wrapper is the authority in supervised mode, and having the CLI also wait would create two processes competing to verify startup. Note: the drain phase *does* block in both modes — the CLI waits for active runs to finish before sending SIGTERM.
+
+15. **What happens to in-flight work during restart/stop?** — The daemon enters a "draining" state before SIGTERM is sent. In drain mode: new work is rejected (scheduler skips firing, Discord replies with "restarting", web returns 503), but in-flight conversations continue running until they complete naturally or the drain timeout expires. The CLI polls Health for `active_work == 0`. If the timeout expires, SIGTERM is sent and the daemon's shutdown path cancels streaming Claude runs via `ProcessTracker` and drops the `CancellationToken`. Script task children not tracked by `ProcessTracker` may outlive the daemon as orphans (see Drain section caveats). The drain summary (N finished, M aborted) is included in CLI output and prepended to follow-on hooks — the "aborted" count is best-effort since some tasks may complete after the daemon exits. This gives safety (most runs complete) with bounded latency (restart won't hang forever). Default drain timeout: 120s for restart (agents often run 30-60s), 30s for stop.
+
+16. **Why not use `ProcessTracker::count()` for active work?** — `ProcessTracker` only tracks streaming Claude CLI processes (for abort support). It misses scheduler Script tasks, NewConversation (non-streaming path), and ScriptThenConversation — all of which represent active work that should complete before shutdown. `DaemonState.active_work` is a unified `AtomicU32` counter incremented at each work entry point: `ConversationEngine::handle_message()` (user-initiated conversations), `ConversationEngine::send_to_conversation()` (scheduler `ResumeConversation`, follow-on hooks), `exec_script()`, `exec_new_conversation()`, and `exec_script_then_conversation()`. Note: `handle_message()` and `send_to_conversation()` are separate streaming paths — both need independent `WorkGuard` tracking. `exec_resume_conversation()` delegates to `send_to_conversation()` which tracks it — no double-counting at the scheduler level. `ProcessTracker` is retained for abort support, not for drain tracking.
+
+17. **Do Discord and Web need drain checks?** — Yes, for correctness. Without drain checks, new Discord messages or web actions could start conversations during the drain window, extending or defeating the drain. The checks are trivial (one `AtomicBool` read) and the error messages are clear: Discord gets a human-readable reply, web gets 503. Read-only web pages (status, conversation list) continue working during drain.
+
+18. **What if the restart/stop fails after Drain?** — The CLI sends `Undrain` to roll back the draining state, restoring the daemon to normal operation. Without this, a failed restart (e.g., hook write error, signal failure) would leave the daemon alive but permanently rejecting new work. `Undrain` resets `DaemonState.draining = false`. If the socket is unreachable, the drain phase is skipped entirely (see socket-down fallback), so there's nothing to roll back.
+
+19. **What if the socket is down during stop/restart?** — If the daemon process is alive (PID check passes) but the Unix socket is unreachable (connection refused, file missing), the CLI skips the drain phase and proceeds directly to SIGTERM with a warning. This handles edge cases like a crashed socket listener. Active work may be interrupted, but the alternative — refusing to stop/restart — is worse. The status command already has this fallback pattern.
+
+20. **Why don't Script tasks register in ProcessTracker for clean abort?** — `ProcessTracker` is designed for streaming Claude CLI processes that support abort signaling. Script tasks are arbitrary shell commands (`tokio::process::Command`) with no standard cancellation protocol — there's no guarantee a script responds cleanly to SIGTERM. Adding script PID tracking and kill-on-shutdown is possible but adds complexity for marginal benefit: (1) the drain phase gives scripts time to complete naturally, (2) scripts are typically short cron-like jobs, (3) orphaned scripts reparented to PID 1 are cleaned up by the OS. If orphaned scripts become a real problem, a future enhancement could add a `ScriptTracker` that sends `SIGTERM` then `SIGKILL` with a grace period, or use process groups (`setsid`) to kill the script and all its descendants.
