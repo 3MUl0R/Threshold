@@ -105,7 +105,14 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
     };
 
     // 3c. Export data dir and config path as env vars for child processes.
-    // SAFETY: Single-threaded at this point — no other threads have spawned yet.
+    // These are consumed by CLI subcommands (e.g. `threshold schedule list`)
+    // connecting back to the daemon. We set them early, before any subsystem
+    // spawns child processes.
+    //
+    // SAFETY: While tokio worker threads exist at this point, no code in
+    // this process concurrently reads THRESHOLD_DATA_DIR or THRESHOLD_CONFIG.
+    // They are only consumed by child processes (Command::new) spawned later.
+    // No concurrent iterator over std::env::vars() is active either.
     unsafe {
         std::env::set_var("THRESHOLD_DATA_DIR", &data_dir);
         std::env::set_var("THRESHOLD_CONFIG", &config_path);
@@ -524,9 +531,33 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Write the current process ID to `$DATA_DIR/threshold.pid`.
+///
+/// Uses `create_new(true)` (O_CREAT|O_EXCL) for atomic creation when possible.
+/// Falls back to plain write if the file already exists (stale PID was already
+/// removed by `check_existing_daemon`).
 fn write_pid_file(data_dir: &Path) -> anyhow::Result<PathBuf> {
+    use std::io::Write;
     let pid_path = data_dir.join("threshold.pid");
-    std::fs::write(&pid_path, std::process::id().to_string())?;
+    let pid_str = std::process::id().to_string();
+
+    // Try atomic exclusive create first — prevents TOCTOU race between
+    // check_existing_daemon and write_pid_file when two daemons start
+    // simultaneously.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pid_path)
+    {
+        Ok(mut f) => {
+            f.write_all(pid_str.as_bytes())?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Stale file — check_existing_daemon already verified it's safe to overwrite
+            std::fs::write(&pid_path, &pid_str)?;
+        }
+        Err(e) => return Err(e.into()),
+    }
+
     tracing::info!(pid = std::process::id(), path = %pid_path.display(), "PID file written");
     Ok(pid_path)
 }
@@ -566,8 +597,9 @@ fn is_threshold_process(pid: u32) -> bool {
     }
 }
 
-/// Verify no other Threshold daemon is running. Stale PID files are logged and
-/// overwritten; live Threshold processes cause a `DaemonAlreadyRunning` error.
+/// Verify no other Threshold daemon is running. Stale PID files are removed
+/// so that `write_pid_file` can use atomic exclusive create. Live Threshold
+/// processes cause a `DaemonAlreadyRunning` error.
 fn check_existing_daemon(data_dir: &Path) -> anyhow::Result<()> {
     use threshold_core::ThresholdError;
 
@@ -576,10 +608,13 @@ fn check_existing_daemon(data_dir: &Path) -> anyhow::Result<()> {
             if is_threshold_process(pid) {
                 return Err(ThresholdError::DaemonAlreadyRunning { pid }.into());
             }
-            tracing::warn!(pid, "PID file exists for non-Threshold process, overwriting");
+            tracing::warn!(pid, "PID file exists for non-Threshold process, removing stale file");
         } else {
-            tracing::info!(pid, "Stale PID file found, overwriting");
+            tracing::info!(pid, "Stale PID file found, removing");
         }
+        // Remove stale file so write_pid_file can use atomic O_CREAT|O_EXCL
+        let pid_path = data_dir.join("threshold.pid");
+        let _ = std::fs::remove_file(&pid_path);
     }
     Ok(())
 }

@@ -295,18 +295,16 @@ impl ConversationEngine {
     pub async fn handle_message(&self, portal_id: &PortalId, content: &str) -> Result<()> {
         use threshold_cli_wrapper::stream::StreamEvent;
 
-        // Drain check: reject new work if daemon is shutting down
+        // Drain check + work tracking: reject new work if daemon is draining.
+        // The check-then-increment is intentionally non-atomic — if work slips
+        // through a narrow race, the WorkGuard ensures it still completes and
+        // decrements cleanly. The stop command waits for active_work == 0.
         if let Some(ds) = &self.daemon_state {
             if ds.is_draining() {
                 return Err(ThresholdError::DaemonDraining);
             }
         }
-
-        // Track active work via RAII guard (decrements on all exit paths)
-        let _work_guard = self.daemon_state.as_ref().map(|ds| {
-            ds.increment_work();
-            WorkGuard(ds.clone())
-        });
+        let _work_guard = self.daemon_state.as_ref().map(WorkGuard::acquire);
 
         let run_id = RunId::new();
 
@@ -1113,18 +1111,16 @@ impl ConversationEngine {
     ) -> Result<String> {
         use threshold_cli_wrapper::stream::StreamEvent;
 
-        // Drain check: reject new work if daemon is shutting down
+        // Drain check + work tracking: reject new work if daemon is draining.
+        // The check-then-increment is intentionally non-atomic — if work slips
+        // through a narrow race, the WorkGuard ensures it still completes and
+        // decrements cleanly. The stop command waits for active_work == 0.
         if let Some(ds) = &self.daemon_state {
             if ds.is_draining() {
                 return Err(ThresholdError::DaemonDraining);
             }
         }
-
-        // Track active work via RAII guard (decrements on all exit paths)
-        let _work_guard = self.daemon_state.as_ref().map(|ds| {
-            ds.increment_work();
-            WorkGuard(ds.clone())
-        });
+        let _work_guard = self.daemon_state.as_ref().map(WorkGuard::acquire);
 
         let run_id = RunId::new();
 

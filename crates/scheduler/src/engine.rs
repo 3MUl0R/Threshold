@@ -361,7 +361,9 @@ impl Scheduler {
 
     /// Check for due tasks and spawn them with bounded concurrency.
     async fn check_and_run(&mut self) {
-        // Skip firing tasks if daemon is draining
+        // Skip firing tasks if daemon is draining. This check runs once per
+        // tick; tasks already queued in this batch will still launch, but they
+        // individually acquire WorkGuards and complete gracefully.
         if let Some(ds) = &self.daemon_state {
             if ds.is_draining() {
                 return;
@@ -452,10 +454,7 @@ impl Scheduler {
                     task_snapshot.action,
                     ScheduledAction::ResumeConversation { .. }
                 ) {
-                    daemon_state.as_ref().map(|ds| {
-                        ds.increment_work();
-                        threshold_core::WorkGuard(ds.clone())
-                    })
+                    daemon_state.as_ref().map(threshold_core::WorkGuard::acquire)
                 } else {
                     None
                 };

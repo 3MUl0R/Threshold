@@ -292,8 +292,18 @@ impl Default for DaemonState {
 /// RAII guard that decrements `DaemonState.active_work` on drop.
 ///
 /// Guarantees the counter is decremented on all exit paths — success, error,
-/// panic, and cancellation.
-pub struct WorkGuard(pub std::sync::Arc<DaemonState>);
+/// panic, and cancellation. Use `WorkGuard::acquire()` to atomically
+/// increment the counter and create the guard.
+pub struct WorkGuard(std::sync::Arc<DaemonState>);
+
+impl WorkGuard {
+    /// Atomically increment the active work counter and return an RAII guard
+    /// that decrements it on drop.
+    pub fn acquire(state: &std::sync::Arc<DaemonState>) -> Self {
+        state.increment_work();
+        Self(state.clone())
+    }
+}
 
 impl Drop for WorkGuard {
     fn drop(&mut self) {
@@ -571,11 +581,10 @@ mod tests {
     #[test]
     fn work_guard_decrements_on_drop() {
         let state = std::sync::Arc::new(DaemonState::new());
-        state.increment_work();
-        assert_eq!(state.active_work(), 1);
+        assert_eq!(state.active_work(), 0);
         {
-            let _guard = WorkGuard(state.clone());
-            // active_work still 1 while guard is alive
+            let _guard = WorkGuard::acquire(&state);
+            // active_work incremented to 1 while guard is alive
             assert_eq!(state.active_work(), 1);
         }
         // guard dropped, counter decremented
