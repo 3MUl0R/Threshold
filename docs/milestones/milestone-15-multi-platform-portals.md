@@ -15,7 +15,7 @@ Infrastructure for connecting multiple communication platforms to the same conve
 
 ### What This Does NOT Do
 
-- **No new platform crate** — This milestone builds the infrastructure. Actual Teams/Slack integration would be a separate milestone (e.g., Milestone 16) that adds a `crates/teams/` or `crates/slack/` crate.
+- **No new platform crate** — This milestone builds the infrastructure. Actual Teams/Slack integration would be a separate future milestone that adds a `crates/teams/` or `crates/slack/` crate.
 - **No cross-platform message relay** — Messages sent in Discord don't appear in Teams. The agent has full context, but platform UIs remain independent. When a user sends a message from a specific portal, the agent responds to that same portal (origin-only delivery). Other portals on the conversation do not echo the response.
 - **No portal-level permissions** — All portals on a conversation have equal access. Role-based portal restrictions are out of scope.
 
@@ -113,10 +113,19 @@ pub struct Conversation {
 ```rust
 // In ConversationEngine — when a portal is attached:
 async fn maybe_set_primary(&self, conversation_id: ConversationId, portal_id: PortalId) {
-    let mut conversations = self.conversations.write().await;
-    if let Some(conv) = conversations.get_mut(&conversation_id) {
-        if conv.primary_portal.is_none() {
-            conv.primary_portal = Some(portal_id);
+    let changed = {
+        let mut conversations = self.conversations.write().await;
+        if let Some(conv) = conversations.get_mut(&conversation_id) {
+            if conv.primary_portal.is_none() {
+                conv.primary_portal = Some(portal_id);
+                true
+            } else { false }
+        } else { false }
+    }; // conversations lock dropped
+
+    if changed {
+        if let Err(e) = self.save_conversations().await {
+            tracing::warn!("Failed to persist primary portal assignment: {}", e);
         }
     }
 }
@@ -134,10 +143,19 @@ async fn maybe_reassign_primary(&self, conversation_id: ConversationId, detached
             .map(|p| p.id)
     }; // portals lock dropped here
 
-    let mut conversations = self.conversations.write().await;
-    if let Some(conv) = conversations.get_mut(&conversation_id) {
-        if conv.primary_portal == Some(detached_portal) {
-            conv.primary_portal = next_primary;
+    let changed = {
+        let mut conversations = self.conversations.write().await;
+        if let Some(conv) = conversations.get_mut(&conversation_id) {
+            if conv.primary_portal == Some(detached_portal) {
+                conv.primary_portal = next_primary;
+                true
+            } else { false }
+        } else { false }
+    }; // conversations lock dropped
+
+    if changed {
+        if let Err(e) = self.save_conversations().await {
+            tracing::warn!("Failed to persist primary portal reassignment: {}", e);
         }
     }
 }
@@ -176,18 +194,40 @@ On engine initialization, after loading conversations and portals from disk:
 ```rust
 // In ConversationEngine::new() or init():
 async fn backfill_primary_portals(&self) {
-    let portals = self.portals.read().await;
-    let mut conversations = self.conversations.write().await;
-    for conv in conversations.all_mut() {
-        if conv.primary_portal.is_none() {
-            conv.primary_portal = portals
-                .get_portals_for_conversation(&conv.id)
-                .iter()
-                .min_by_key(|p| p.connected_at)
-                .map(|p| p.id);
-        }
+    // Phase 1: Collect backfill assignments while holding locks briefly.
+    let assignments: Vec<(ConversationId, PortalId)> = {
+        let portals = self.portals.read().await;
+        let conversations = self.conversations.read().await;
+        conversations.all()
+            .filter(|conv| conv.primary_portal.is_none())
+            .filter_map(|conv| {
+                portals
+                    .get_portals_for_conversation(&conv.id)
+                    .iter()
+                    .min_by_key(|p| p.connected_at)
+                    .map(|p| (conv.id, p.id))
+            })
+            .collect()
+    }; // both locks dropped here
+
+    if assignments.is_empty() {
+        return;
     }
-    if let Err(e) = conversations.save().await {
+
+    // Phase 2: Apply assignments under conversations write lock (no portals lock needed).
+    {
+        let mut conversations = self.conversations.write().await;
+        for (conv_id, portal_id) in &assignments {
+            if let Some(conv) = conversations.get_mut(conv_id) {
+                if conv.primary_portal.is_none() {
+                    conv.primary_portal = Some(*portal_id);
+                }
+            }
+        }
+    } // conversations lock dropped
+
+    // Phase 3: Persist outside any lock.
+    if let Err(e) = self.save_conversations().await {
         tracing::warn!("Failed to persist backfilled primary portals: {}", e);
     }
 }
@@ -328,34 +368,34 @@ pub enum ConversationEvent {
         artifacts: Vec<Artifact>,
         usage: Option<Usage>,
         timestamp: DateTime<Utc>,
-        /// Who should deliver this message.
-        delivery_target: Option<DeliveryFilter>,
+        /// Who should deliver this message. Required — every response has a target.
+        delivery_target: DeliveryFilter,
     },
     Error {
         conversation_id: ConversationId,
         run_id: Option<RunId>,
         error: String,
-        delivery_target: Option<DeliveryFilter>,
+        delivery_target: DeliveryFilter,
     },
     Acknowledgment {
         conversation_id: ConversationId,
         run_id: RunId,
         content: String,
-        delivery_target: Option<DeliveryFilter>,
+        delivery_target: DeliveryFilter,
     },
     StatusUpdate {
         conversation_id: ConversationId,
         run_id: RunId,
         summary: String,
         elapsed_secs: u64,
-        delivery_target: Option<DeliveryFilter>,
+        delivery_target: DeliveryFilter,
     },
     Aborted {
         conversation_id: ConversationId,
         run_id: RunId,
-        delivery_target: Option<DeliveryFilter>,
+        delivery_target: DeliveryFilter,
     },
-    // Unchanged:
+    // Unchanged — lifecycle events broadcast to all listeners:
     ConversationCreated { conversation: Conversation },
     PortalAttached { portal_id: PortalId, conversation_id: ConversationId },
     PortalDetached { portal_id: PortalId, conversation_id: ConversationId },
@@ -363,7 +403,9 @@ pub enum ConversationEvent {
 }
 ```
 
-**All event variants that carry response content gain `delivery_target`.** Lifecycle events (`PortalAttached`, `PortalDetached`, `ConversationCreated`, `ConversationDeleted`) do not — they are always broadcast to all listeners.
+**`delivery_target` is non-optional (required) on all response event variants.** This ensures every code path that emits a response must explicitly choose a target — no silent broadcast-all fallback. The compiler enforces this: any new event emission site that forgets `delivery_target` will fail to build.
+
+Lifecycle events (`PortalAttached`, `PortalDetached`, `ConversationCreated`, `ConversationDeleted`) do not have `delivery_target` — they are always broadcast to all listeners.
 
 ### Portal Listener Filtering
 
@@ -373,15 +415,14 @@ Each portal listener checks the delivery target on every event before sending:
 // In portal_listener (discord/handler.rs):
 // Helper function used by all event handlers:
 async fn should_deliver(
-    delivery_target: &Option<DeliveryFilter>,
+    delivery_target: &DeliveryFilter,
     my_portal_id: &PortalId,
     conversation_id: &ConversationId,
     engine: &ConversationEngine,
 ) -> bool {
     match delivery_target {
-        None => true,  // Fallback: all portals deliver (should not happen in practice)
-        Some(DeliveryFilter::Portal(target_id)) => target_id == my_portal_id,
-        Some(DeliveryFilter::PrimaryOnly) => {
+        DeliveryFilter::Portal(target_id) => target_id == my_portal_id,
+        DeliveryFilter::PrimaryOnly => {
             engine.is_primary_portal(my_portal_id, conversation_id).await
         }
     }
@@ -409,14 +450,35 @@ The delivery target is set based on message origin:
 ```rust
 // In ConversationEngine::handle_message() — user-initiated:
 // Respond to origin portal only (the portal that sent the message)
-let delivery_target = Some(DeliveryFilter::Portal(portal_id));
+let delivery_target = DeliveryFilter::Portal(portal_id);
 
 // In ConversationEngine::send_to_conversation() — scheduler-initiated:
 let delivery_target = if let Some(target_portal) = task_portal_id {
-    Some(DeliveryFilter::Portal(target_portal))
+    DeliveryFilter::Portal(target_portal)
 } else {
-    Some(DeliveryFilter::PrimaryOnly)
+    DeliveryFilter::PrimaryOnly
 };
+```
+
+### Portal-Conversation Validation
+
+When a scheduled task specifies `portal_id`, the scheduler must validate that the portal belongs to the same conversation before delivery. An invalid `portal_id` (wrong conversation, deleted portal) should return a clear error rather than silently dropping the message:
+
+```rust
+// In scheduler execution, before calling send_to_conversation():
+if let Some(portal_id) = &task.portal_id {
+    let valid = engine.portal_belongs_to_conversation(portal_id, &task.conversation_id).await;
+    if !valid {
+        tracing::warn!(
+            task_name = %task.name,
+            portal_id = %portal_id.0,
+            conversation_id = %task.conversation_id,
+            "Scheduled task portal_id does not belong to this conversation; falling back to primary"
+        );
+        // Fall back to primary instead of silently dropping
+        task_portal_id = None;
+    }
+}
 ```
 
 ### CLI / Discord Interface
@@ -433,7 +495,7 @@ threshold schedule resume \
   --portal-id <portal-uuid> \
   --prompt "Check email and summarize"
 
-# CLI: list portals (new subcommand)
+# CLI: list portals (new subcommand — runs out-of-process, queries daemon API)
 threshold portal list
 ```
 
@@ -443,7 +505,72 @@ Discord:
 /schedule ... portal:here                 — Target this channel's portal specifically
 ```
 
-**Note:** The `threshold portal list` command requires adding a `Portal` subcommand to the CLI (`crates/server/src/main.rs:24`). This is a small addition alongside the existing `Schedule` subcommand.
+### Daemon API for Portal Commands
+
+CLI subcommands run out-of-process and communicate with the daemon over the Unix socket API (`~/.threshold/threshold.sock`). The `threshold portal list` command follows the same pattern as `threshold schedule list`:
+
+```rust
+// crates/scheduler/src/daemon_api.rs — extend DaemonCommand
+pub enum DaemonCommand {
+    // ... existing variants (Health, Drain, Undrain, Schedule*) ...
+    /// List all portals (optionally filtered by conversation).
+    PortalList { conversation_id: Option<String> },
+}
+```
+
+The `DaemonApi` needs access to the conversation engine to query portals. Pass an `Arc<ConversationEngine>` alongside the existing `SchedulerHandle`:
+
+```rust
+// crates/scheduler/src/daemon_api.rs — add engine field
+pub struct DaemonApi {
+    scheduler: Option<SchedulerHandle>,
+    engine: Option<Arc<ConversationEngine>>,  // NEW — for portal queries
+    health_config: HealthConfig,
+    daemon_state: Arc<DaemonState>,
+    socket_path: PathBuf,
+}
+
+// Dispatch handler:
+DaemonCommand::PortalList { conversation_id } => {
+    match &self.engine {
+        Some(engine) => {
+            let portals = engine.list_portals(conversation_id.as_deref()).await;
+            DaemonResponse::ok(serde_json::to_value(&portals).unwrap_or_default())
+        }
+        None => DaemonResponse::error("not_available", "Engine not initialized"),
+    }
+}
+```
+
+CLI handler follows the existing schedule.rs pattern:
+
+```rust
+// crates/server/src/portal.rs (new file)
+pub async fn handle_portal_command(command: PortalCommands) -> anyhow::Result<()> {
+    let client = DaemonClient::new()?;
+    let daemon_command = match &command {
+        PortalCommands::List { conversation_id, .. } => {
+            DaemonCommand::PortalList { conversation_id: conversation_id.clone() }
+        }
+    };
+    let response = client.send_command(&daemon_command).await?;
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+```
+
+Server wiring in `main.rs`:
+
+```rust
+// crates/server/src/main.rs — pass engine to DaemonApi
+let daemon_api = DaemonApi::new(
+    scheduler_cmd_handle,
+    Some(engine.clone()),  // NEW — for portal queries
+    health_config,
+    daemon_state,
+    socket_path,
+);
+```
 
 ---
 
@@ -503,13 +630,16 @@ Discord:
 
 | File | Change |
 |------|--------|
-| `crates/conversation/src/engine.rs` | Add `DeliveryFilter` enum. Add `delivery_target: Option<DeliveryFilter>` to `AssistantMessage`, `StatusUpdate`, `Acknowledgment`, `Error`, and `Aborted` event variants. |
-| `crates/conversation/src/engine.rs` | Update `handle_message()` — set `delivery_target: Some(DeliveryFilter::Portal(portal_id))` (origin portal). |
+| `crates/conversation/src/engine.rs` | Add `DeliveryFilter` enum. Add `delivery_target: DeliveryFilter` (non-optional) to `AssistantMessage`, `StatusUpdate`, `Acknowledgment`, `Error`, and `Aborted` event variants. |
+| `crates/conversation/src/engine.rs` | Update `handle_message()` — set `delivery_target: DeliveryFilter::Portal(portal_id)` (origin portal). |
 | `crates/conversation/src/engine.rs` | Update `send_to_conversation()` — accept optional `portal_id` parameter. Set `delivery_target` to `Portal(id)` or `PrimaryOnly`. |
 | `crates/discord/src/handler.rs` | Update portal listener — add `should_deliver()` helper. Check `delivery_target` on all event types (`AssistantMessage`, `StatusUpdate`, `Acknowledgment`, `Error`, `Aborted`) before sending to Discord. |
-| `crates/scheduler/src/execution.rs` | Pass `task.portal_id` through to `send_to_conversation()`. |
+| `crates/scheduler/src/execution.rs` | Pass `task.portal_id` through to `send_to_conversation()`. Validate portal belongs to the task's conversation before delivery (see Portal-Conversation Validation below). |
 | `crates/server/src/schedule.rs` | Add `--portal-id` CLI flag to `Resume` (and other) schedule subcommands. |
-| `crates/server/src/main.rs` | Add `Portal` subcommand with `list` action (queries engine for all portals). |
+| `crates/scheduler/src/daemon_api.rs` | Add `PortalList` variant to `DaemonCommand`. Add `engine: Option<Arc<ConversationEngine>>` field to `DaemonApi`. Dispatch `PortalList` to `engine.list_portals()`. |
+| `crates/server/src/portal.rs` | **New file.** CLI handler for `threshold portal list` — builds `DaemonCommand::PortalList`, sends to daemon, prints result. Follows `schedule.rs` pattern. |
+| `crates/server/src/main.rs` | Add `Portal` subcommand enum. Wire to `portal::handle_portal_command()`. Pass `engine.clone()` to `DaemonApi::new()`. |
+| `crates/conversation/src/engine.rs` | Add `list_portals()` method (public, used by daemon API). |
 | `crates/discord/src/scheduler_commands.rs` | Add `portal` option to `/schedule` Discord command — resolves current channel's portal and passes it. |
 
 **Tests:**
@@ -519,6 +649,7 @@ Discord:
 - `handler::listener_filters_by_delivery_target` — Portal listener skips events not targeting it.
 - `handler::listener_delivers_when_primary` — Portal listener delivers when it's the primary and target is `PrimaryOnly`.
 - `handler::listener_filters_status_and_ack` — Verify `StatusUpdate`, `Acknowledgment`, `Error` events are also filtered (not just `AssistantMessage`).
+- `scheduler::portal_mismatch_falls_back_to_primary` — Schedule task with `portal_id` from a different conversation, verify it falls back to primary delivery with a warning log.
 
 ---
 
@@ -576,9 +707,11 @@ Manual testing with running daemon:
 | `crates/discord/src/bot.rs` | Register `/primary` | 15A |
 | `crates/discord/src/handler.rs` | Delivery target filtering on all event types in portal listener | 15C |
 | `crates/discord/src/scheduler_commands.rs` | Add `portal` option to `/schedule` | 15C |
-| `crates/scheduler/src/execution.rs` | Pass `task.portal_id` to `send_to_conversation()` | 15C |
+| `crates/scheduler/src/execution.rs` | Pass `task.portal_id` to `send_to_conversation()` with portal-conversation validation | 15C |
+| `crates/scheduler/src/daemon_api.rs` | Add `PortalList` to `DaemonCommand`, add `engine` field to `DaemonApi`, dispatch portal queries | 15C |
 | `crates/server/src/schedule.rs` | Add `--portal-id` CLI flag to schedule commands | 15C |
-| `crates/server/src/main.rs` | Add `Portal` subcommand with `list` action | 15C |
+| `crates/server/src/portal.rs` | **New file.** CLI handler for `threshold portal list` (daemon API client) | 15C |
+| `crates/server/src/main.rs` | Add `Portal` subcommand, wire to `portal.rs`, pass engine to `DaemonApi` | 15C |
 | `crates/conversation/src/store.rs` (line 104), `crates/core/src/types.rs` (line 278) | Add `primary_portal: None` to `Conversation` struct literals | 15A |
 
 ---
@@ -606,3 +739,9 @@ Manual testing with running daemon:
 10. **Why repurpose `portal_id` instead of adding `target_portal`?** — `ScheduledTask` already has `portal_id: Option<PortalId>` that is never populated. Adding a second portal field would create ambiguity about which one controls targeting. Repurposing the existing field is cleaner and avoids a migration.
 
 11. **How is lock ordering maintained?** — All pseudocode follows the convention: acquire `portals` lock first (read), drop it, then acquire `conversations` lock (write). This prevents deadlocks from nested lock acquisition. The `maybe_reassign_primary()` function specifically reads portals into a local variable before taking the conversations write lock.
+
+12. **Why is `delivery_target` non-optional instead of `Option<DeliveryFilter>`?** — An `Option` with `None => broadcast-all` creates a dangerous default: any code path that forgets to set the delivery target silently broadcasts to every portal. Making it non-optional means the compiler rejects event emission sites that don't explicitly choose a target. This enforces the origin-only guarantee at compile time.
+
+13. **What happens when `task.portal_id` references a portal from the wrong conversation?** — The scheduler validates portal-conversation membership before delivery. If the portal doesn't belong to the task's conversation, it logs a warning and falls back to primary portal delivery. This prevents silent message drops from misconfigured tasks.
+
+14. **How does `threshold portal list` work if the CLI runs out-of-process?** — Like `threshold schedule list`, it communicates with the daemon over the Unix socket API. A `PortalList` command was added to `DaemonCommand`, dispatched to `engine.list_portals()`. The `DaemonApi` accepts an `Arc<ConversationEngine>` for this purpose.
