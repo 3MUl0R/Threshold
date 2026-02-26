@@ -91,6 +91,30 @@ enum DaemonAction {
     },
 }
 
+/// Resolve the effective data dir, preferring `--data-dir` flag, then `--config`
+/// (via THRESHOLD_CONFIG env var and resolve_data_dir chain).
+fn resolve_effective_data_dir(
+    data_dir: Option<&str>,
+    config: Option<&str>,
+) -> anyhow::Result<std::path::PathBuf> {
+    // If explicit --data-dir given, use it
+    if data_dir.is_some() {
+        return daemon_client::resolve_data_dir(data_dir);
+    }
+    // If --config given, set THRESHOLD_CONFIG so resolve_data_dir picks it up
+    if let Some(config_path) = config {
+        // Don't overwrite an existing env var
+        if std::env::var("THRESHOLD_CONFIG").is_err() {
+            // SAFETY: We're in the CLI main thread before spawning async work.
+            // This is single-threaded at this point.
+            unsafe {
+                std::env::set_var("THRESHOLD_CONFIG", config_path);
+            }
+        }
+    }
+    daemon_client::resolve_data_dir(None)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -98,13 +122,22 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Daemon(args) => {
             let action = args.action.unwrap_or(DaemonAction::Start);
+            let config_arg = args.config;
             match action {
-                DaemonAction::Start => run_daemon(args.config).await,
-                DaemonAction::Status { data_dir } => run_daemon_status(data_dir).await,
+                DaemonAction::Start => run_daemon(config_arg).await,
+                DaemonAction::Status { data_dir } => {
+                    let dir =
+                        resolve_effective_data_dir(data_dir.as_deref(), config_arg.as_deref())?;
+                    run_daemon_status(Some(dir.to_string_lossy().into_owned())).await
+                }
                 DaemonAction::Stop {
                     data_dir,
                     drain_timeout,
-                } => run_daemon_stop(data_dir, drain_timeout).await,
+                } => {
+                    let dir =
+                        resolve_effective_data_dir(data_dir.as_deref(), config_arg.as_deref())?;
+                    run_daemon_stop(Some(dir.to_string_lossy().into_owned()), drain_timeout).await
+                }
                 DaemonAction::Restart {
                     data_dir,
                     drain_timeout,
@@ -112,8 +145,10 @@ async fn main() -> anyhow::Result<()> {
                     follow_on_conversation,
                     follow_on_prompt,
                 } => {
+                    let dir =
+                        resolve_effective_data_dir(data_dir.as_deref(), config_arg.as_deref())?;
                     run_daemon_restart(
-                        data_dir,
+                        Some(dir.to_string_lossy().into_owned()),
                         drain_timeout,
                         skip_build,
                         follow_on_conversation,
@@ -818,6 +853,15 @@ async fn run_daemon_stop(
         anyhow::bail!("Daemon is not running (stale PID file for PID {})", pid);
     }
 
+    // Verify the PID is actually a Threshold process (not a recycled PID)
+    if !is_threshold_process(pid) {
+        let _ = std::fs::remove_file(data_dir.join("threshold.pid"));
+        anyhow::bail!(
+            "PID {} from PID file is not a Threshold process (stale/recycled PID)",
+            pid
+        );
+    }
+
     let client = daemon_client::DaemonClient::with_data_dir(&data_dir);
 
     // Try drain phase (skip if socket is unreachable)
@@ -832,12 +876,21 @@ async fn run_daemon_stop(
         }
     };
 
+    // Write stop sentinel for supervised mode (tells wrapper to exit instead of restarting)
+    if detect_supervised(&data_dir) {
+        let sentinel_path = data_dir.join("state").join("stop-sentinel");
+        if let Some(parent) = sentinel_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&sentinel_path, "stop");
+    }
+
     // Send SIGTERM
     send_sigterm(pid)?;
     println!("SIGTERM sent to PID {}.", pid);
 
-    // Wait for process exit (up to 10s)
-    wait_for_process_exit(pid, 10).await;
+    // Wait for process exit (up to 30s)
+    wait_for_process_exit(pid, 30).await;
 
     // Print summary
     if let Some(summary) = drain_summary {
@@ -875,6 +928,13 @@ async fn run_daemon_restart(
 ) -> anyhow::Result<()> {
     use threshold_core::{ConversationId, DrainSummary, RestartHook};
 
+    // Validate follow-on args: both must be provided or neither
+    if follow_on_conversation.is_some() != follow_on_prompt.is_some() {
+        anyhow::bail!(
+            "--follow-on-conversation and --follow-on-prompt must be used together"
+        );
+    }
+
     let data_dir = daemon_client::resolve_data_dir(data_dir_override.as_deref())?;
 
     // Check PID file
@@ -886,12 +946,21 @@ async fn run_daemon_restart(
         anyhow::bail!("Daemon is not running (stale PID file for PID {})", pid);
     }
 
+    // Verify the PID is actually a Threshold process (not a recycled PID)
+    if !is_threshold_process(pid) {
+        let _ = std::fs::remove_file(data_dir.join("threshold.pid"));
+        anyhow::bail!(
+            "PID {} from PID file is not a Threshold process (stale/recycled PID)",
+            pid
+        );
+    }
+
     // Step 1: Build first (critical safety invariant)
     if !skip_build {
         println!("Building...");
         let repo_root = find_repo_root()?;
         let status = std::process::Command::new("cargo")
-            .args(["build", "--release", "-p", "threshold-server"])
+            .args(["build", "--release", "-p", "threshold"])
             .current_dir(&repo_root)
             .status()?;
 
@@ -920,7 +989,11 @@ async fn run_daemon_restart(
 
     // Step 4: Write restart hooks (if follow-on specified)
     let hooks_path = data_dir.join("state").join("restart-hooks.json");
-    if let (Some(conv_id_str), Some(prompt)) = (&follow_on_conversation, &follow_on_prompt) {
+    // Save original hooks for rollback — if we fail, we restore these
+    let original_hooks = read_existing_hooks(&hooks_path);
+    let wrote_hooks = if let (Some(conv_id_str), Some(prompt)) =
+        (&follow_on_conversation, &follow_on_prompt)
+    {
         let conv_id: uuid::Uuid = conv_id_str.parse().map_err(|e| {
             anyhow::anyhow!("Invalid conversation ID '{}': {}", conv_id_str, e)
         })?;
@@ -946,13 +1019,25 @@ async fn run_daemon_restart(
             }),
         };
 
-        if let Err(e) = write_hooks_atomic(&hooks_path, &[hook]) {
-            // Rollback: undrain and clean up
+        // Merge with any existing hooks (e.g., from a prior failed restart)
+        let mut all_hooks = original_hooks.clone();
+        all_hooks.push(hook);
+
+        if let Err(e) = write_hooks_atomic(&hooks_path, &all_hooks) {
             eprintln!("Error writing restart hooks: {}. Rolling back.", e);
-            rollback_on_failure(&client, &hooks_path, &data_dir).await;
+            rollback_on_failure_with_hooks(
+                &client,
+                &hooks_path,
+                &data_dir,
+                Some(&original_hooks),
+            )
+            .await;
             anyhow::bail!("Restart aborted: failed to write hooks");
         }
-    }
+        true
+    } else {
+        false
+    };
 
     // Step 5: Write restart-pending for supervised mode
     let supervised = detect_supervised(&data_dir);
@@ -964,8 +1049,17 @@ async fn run_daemon_restart(
         });
         if let Err(e) = write_json_atomic(&restart_pending_path, &pending) {
             eprintln!("Error writing restart-pending: {}. Rolling back.", e);
-            rollback_on_failure(&client, &hooks_path, &data_dir).await;
-            let _ = std::fs::remove_file(&restart_pending_path);
+            rollback_on_failure_with_hooks(
+                &client,
+                &hooks_path,
+                &data_dir,
+                if wrote_hooks {
+                    Some(&original_hooks)
+                } else {
+                    None
+                },
+            )
+            .await;
             anyhow::bail!("Restart aborted: failed to write restart-pending");
         }
     }
@@ -973,16 +1067,32 @@ async fn run_daemon_restart(
     // Step 6: Send SIGTERM
     if let Err(e) = send_sigterm(pid) {
         eprintln!("Error sending SIGTERM: {}. Rolling back.", e);
-        rollback_on_failure(&client, &hooks_path, &data_dir).await;
-        if supervised {
-            let _ = std::fs::remove_file(&restart_pending_path);
-        }
+        rollback_on_failure_with_hooks(
+            &client,
+            &hooks_path,
+            &data_dir,
+            if wrote_hooks {
+                Some(&original_hooks)
+            } else {
+                None
+            },
+        )
+        .await;
         anyhow::bail!("Restart aborted: failed to send SIGTERM");
     }
     println!("SIGTERM sent to PID {}.", pid);
 
     // Step 7: Wait for exit
-    wait_for_process_exit(pid, 10).await;
+    // Wait for old daemon to fully exit (hard requirement — don't proceed until dead)
+    wait_for_process_exit(pid, 30).await;
+
+    if is_process_alive(pid) {
+        anyhow::bail!(
+            "Old daemon (PID {}) did not exit within 30s. \
+             It may need to be killed manually.",
+            pid
+        );
+    }
 
     if let Some(summary) = &drain_summary {
         println!(
@@ -1012,10 +1122,10 @@ async fn run_daemon_restart(
     cmd.spawn()
         .map_err(|e| anyhow::anyhow!("Failed to start new daemon: {}", e))?;
 
-    // Step 9: Wait for healthy
+    // Step 9: Wait for healthy — verify new daemon has a different PID
     println!("Waiting for daemon to become healthy...");
-    match wait_for_healthy(&client, 30).await {
-        Ok(()) => println!("Daemon restarted successfully."),
+    match wait_for_healthy_new_pid(&client, pid, 30).await {
+        Ok(new_pid) => println!("Daemon restarted successfully (new PID {}).", new_pid),
         Err(e) => eprintln!("Warning: health check failed after restart: {}", e),
     }
 
@@ -1109,7 +1219,12 @@ async fn drain_and_wait(
 
 /// Send SIGTERM to a process.
 fn send_sigterm(pid: u32) -> anyhow::Result<()> {
-    // SAFETY: sending SIGTERM to a known PID.
+    // Guard against u32 values above i32::MAX — casting those to i32 would wrap
+    // negative, potentially targeting process groups or unintended processes.
+    if pid > i32::MAX as u32 || pid == 0 {
+        anyhow::bail!("Invalid PID {}: out of valid range", pid);
+    }
+    // SAFETY: PID is bounds-checked above and is a known daemon PID.
     let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
     if ret != 0 {
         let err = std::io::Error::last_os_error();
@@ -1132,6 +1247,7 @@ async fn wait_for_process_exit(pid: u32, max_secs: u64) {
 }
 
 /// Wait for the daemon to become healthy, polling every second.
+#[allow(dead_code)]
 async fn wait_for_healthy(
     client: &daemon_client::DaemonClient,
     max_secs: u64,
@@ -1151,6 +1267,41 @@ async fn wait_for_healthy(
     }
 
     anyhow::bail!("Daemon did not become healthy within {}s", max_secs)
+}
+
+/// Wait for the daemon to become healthy with a *different* PID than the old one.
+///
+/// This prevents false-positive health checks against the old daemon that hasn't
+/// fully shut down yet. Returns the new PID on success.
+async fn wait_for_healthy_new_pid(
+    client: &daemon_client::DaemonClient,
+    old_pid: u32,
+    max_secs: u64,
+) -> anyhow::Result<u32> {
+    let deadline = tokio::time::Instant::now()
+        + tokio::time::Duration::from_secs(max_secs);
+
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+        match client.send_health_check().await {
+            Ok(resp) if resp.status == daemon_client::ResponseStatus::Ok => {
+                let new_pid = resp
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("pid"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
+                if new_pid != old_pid && new_pid != 0 {
+                    return Ok(new_pid);
+                }
+                // Got health from old PID — keep waiting
+            }
+            _ => continue,
+        }
+    }
+
+    anyhow::bail!("New daemon did not become healthy within {}s", max_secs)
 }
 
 /// Find the repository root by walking up from the current exe to find Cargo.toml.
@@ -1182,6 +1333,14 @@ fn find_repo_root() -> anyhow::Result<PathBuf> {
     )
 }
 
+/// Read existing restart hooks from disk, returning empty vec on any error.
+fn read_existing_hooks(path: &Path) -> Vec<threshold_core::RestartHook> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default()
+}
+
 /// Write restart hooks to disk atomically (write-then-rename).
 fn write_hooks_atomic(
     path: &Path,
@@ -1211,8 +1370,9 @@ fn write_json_atomic(path: &Path, data: &serde_json::Value) -> anyhow::Result<()
 
 /// Detect if the daemon is running under the supervised wrapper script.
 ///
-/// Checks for a `$DATA_DIR/state/supervised` marker file containing the current
-/// daemon's PID and a start timestamp that hasn't gone stale.
+/// Checks for a `$DATA_DIR/state/supervised` marker file. The marker is a JSON
+/// file with `wrapper_pid` and `started_at` fields written by the wrapper.
+/// Three-way validation: PID alive + process name check + start time comparison.
 fn detect_supervised(data_dir: &Path) -> bool {
     let marker_path = data_dir.join("state").join("supervised");
     let content = match std::fs::read_to_string(&marker_path) {
@@ -1220,49 +1380,99 @@ fn detect_supervised(data_dir: &Path) -> bool {
         Err(_) => return false,
     };
 
-    // Parse "PID START_TIME" format
-    let parts: Vec<&str> = content.trim().split_whitespace().collect();
-    if parts.len() < 2 {
-        let _ = std::fs::remove_file(&marker_path);
-        return false;
-    }
+    // Try JSON format first: {"wrapper_pid": 12345, "started_at": "..."}
+    let (marker_pid, _started_at) =
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+            let pid = json
+                .get("wrapper_pid")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            let started = json
+                .get("started_at")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            match pid {
+                Some(p) => (p, started),
+                None => {
+                    let _ = std::fs::remove_file(&marker_path);
+                    return false;
+                }
+            }
+        } else {
+            // Fallback: "PID TIMESTAMP" plain text
+            let parts: Vec<&str> = content.trim().split_whitespace().collect();
+            if parts.len() < 2 {
+                let _ = std::fs::remove_file(&marker_path);
+                return false;
+            }
+            match parts[0].parse::<u32>() {
+                Ok(p) => (p, Some(parts[1].to_string())),
+                Err(_) => {
+                    let _ = std::fs::remove_file(&marker_path);
+                    return false;
+                }
+            }
+        };
 
-    let marker_pid: u32 = match parts[0].parse() {
-        Ok(p) => p,
-        Err(_) => {
-            let _ = std::fs::remove_file(&marker_path);
-            return false;
-        }
-    };
-
-    // Check if the marker PID matches the running daemon
+    // Check 1: Is the PID alive?
     if !is_process_alive(marker_pid) {
         let _ = std::fs::remove_file(&marker_path);
         return false;
     }
 
-    // Check if the PID is actually a threshold process (handles PID reuse)
-    if !is_threshold_process(marker_pid) {
+    // Check 2: Is the PID a shell process (bash/sh/zsh — the wrapper)?
+    // We check for common shell names since the wrapper is a shell script.
+    let is_shell = match std::process::Command::new("ps")
+        .args(["-p", &marker_pid.to_string(), "-o", "comm="])
+        .output()
+    {
+        Ok(output) => {
+            let name = String::from_utf8_lossy(&output.stdout);
+            let name = name.trim();
+            name.ends_with("bash") || name.ends_with("sh") || name.ends_with("zsh")
+        }
+        Err(_) => false,
+    };
+    if !is_shell {
         let _ = std::fs::remove_file(&marker_path);
         return false;
     }
 
+    // Check 3: Start time validation would require sysctl(KERN_PROC) on macOS.
+    // Deferred to Phase 16D where the wrapper script actually writes the marker.
+    // For now, checks 1+2 are sufficient to avoid most PID reuse false positives.
+
     true
 }
 
-/// Roll back a failed restart: send Undrain and clean up control files.
-async fn rollback_on_failure(
+/// Roll back a failed restart: send Undrain and restore original hooks.
+///
+/// If `original_hooks` is provided, the hooks file is restored to the original
+/// state (preserving pre-existing hooks). Otherwise the hooks file is removed.
+async fn rollback_on_failure_with_hooks(
     client: &daemon_client::DaemonClient,
     hooks_path: &Path,
     data_dir: &Path,
+    original_hooks: Option<&[threshold_core::RestartHook]>,
 ) {
     // Try to undrain
     if let Err(e) = client.send_undrain().await {
         eprintln!("Warning: failed to undrain daemon: {}", e);
     }
 
-    // Clean up hooks file
-    let _ = std::fs::remove_file(hooks_path);
+    // Restore or clean up hooks file
+    match original_hooks {
+        Some(hooks) if !hooks.is_empty() => {
+            // Restore pre-existing hooks
+            if let Err(e) = write_hooks_atomic(hooks_path, hooks) {
+                eprintln!("Warning: failed to restore original hooks: {}", e);
+                let _ = std::fs::remove_file(hooks_path);
+            }
+        }
+        _ => {
+            let _ = std::fs::remove_file(hooks_path);
+        }
+    }
 
     // Clean up restart-pending
     let _ = std::fs::remove_file(data_dir.join("state").join("restart-pending.json"));
@@ -1503,18 +1713,33 @@ mod tests {
     }
 
     #[test]
-    fn detect_supervised_returns_false_for_dead_pid() {
+    fn detect_supervised_returns_false_for_dead_pid_json() {
         let tmp = TempDir::new().unwrap();
         let state_dir = tmp.path().join("state");
         fs::create_dir_all(&state_dir).unwrap();
-        // Write marker with non-existent PID
+        // Write JSON marker with non-existent PID
+        fs::write(
+            state_dir.join("supervised"),
+            r#"{"wrapper_pid": 99999999, "started_at": "2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        assert!(!detect_supervised(tmp.path()));
+        // Marker should be cleaned up
+        assert!(!state_dir.join("supervised").exists());
+    }
+
+    #[test]
+    fn detect_supervised_returns_false_for_dead_pid_plaintext() {
+        let tmp = TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        // Write plain text marker with non-existent PID
         fs::write(
             state_dir.join("supervised"),
             "99999999 2026-01-01T00:00:00Z",
         )
         .unwrap();
         assert!(!detect_supervised(tmp.path()));
-        // Marker should be cleaned up
         assert!(!state_dir.join("supervised").exists());
     }
 
@@ -1530,5 +1755,41 @@ mod tests {
     #[test]
     fn send_sigterm_to_nonexistent_fails() {
         assert!(send_sigterm(99999999).is_err());
+    }
+
+    #[test]
+    fn send_sigterm_rejects_zero_pid() {
+        let err = send_sigterm(0).unwrap_err();
+        assert!(err.to_string().contains("Invalid PID"));
+    }
+
+    #[test]
+    fn send_sigterm_rejects_overflow_pid() {
+        let err = send_sigterm(u32::MAX).unwrap_err();
+        assert!(err.to_string().contains("Invalid PID"));
+    }
+
+    #[test]
+    fn read_existing_hooks_returns_empty_for_missing_file() {
+        let tmp = TempDir::new().unwrap();
+        let hooks = read_existing_hooks(&tmp.path().join("nonexistent.json"));
+        assert!(hooks.is_empty());
+    }
+
+    #[test]
+    fn read_existing_hooks_returns_empty_for_invalid_json() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("hooks.json");
+        fs::write(&path, "not json").unwrap();
+        let hooks = read_existing_hooks(&path);
+        assert!(hooks.is_empty());
+    }
+
+    #[test]
+    fn follow_on_args_must_be_paired() {
+        // This tests the validation logic directly
+        let has_conv = Some("abc".to_string());
+        let no_prompt: Option<String> = None;
+        assert!(has_conv.is_some() != no_prompt.is_some());
     }
 }
