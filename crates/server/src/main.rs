@@ -89,6 +89,14 @@ enum DaemonAction {
         #[arg(long)]
         follow_on_prompt: Option<String>,
     },
+    /// Install launchd service for auto-start on boot (macOS)
+    Install {
+        /// Override data directory
+        #[arg(long)]
+        data_dir: Option<String>,
+    },
+    /// Uninstall launchd service (macOS)
+    Uninstall,
 }
 
 /// Resolve the effective data dir, preferring `--data-dir` flag, then `--config`
@@ -156,6 +164,15 @@ async fn main() -> anyhow::Result<()> {
                     )
                     .await
                 }
+                DaemonAction::Install { data_dir } => {
+                    let dir =
+                        resolve_effective_data_dir(data_dir.as_deref(), config_arg.as_deref())?;
+                    run_daemon_install(
+                        &dir,
+                        config_arg.as_deref(),
+                    )
+                }
+                DaemonAction::Uninstall => run_daemon_uninstall(),
             }
         }
         Commands::Schedule { command } => schedule::handle_schedule_command(command).await,
@@ -1551,6 +1568,166 @@ async fn process_restart_hooks(
 }
 
 // ---------------------------------------------------------------------------
+// launchd integration (macOS)
+// ---------------------------------------------------------------------------
+
+const LAUNCHD_LABEL: &str = "com.threshold.daemon";
+
+/// Install a launchd service that auto-starts the daemon on login.
+fn run_daemon_install(data_dir: &Path, config_arg: Option<&str>) -> anyhow::Result<()> {
+    let repo_root = find_repo_root()?;
+    let wrapper_path = repo_root.join("scripts").join("threshold-wrapper.sh");
+
+    if !wrapper_path.exists() {
+        anyhow::bail!(
+            "Wrapper script not found at {}. Is this a complete checkout?",
+            wrapper_path.display()
+        );
+    }
+
+    // Resolve config path
+    let config_path = match config_arg {
+        Some(p) => PathBuf::from(p),
+        None => std::env::var("THRESHOLD_CONFIG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                dirs::home_dir()
+                    .unwrap_or_default()
+                    .join(".threshold")
+                    .join("config.toml")
+            }),
+    };
+
+    // Build the PATH with cargo's bin directory
+    let cargo_bin = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".cargo")
+        .join("bin");
+    let system_path = std::env::var("PATH").unwrap_or_default();
+    let full_path = format!("{}:{}", cargo_bin.display(), system_path);
+
+    let plist_content = generate_plist(
+        &repo_root,
+        &wrapper_path,
+        &config_path,
+        data_dir,
+        &full_path,
+    );
+
+    // Write to ~/Library/LaunchAgents/
+    let plist_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
+        .join("Library")
+        .join("LaunchAgents");
+    std::fs::create_dir_all(&plist_dir)?;
+
+    let plist_path = plist_dir.join(format!("{}.plist", LAUNCHD_LABEL));
+    std::fs::write(&plist_path, &plist_content)?;
+
+    // Create logs directory
+    std::fs::create_dir_all(data_dir.join("logs"))?;
+
+    println!("Created launchd service: {}", LAUNCHD_LABEL);
+    println!("  Plist: {}", plist_path.display());
+    println!("  Log:   {}/logs/launchd-stdout.log", data_dir.display());
+    println!();
+    println!(
+        "To start now: launchctl load {}",
+        plist_path.display()
+    );
+
+    Ok(())
+}
+
+/// Uninstall the launchd service.
+fn run_daemon_uninstall() -> anyhow::Result<()> {
+    let plist_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
+        .join("Library")
+        .join("LaunchAgents");
+
+    let plist_path = plist_dir.join(format!("{}.plist", LAUNCHD_LABEL));
+
+    if !plist_path.exists() {
+        println!("No launchd service found (plist does not exist).");
+        return Ok(());
+    }
+
+    // Try to unload first (ignore errors — service may not be loaded)
+    println!("Unloading launchd service...");
+    let _ = std::process::Command::new("launchctl")
+        .args(["unload", &plist_path.to_string_lossy()])
+        .status();
+
+    // Remove the plist
+    std::fs::remove_file(&plist_path)?;
+    println!("Removing plist: {}", plist_path.display());
+    println!("Service removed. The daemon will no longer start automatically.");
+
+    Ok(())
+}
+
+/// Generate a launchd plist XML string.
+fn generate_plist(
+    repo_root: &Path,
+    wrapper_path: &Path,
+    config_path: &Path,
+    data_dir: &Path,
+    path_env: &str,
+) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{wrapper}</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>{repo_root}</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>THRESHOLD_CONFIG</key>
+        <string>{config_path}</string>
+        <key>THRESHOLD_DATA_DIR</key>
+        <string>{data_dir}</string>
+        <key>PATH</key>
+        <string>{path}</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>{data_dir}/logs/launchd-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>{data_dir}/logs/launchd-stderr.log</string>
+</dict>
+</plist>
+"#,
+        label = LAUNCHD_LABEL,
+        wrapper = wrapper_path.display(),
+        repo_root = repo_root.display(),
+        config_path = config_path.display(),
+        data_dir = data_dir.display(),
+        path = path_env,
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1791,5 +1968,82 @@ mod tests {
         let has_conv = Some("abc".to_string());
         let no_prompt: Option<String> = None;
         assert!(has_conv.is_some() != no_prompt.is_some());
+    }
+
+    // ---- Phase 16D tests ----
+
+    #[test]
+    fn plist_generated_correctly() {
+        let plist = generate_plist(
+            Path::new("/opt/threshold"),
+            Path::new("/opt/threshold/scripts/threshold-wrapper.sh"),
+            Path::new("/home/user/.threshold/config.toml"),
+            Path::new("/home/user/.threshold"),
+            "/home/user/.cargo/bin:/usr/bin:/bin",
+        );
+
+        assert!(plist.contains("com.threshold.daemon"));
+        assert!(plist.contains("/opt/threshold/scripts/threshold-wrapper.sh"));
+        assert!(plist.contains("<key>WorkingDirectory</key>"));
+        assert!(plist.contains("/opt/threshold"));
+        assert!(plist.contains("<key>THRESHOLD_CONFIG</key>"));
+        assert!(plist.contains("/home/user/.threshold/config.toml"));
+        assert!(plist.contains("<key>THRESHOLD_DATA_DIR</key>"));
+        assert!(plist.contains("<key>PATH</key>"));
+        assert!(plist.contains("/home/user/.cargo/bin:/usr/bin:/bin"));
+        assert!(plist.contains("<key>RunAtLoad</key>"));
+        assert!(plist.contains("<key>KeepAlive</key>"));
+        assert!(plist.contains("<key>SuccessfulExit</key>"));
+        assert!(plist.contains("launchd-stdout.log"));
+        assert!(plist.contains("launchd-stderr.log"));
+    }
+
+    #[test]
+    fn plist_is_valid_xml() {
+        let plist = generate_plist(
+            Path::new("/repo"),
+            Path::new("/repo/scripts/threshold-wrapper.sh"),
+            Path::new("/home/.threshold/config.toml"),
+            Path::new("/home/.threshold"),
+            "/usr/bin:/bin",
+        );
+
+        // Basic XML structure checks
+        assert!(plist.starts_with("<?xml version="));
+        assert!(plist.contains("<!DOCTYPE plist"));
+        assert!(plist.contains("<plist version=\"1.0\">"));
+        assert!(plist.contains("</plist>"));
+        assert!(plist.contains("</dict>"));
+    }
+
+    #[test]
+    fn install_writes_plist_to_temp() {
+        // Test generate_plist + write flow (not actual ~/Library/LaunchAgents)
+        let tmp = TempDir::new().unwrap();
+        let plist_path = tmp.path().join("com.threshold.daemon.plist");
+
+        let content = generate_plist(
+            Path::new("/repo"),
+            Path::new("/repo/scripts/wrapper.sh"),
+            Path::new("/config.toml"),
+            Path::new("/data"),
+            "/usr/bin",
+        );
+        fs::write(&plist_path, &content).unwrap();
+
+        assert!(plist_path.exists());
+        let read_back = fs::read_to_string(&plist_path).unwrap();
+        assert!(read_back.contains("com.threshold.daemon"));
+    }
+
+    #[test]
+    fn uninstall_removes_plist() {
+        let tmp = TempDir::new().unwrap();
+        let plist_path = tmp.path().join("com.threshold.daemon.plist");
+        fs::write(&plist_path, "test").unwrap();
+        assert!(plist_path.exists());
+
+        fs::remove_file(&plist_path).unwrap();
+        assert!(!plist_path.exists());
     }
 }
