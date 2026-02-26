@@ -56,15 +56,16 @@ Agent (in conversation):
              --follow-on-prompt "Restart complete. Verify the changes took effect."
 
 threshold daemon restart (CLI process, outside the daemon):
-  ├── 1. Read PID from $DATA_DIR/threshold.pid
-  ├── 2. Run `cargo build -p threshold` from repo root
+  ├── 1. Acquire restart lock (flock $DATA_DIR/state/restart.lock)
+  ├── 2. Read PID from $DATA_DIR/threshold.pid
+  ├── 3. Run `cargo build -p threshold` from repo root
   │      └── If build FAILS → abort restart, print compiler errors, daemon untouched
-  ├── 3. Write follow-on hook to $DATA_DIR/state/restart-hooks.json
-  ├── 4. Send SIGTERM to daemon PID
-  ├── 5. Wait for daemon process to exit (poll PID, timeout 30s)
-  ├── 6. Start new daemon process (detached, using freshly built binary)
-  ├── 7. Poll Health command on Unix socket until ready (timeout 60s)
-  └── 8. Print success: "Daemon restarted (PID 12345)"
+  ├── 4. Write follow-on hook to $DATA_DIR/state/restart-hooks.json
+  ├── 5. Send SIGTERM to daemon PID
+  ├── 6. Wait for daemon process to exit (poll PID, timeout 30s)
+  ├── 7. Start new daemon: {repo_root}/target/debug/threshold daemon start (absolute path)
+  ├── 8. Poll Health command on Unix socket until ready (timeout 60s)
+  └── 9. Print success: "Daemon restarted (PID 12345)"
 
 New daemon starts:
   ├── Load state from disk (conversations, portals, schedules)
@@ -87,7 +88,7 @@ There are two modes, determined by how the daemon is running:
 - The wrapper detects `restart-pending.json`, optionally rebuilds, and starts the new daemon.
 - `threshold daemon stop` writes a `$DATA_DIR/state/stop-sentinel` file, then sends SIGTERM.
 - The wrapper detects the stop sentinel and exits its loop instead of restarting.
-- Detection: the wrapper writes a `$DATA_DIR/state/supervised` marker file containing its PID and process start time (e.g., `{"wrapper_pid": 12345, "started_at": "2026-02-25T12:00:00Z"}`). The restart command reads this file, checks if the wrapper PID is alive (`kill(pid, 0)`), and validates wrapper identity by checking the process name (same pattern as `is_threshold_process()`). If the marker is stale (wrapper PID dead, PID recycled to a different process, or identity check fails), the CLI deletes it and proceeds in standalone mode.
+- Detection: the wrapper writes a `$DATA_DIR/state/supervised` marker file containing its PID and process start time (e.g., `{"wrapper_pid": 12345, "started_at": "2026-02-25T12:00:00Z"}`). The restart command validates the marker with three checks: (1) `kill(pid, 0)` — is the PID alive? (2) Process name check via `sysctl` — is it a bash/sh process? (3) **Process start time check** — query the process's actual start time via `sysctl(KERN_PROC)` on macOS and compare it against the recorded `started_at`. If the times differ by more than 2 seconds, the PID was recycled. All three checks must pass; if any fails, the marker is stale — the CLI deletes it and proceeds in standalone mode. This three-way validation prevents PID reuse from causing false supervised-mode detection.
 
 This avoids the race condition of both the CLI and the wrapper trying to start a new daemon simultaneously.
 
@@ -176,6 +177,16 @@ pub enum DaemonCommand {
 }
 ```
 
+**Decoupling from scheduler:** Currently, the `DaemonApi` is created and spawned inside the scheduler task in `main.rs` — if the scheduler is disabled (`scheduler_instance` is `None`), the entire block early-returns, and the Unix socket never opens. This means health check, status, and restart's health polling all break when the scheduler is disabled.
+
+**Fix:** The `DaemonApi` must be spawned as an independent top-level task in the `tokio::select!` block, not nested inside the scheduler task. The `SchedulerHandle` becomes `Option<SchedulerHandle>`:
+
+- When the scheduler is enabled, the `DaemonApi` receives `Some(handle)` and scheduler commands work normally.
+- When the scheduler is disabled, the `DaemonApi` receives `None` and scheduler commands (`ScheduleCreate`, `ScheduleList`, etc.) return an error response: `{"status": "error", "code": "scheduler_disabled", "message": "Scheduler is not enabled in this configuration"}`.
+- The `Health` command always works regardless, returning `scheduler_task_count: null` when the scheduler is disabled.
+
+This ensures the Unix socket is always available for health checks, status queries, and restart health polling.
+
 The `DaemonApi` needs access to health state beyond the scheduler. Add a `HealthConfig` struct for static fields and compute dynamic fields per request:
 
 ```rust
@@ -188,7 +199,7 @@ pub struct HealthConfig {
 }
 ```
 
-The `DaemonApi` constructor gains a `HealthConfig` parameter (not `Arc<RwLock<>>` — these fields never change after startup). Scheduler task counts are computed dynamically per health request by calling `scheduler.list_tasks()`, so they always reflect the current state. Fields that require cross-crate queries (conversation count, Discord status) are deferred to a future milestone — this keeps the health check lightweight and avoids coupling the daemon API to the conversation engine or Discord crate.
+The `DaemonApi` constructor gains a `HealthConfig` parameter and an `Option<SchedulerHandle>`. Static health fields never change after startup. Scheduler task counts are computed dynamically per health request by calling `scheduler.list_tasks()` when available. Fields that require cross-crate queries (conversation count, Discord status) are deferred to a future milestone — this keeps the health check lightweight and avoids coupling the daemon API to the conversation engine or Discord crate.
 
 Health response uses the existing `DaemonResponse` envelope (`daemon_api.rs:42`), with health payload in the `data` field:
 
@@ -206,6 +217,22 @@ Health response uses the existing `DaemonResponse` envelope (`daemon_api.rs:42`)
 }
 ```
 
+When the scheduler is disabled, the task count fields are `null`:
+
+```json
+{
+    "version": 1,
+    "status": "ok",
+    "data": {
+        "pid": 12345,
+        "uptime_secs": 3600,
+        "version": "0.1.0",
+        "scheduler_task_count": null,
+        "scheduler_enabled_count": null
+    }
+}
+```
+
 ### CLI Status Command
 
 ```bash
@@ -219,7 +246,19 @@ Threshold Daemon
   Scheduler: 8 tasks (3 enabled)
 ```
 
-Implementation: connects to the Unix socket at `$DATA_DIR/threshold.sock`, sends `Health`, and formats the response. If the socket doesn't exist or connection fails, falls back to PID file check:
+When the scheduler is disabled, the status output reflects this:
+
+```
+$ threshold daemon status
+Threshold Daemon
+  Status:    Running
+  PID:       12345
+  Uptime:    2h 30m 15s
+  Version:   0.1.0
+  Scheduler: disabled
+```
+
+Implementation: connects to the Unix socket at `$DATA_DIR/threshold.sock`, sends `Health`, and formats the response. When health JSON has `scheduler_task_count: null`, display "Scheduler: disabled" instead of task counts. If the socket doesn't exist or connection fails, falls back to PID file check:
 
 ```
 $ threshold daemon status
@@ -264,18 +303,21 @@ threshold daemon restart [--skip-build] [--data-dir <path>] \
 
 **Critical safety invariant:** The build must succeed *before* the running daemon is stopped. If the build fails, the restart is aborted and the running daemon continues undisturbed. This prevents the failure mode where the daemon is stopped, the rebuild fails, and no daemon can be started — leaving the system dead.
 
+**Restart lock:** The restart command acquires an exclusive `flock()` on `$DATA_DIR/state/restart.lock` before doing anything. This serializes concurrent restart attempts — if two agents or users invoke `threshold daemon restart` simultaneously, the second one blocks until the first completes (or fails with a timeout). The lock is held for the entire restart orchestration (build + stop + start + health check) and released automatically when the CLI process exits. The same lock is acquired by `threshold daemon stop` to prevent stop and restart from racing.
+
 **Steps:**
 
 1. **Resolve data dir** — from `--data-dir`, `THRESHOLD_DATA_DIR`, or default `~/.threshold`
-2. **Verify daemon is running** — Read PID file, check process alive, validate it's a Threshold process (same `is_threshold_process()` check used at startup). Error if PID is stale or belongs to a different process.
-3. **Build first** (unless `--skip-build`) — Run `cargo build -p threshold` from the repository root. If the build fails, **abort the restart immediately** and return the compiler error output. The running daemon is never touched.
-4. **Detect supervised mode** — Check for `$DATA_DIR/state/supervised` marker. If present, delegate to supervised restart (see below).
-5. **Write follow-on hook** (if provided) — Atomic write to `$DATA_DIR/state/restart-hooks.json` (write to temp file, then rename)
-6. **Send SIGTERM** — `kill(pid, SIGTERM)` (only after identity validation in step 2)
-7. **Wait for exit** — Poll process existence, timeout after 30 seconds
-8. **Start new daemon** — Spawn `threshold daemon start` as a detached process (using the freshly built binary)
-9. **Wait for healthy** — Poll `Health` command via Unix socket, timeout after 60 seconds
-10. **Report success** — Print new PID, build time, startup time
+2. **Acquire restart lock** — `flock()` on `$DATA_DIR/state/restart.lock` (blocking, 60s timeout). If the lock cannot be acquired, error: "Another restart or stop operation is in progress."
+3. **Verify daemon is running** — Read PID file, check process alive, validate it's a Threshold process (same `is_threshold_process()` check used at startup). Error if PID is stale or belongs to a different process.
+4. **Build first** (unless `--skip-build`) — Run `cargo build -p threshold` from the repository root. If the build fails, **abort the restart immediately** and return the compiler error output. The running daemon is never touched.
+5. **Detect supervised mode** — Check for `$DATA_DIR/state/supervised` marker. If present, delegate to supervised restart (see below).
+6. **Write follow-on hook** (if provided) — Atomic write to `$DATA_DIR/state/restart-hooks.json` (write to temp file, then rename). The restart lock guarantees no concurrent writer.
+7. **Send SIGTERM** — `kill(pid, SIGTERM)` (only after identity validation in step 3)
+8. **Wait for exit** — Poll process existence, timeout after 30 seconds
+9. **Start new daemon** — Spawn the freshly built binary as a detached process using its **absolute path** (`{repo_root}/target/debug/threshold daemon start`), not a bare `threshold` that would resolve via PATH. The repo root is determined by `find_repo_root()`, which uses two strategies: (1) walk up from `cwd` looking for `Cargo.toml` with `[workspace]`, (2) if that fails, resolve the running binary's path via `std::env::current_exe()` and walk up from there (the binary is at `{repo_root}/target/debug/threshold`). This ensures restart works even when invoked from outside the repo directory.
+10. **Wait for healthy** — Poll `Health` command via Unix socket, timeout after 60 seconds
+11. **Report success** — Print new PID, build time, startup time
 
 ### Restart Command (Supervised Mode)
 
@@ -296,11 +338,12 @@ When the supervised marker is detected:
 threshold daemon stop [--data-dir <path>]
 ```
 
-1. Read PID file, validate process identity (same `is_threshold_process()` check)
-2. If supervised mode: write `$DATA_DIR/state/stop-sentinel` file
-3. Send SIGTERM (only after identity validation)
-4. Wait for process exit (timeout 30s)
-5. Print: "Daemon stopped."
+1. Acquire restart lock (`flock()` on `$DATA_DIR/state/restart.lock`, same as restart command)
+2. Read PID file, validate process identity (same `is_threshold_process()` check)
+3. If supervised mode: write `$DATA_DIR/state/stop-sentinel` file
+4. Send SIGTERM (only after identity validation)
+5. Wait for process exit (timeout 30s)
+6. Print: "Daemon stopped."
 
 Under supervised mode, the stop sentinel tells the wrapper script to exit its loop instead of restarting the daemon.
 
@@ -333,7 +376,7 @@ pub struct RestartHook {
 
 ### File Robustness
 
-All hook/pending file writes use atomic write-temp-then-rename:
+All hook/pending file writes use atomic write-temp-then-rename. The temp file uses a unique suffix (PID + timestamp) to avoid collisions if two processes write simultaneously. Note: the rename itself is atomic on POSIX, but two concurrent writers performing read-modify-write could still lose data. In practice this is a non-issue — only one restart can be in flight at a time (there's only one daemon PID to signal). If a future use case requires concurrent hook writers, add `flock()`-based advisory locking.
 
 ```rust
 fn write_hooks_atomic(path: &Path, hooks: &[RestartHook]) -> Result<()> {
@@ -341,8 +384,10 @@ fn write_hooks_atomic(path: &Path, hooks: &[RestartHook]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // Write to temp file, then rename for atomicity
-    let tmp_path = path.with_extension("json.tmp");
+    // Write to temp file with unique suffix (PID + timestamp), then rename for atomicity.
+    // Unique suffix prevents concurrent writers from clobbering each other's temp file.
+    let suffix = format!("{}.{}", std::process::id(), chrono::Utc::now().timestamp_millis());
+    let tmp_path = path.with_extension(format!("tmp.{}", suffix));
     let content = serde_json::to_string_pretty(hooks)?;
     std::fs::write(&tmp_path, content)?;
     std::fs::rename(&tmp_path, path)?;
@@ -404,16 +449,54 @@ async fn process_restart_hooks(
         write_hooks_atomic(&hooks_path, &failed_hooks)?;
         tracing::warn!(
             remaining = failed_hooks.len(),
-            "Some restart hooks failed — preserved for next startup"
+            "Some restart hooks failed — scheduling background retry"
         );
+
+        // Retry failed hooks with exponential backoff (5s, 10s, 20s — 3 attempts max).
+        // If all retries fail, the hooks remain on disk for the next startup.
+        let engine = engine.clone();
+        let hooks_path = hooks_path.clone();
+        tokio::spawn(async move {
+            let delays = [5, 10, 20];
+            for (attempt, delay_secs) in delays.iter().enumerate() {
+                tokio::time::sleep(std::time::Duration::from_secs(*delay_secs)).await;
+                let raw = match std::fs::read_to_string(&hooks_path) {
+                    Ok(r) => r,
+                    Err(_) => return, // File removed (maybe processed by another path)
+                };
+                let hooks: Vec<RestartHook> = match serde_json::from_str(&raw) {
+                    Ok(h) => h,
+                    Err(_) => return,
+                };
+                if hooks.is_empty() { return; }
+
+                let mut still_failed = Vec::new();
+                for hook in hooks {
+                    if engine.send_to_conversation(&hook.conversation_id, &hook.prompt).await.is_err() {
+                        still_failed.push(hook);
+                    }
+                }
+
+                if still_failed.is_empty() {
+                    std::fs::remove_file(&hooks_path).ok();
+                    tracing::info!("All restart hooks delivered on retry attempt {}", attempt + 1);
+                    return;
+                } else {
+                    write_hooks_atomic(&hooks_path, &still_failed).ok();
+                }
+            }
+            tracing::warn!("Restart hooks still pending after all retries — will retry on next startup");
+        });
     }
     Ok(())
 }
 ```
 
-### One-Shot Scheduled Tasks (Independent Enhancement)
+### One-Shot Scheduled Tasks (Independent Enhancement — Deferrable)
 
 As a standalone improvement in this milestone, the scheduler gains a `one_shot` field for tasks that should auto-delete after first execution. This is **not** used by the follow-on hook system (which processes hooks directly via the conversation engine). It's a general-purpose scheduler enhancement that enables "run once at next opportunity" patterns for future use cases.
+
+**Scope note:** This is fully independent of the daemon management objective. It can be deferred to a later milestone without affecting any other Phase 16 deliverable. It's included here because it's small (~15 lines of code) and was identified during the design of the follow-on system.
 
 ```rust
 // crates/scheduler/src/task.rs — add field to ScheduledTask
@@ -469,6 +552,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
+BINARY="$REPO_ROOT/target/debug/threshold"
+
+# Initial build if binary doesn't exist (first boot, after cargo clean, etc.)
+if [ ! -f "$BINARY" ]; then
+    echo "[wrapper] Binary not found at $BINARY. Building from source..."
+    (cd "$REPO_ROOT" && cargo build -p threshold) || {
+        echo "[wrapper] Initial build failed. Cannot start daemon. Exiting."
+        exit 1
+    }
+fi
+
 while true; do
     # Check for stop sentinel — exit loop instead of restarting
     if [ -f "$STATE_DIR/stop-sentinel" ]; then
@@ -503,7 +597,7 @@ except: print('false')
 
     echo "[wrapper] Starting daemon..."
     EXIT_CODE=0
-    "$REPO_ROOT/target/debug/threshold" daemon start || EXIT_CODE=$?
+    "$BINARY" daemon start || EXIT_CODE=$?
 
     # Check for stop sentinel again (may have been written during shutdown)
     if [ -f "$STATE_DIR/stop-sentinel" ]; then
@@ -518,7 +612,10 @@ except: print('false')
     fi
 done
 
+# Exit 0 = intentional stop (launchd won't restart).
+# Exit 1 = unexpected failure (launchd will restart via KeepAlive/SuccessfulExit=false).
 echo "[wrapper] Wrapper exiting."
+exit 0
 ```
 
 ### Restart Pending File
@@ -579,9 +676,14 @@ To start now: launchctl load ~/Library/LaunchAgents/com.threshold.daemon.plist
     <true/>
 
     <key>KeepAlive</key>
-    <false/>
-    <!-- KeepAlive is false because the wrapper script handles restart logic.
-         launchd starts the wrapper; the wrapper loops internally. -->
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <!-- KeepAlive/SuccessfulExit=false: launchd restarts the wrapper only if it
+         exits with a non-zero status (unexpected crash). When the wrapper exits
+         cleanly via stop sentinel (exit 0), launchd leaves it down. This prevents
+         a wrapper crash from permanently killing the service. -->
 
     <key>StandardOutPath</key>
     <string>{data_dir}/logs/launchd-stdout.log</string>
@@ -682,6 +784,12 @@ enum DaemonAction {
 
 All management actions (`stop`, `restart`, `status`, `install`) accept `--data-dir` for non-default data directory locations. The data dir is resolved in order: `--data-dir` flag → `THRESHOLD_DATA_DIR` env var → `~/.threshold` default. The PID file and socket path are derived from the data dir.
 
+**Data dir consistency:** The daemon start command resolves data_dir from `ThresholdConfig.data_dir()` (config file field → `~/.threshold`). To ensure management commands can always find the running daemon, the daemon **exports `THRESHOLD_DATA_DIR`** as an environment variable on startup (set to its resolved data_dir value). This means child processes (including CLI commands spawned by agents) inherit the correct data dir.
+
+However, the env var only propagates to child processes — it doesn't help a user running `threshold daemon status` from a separate shell. For this case, management commands use a full resolution chain: `--data-dir` flag → `THRESHOLD_DATA_DIR` env var → **`THRESHOLD_CONFIG` env var / `--config` flag** (load config, read `data_dir` field) → `~/.threshold` default. The config fallback step ensures that if someone has a custom data_dir in their config file, management commands can still find the daemon even without the env var being set. The `DaemonClient` uses the same resolution chain for its socket path (not hardcoded).
+
+In practice, the common cases are: (a) default `~/.threshold` — everything works with no flags, (b) agent-spawned commands — env var is inherited, (c) manual commands with custom data dir — user passes `--data-dir` or has `THRESHOLD_DATA_DIR` in their shell profile.
+
 **Help flags:** Clap auto-generates `-h` and `--help` for every subcommand. This is the primary discovery mechanism for agents — they don't need to memorize the CLI interface. An agent can run `threshold --help` to see all top-level commands, `threshold daemon --help` to see all daemon actions, and `threshold daemon restart --help` to see restart-specific flags. The `/// doc comments` on the `DaemonAction` variants and `#[arg(...)]` fields become the help text, so they should be written as clear, concise descriptions suitable for both human and agent consumption.
 
 **Backward compatibility:** To avoid breaking existing `threshold daemon --config <path>` invocations, `Start` is the default subcommand. If no action is given, it behaves as `threshold daemon start`.
@@ -749,15 +857,17 @@ The conversation ID is available to the agent via its conversation context. The 
 | File | Change |
 |------|--------|
 | `crates/core/src/types.rs` | Add `HealthConfig` struct (pid, started_at, version). |
-| `crates/scheduler/src/daemon_api.rs` | Add `DaemonCommand::Health`. Accept `HealthConfig` in `DaemonApi::new()`. Compute task counts dynamically via `list_tasks()`. Return health in `DaemonResponse` envelope. |
-| `crates/server/src/main.rs` | Create `HealthConfig` at startup, pass to `DaemonApi`. Restructure `Commands::Daemon` to use `DaemonAction` subcommand enum. Implement `DaemonAction::Status` — connect to socket, send `Health`, format output. |
-| `crates/server/src/daemon_client.rs` | Add `send_health_check()` method — connects to socket, sends `Health` command, returns parsed `DaemonResponse` with health JSON payload. |
+| `crates/scheduler/src/daemon_api.rs` | Add `DaemonCommand::Health`. Change `scheduler` field to `Option<SchedulerHandle>`. Accept `HealthConfig` in `DaemonApi::new()`. Compute task counts dynamically via `list_tasks()` when scheduler is `Some`. Return `scheduler_disabled` error for schedule commands when `None`. Return health in `DaemonResponse` envelope. |
+| `crates/server/src/main.rs` | **Decouple DaemonApi from scheduler task** — spawn DaemonApi as independent top-level task in `tokio::select!`, not nested inside the scheduler block. Pass `Some(scheduler_handle)` when scheduler is enabled, `None` when disabled. Create `HealthConfig` at startup, pass to `DaemonApi`. Restructure `Commands::Daemon` to use `DaemonAction` subcommand enum. Implement `DaemonAction::Status` — connect to socket, send `Health`, format output. **Export `THRESHOLD_DATA_DIR`** env var on startup (resolved data_dir value) for child process consistency. |
+| `crates/server/src/daemon_client.rs` | Accept configurable socket path (resolve via `--data-dir` → `THRESHOLD_DATA_DIR` → `~/.threshold`, not hardcoded). Add `send_health_check()` method — connects to socket, sends `Health` command, returns parsed `DaemonResponse` with health JSON payload. |
 
 **Tests:**
 - `daemon_api::health_returns_uptime` — Send `Health` command to daemon API, verify response envelope includes pid, uptime, version, task counts in `data` field.
 - `daemon_api::health_counts_dynamic` — Add and remove tasks, verify health response reflects current counts.
-- `daemon::status_shows_running` — Start daemon, run `threshold daemon status`, verify output.
+- `daemon_api::health_without_scheduler` — Create `DaemonApi` with `scheduler: None`, send `Health`, verify response succeeds with `scheduler_task_count: null`. Send `ScheduleList`, verify `scheduler_disabled` error.
+- `daemon::status_shows_running` — Start daemon, run `threshold daemon status`, verify output includes PID, uptime, version, task counts.
 - `daemon::status_shows_not_running` — No daemon running, run status, verify "Not running" output.
+- `daemon::status_shows_scheduler_disabled` — Start daemon with scheduler disabled, run status, verify output shows "Scheduler: disabled".
 - `daemon_api::health_config_serde_round_trip` — Serialize and deserialize `HealthConfig`.
 
 ### Phase 16C — Stop, Restart, and Follow-On Hooks
@@ -775,8 +885,12 @@ The conversation ID is available to the agent via its conversation context. The 
 
 **Tests:**
 - `daemon::restart_aborts_on_build_failure` — Start daemon, trigger restart with a simulated build failure (e.g., mock cargo returning non-zero), verify daemon is still running (PID unchanged, health check passes), verify CLI returned the build error.
+- `daemon::restart_lock_serializes_concurrent` — Acquire restart lock in test, spawn `threshold daemon restart` in background, verify it blocks (doesn't send SIGTERM while lock is held), release lock, verify restart proceeds.
 - `daemon::stop_sends_sigterm` — Start daemon in background, run stop, verify process exits.
 - `daemon::stop_writes_sentinel_in_supervised_mode` — Set supervised marker, run stop, verify sentinel file created.
+- `daemon::supervised_marker_valid` — Write supervised marker with current process PID and start time, verify `detect_supervised()` returns `true`.
+- `daemon::supervised_marker_stale_pid_dead` — Write supervised marker with non-existent PID, verify `detect_supervised()` returns `false` and deletes marker.
+- `daemon::supervised_marker_stale_pid_recycled` — Write supervised marker with a live PID but mismatched start time (simulating PID reuse), verify `detect_supervised()` returns `false` and deletes marker.
 - `hooks::write_and_read_round_trip` — Write restart hooks atomically, read back, verify fields match.
 - `hooks::atomic_write_creates_parent_dirs` — Write hooks to non-existent state dir, verify `create_dir_all` works.
 - `hooks::processed_on_startup` — Write hook file, start daemon, verify `send_to_conversation()` called and hook file deleted.
@@ -799,8 +913,10 @@ The conversation ID is available to the agent via its conversation context. The 
 - `launchd::plist_generated_correctly` — Generate plist from known paths, verify XML structure, environment variables, and program arguments.
 - `launchd::install_writes_plist` — Run install (with test paths), verify file created at expected location.
 - `launchd::uninstall_removes_plist` — Create plist, run uninstall, verify file removed.
-- `wrapper::stop_sentinel_exits_loop` — Integration test: create stop sentinel, verify wrapper exits.
+- `wrapper::stop_sentinel_exits_loop` — Integration test: create stop sentinel, verify wrapper exits with code 0.
 - `wrapper::restart_pending_triggers_rebuild` — Integration test: create restart-pending.json with `skip_build: false`, verify build runs.
+- `wrapper::first_boot_builds_if_binary_missing` — Integration test: remove binary, start wrapper, verify it runs `cargo build` before first daemon start.
+- `wrapper::first_boot_exits_on_build_failure` — Integration test: remove binary, make build fail (e.g., invalid source), verify wrapper exits with code 1 (triggering launchd restart).
 - Note: Actual launchd loading/unloading is manual-test only (requires user login session).
 
 ---
@@ -849,10 +965,10 @@ Manual testing sequence:
 | `crates/server/src/main.rs` | PID file, SIGTERM, DaemonAction enum, status/stop/restart/install/uninstall commands, restart hook processing, health state creation | 16A, 16B, 16C, 16D |
 | `crates/core/src/error.rs` | Add `DaemonAlreadyRunning { pid: u32 }` variant | 16A |
 | `crates/core/src/types.rs` | Add `RestartHook` struct, add `HealthConfig` struct | 16B, 16C |
-| `crates/scheduler/src/daemon_api.rs` | Add `Health` command, accept `HealthConfig`, compute task counts dynamically | 16B |
+| `crates/scheduler/src/daemon_api.rs` | Add `Health` command, accept `HealthConfig`, change `scheduler` to `Option<SchedulerHandle>`, handle scheduler-disabled errors | 16B |
 | `crates/scheduler/src/task.rs` | Add `one_shot: bool` field (`#[serde(default)]`) | 16C |
 | `crates/scheduler/src/engine.rs` | One-shot task auto-deletion after execution | 16C |
-| `crates/server/src/daemon_client.rs` | Add `send_health_check()` | 16B |
+| `crates/server/src/daemon_client.rs` | Configurable socket path (not hardcoded), add `send_health_check()` | 16B |
 | `scripts/threshold-wrapper.sh` | New: restart loop wrapper script with stop sentinel, supervised marker, rebuild support | 16D |
 | `Cargo.toml` (server) | Add `libc` dependency | 16A |
 
@@ -878,6 +994,12 @@ Manual testing sequence:
 
 9. **What about Windows/Linux?** — The PID file, health check, restart command, follow-on hooks, and wrapper script are platform-agnostic (or trivially portable). Only Phase 16D's launchd integration is macOS-specific. Linux systemd support would use the same patterns: PID file, wrapper script as ExecStart, and `systemctl restart` integration.
 
-10. **Why a wrapper script instead of pure launchd KeepAlive?** — launchd's `KeepAlive` would restart the daemon immediately, but it can't run `cargo build` first. The wrapper checks `restart-pending.json` and conditionally rebuilds before restarting. It also handles the stop sentinel logic.
+10. **Why a wrapper script instead of pure launchd KeepAlive?** — launchd's `KeepAlive` would restart the daemon immediately, but it can't run `cargo build` first. The wrapper checks `restart-pending.json` and conditionally rebuilds before restarting. It also handles the stop sentinel logic. The plist uses `KeepAlive/SuccessfulExit=false` so launchd restarts the *wrapper* if it crashes unexpectedly (non-zero exit), but leaves it down on intentional stop (exit 0 via stop sentinel).
 
 11. **How are health check fields scoped?** — `HealthConfig` stores static fields set at startup: PID, start time, version. Scheduler task counts are computed dynamically per health request by calling `list_tasks()` on the `SchedulerHandle`, so they always reflect the current state. Fields requiring cross-crate queries (Discord connection status, active conversation count) are deferred to a future milestone to avoid coupling the daemon API to every subsystem.
+
+12. **Should daemon management work when the scheduler is disabled?** — Yes. The DaemonApi (Unix socket listener) is decoupled from the scheduler and always starts as an independent top-level task. Health, status, stop, and restart all work regardless of scheduler config. Scheduler-specific commands return a `scheduler_disabled` error when the scheduler is not enabled. See the Health Check section for details.
+
+13. **What is the single source of truth for data dir?** — The resolution order is: `--data-dir` CLI flag → `THRESHOLD_DATA_DIR` env var → `~/.threshold` default. The config file's `data_dir` field is used by `daemon start` to resolve the working data dir, which is then exported as `THRESHOLD_DATA_DIR` so child processes (CLI commands spawned by agents) inherit it. Management commands use the same resolution order. The env var is the bridge between config-driven and flag-driven resolution.
+
+14. **In supervised mode, does restart return only after health is green?** — No. In supervised mode, the CLI returns immediately after signaling (SIGTERM sent, wrapper will handle the rest). The agent gets continuity via the follow-on hook, not via the CLI's return value. In standalone mode, the CLI blocks until health is green. This is intentional: the supervised wrapper is the authority in supervised mode, and having the CLI also wait would create two processes competing to verify startup.
