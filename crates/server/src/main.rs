@@ -990,6 +990,17 @@ async fn run_daemon_restart(
         println!("Build succeeded.");
     }
 
+    // Validate follow-on conversation ID up front (before drain) to avoid
+    // leaving the daemon stuck in draining mode on a parse failure.
+    let follow_on_conv_id = if let Some(conv_id_str) = &follow_on_conversation {
+        let conv_id: uuid::Uuid = conv_id_str.parse().map_err(|e| {
+            anyhow::anyhow!("Invalid conversation ID '{}': {}", conv_id_str, e)
+        })?;
+        Some(conv_id)
+    } else {
+        None
+    };
+
     let client = daemon_client::DaemonClient::with_data_dir(&data_dir);
 
     // Step 2-3: Drain
@@ -1008,12 +1019,9 @@ async fn run_daemon_restart(
     let hooks_path = data_dir.join("state").join("restart-hooks.json");
     // Save original hooks for rollback — if we fail, we restore these
     let original_hooks = read_existing_hooks(&hooks_path);
-    let wrote_hooks = if let (Some(conv_id_str), Some(prompt)) =
-        (&follow_on_conversation, &follow_on_prompt)
+    if let (Some(conv_id), Some(prompt)) =
+        (follow_on_conv_id, &follow_on_prompt)
     {
-        let conv_id: uuid::Uuid = conv_id_str.parse().map_err(|e| {
-            anyhow::anyhow!("Invalid conversation ID '{}': {}", conv_id_str, e)
-        })?;
 
         // Prepend drain summary to the prompt
         let full_prompt = if let Some(summary) = &drain_summary {
@@ -1051,10 +1059,7 @@ async fn run_daemon_restart(
             .await;
             anyhow::bail!("Restart aborted: failed to write hooks");
         }
-        true
-    } else {
-        false
-    };
+    }
 
     // Step 5: Write restart-pending for supervised mode
     let supervised = detect_supervised(&data_dir);
@@ -1070,11 +1075,7 @@ async fn run_daemon_restart(
                 &client,
                 &hooks_path,
                 &data_dir,
-                if wrote_hooks {
-                    Some(&original_hooks)
-                } else {
-                    None
-                },
+                Some(&original_hooks),
             )
             .await;
             anyhow::bail!("Restart aborted: failed to write restart-pending");
@@ -1088,11 +1089,7 @@ async fn run_daemon_restart(
             &client,
             &hooks_path,
             &data_dir,
-            if wrote_hooks {
-                Some(&original_hooks)
-            } else {
-                None
-            },
+            Some(&original_hooks),
         )
         .await;
         anyhow::bail!("Restart aborted: failed to send SIGTERM");
@@ -1142,11 +1139,17 @@ async fn run_daemon_restart(
     // Step 9: Wait for healthy — verify new daemon has a different PID
     println!("Waiting for daemon to become healthy...");
     match wait_for_healthy_new_pid(&client, pid, 30).await {
-        Ok(new_pid) => println!("Daemon restarted successfully (new PID {}).", new_pid),
-        Err(e) => eprintln!("Warning: health check failed after restart: {}", e),
+        Ok(new_pid) => {
+            println!("Daemon restarted successfully (new PID {}).", new_pid);
+            Ok(())
+        }
+        Err(e) => {
+            anyhow::bail!(
+                "Restart may have failed: new daemon did not become healthy: {}",
+                e
+            );
+        }
     }
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1455,9 +1458,35 @@ fn detect_supervised(data_dir: &Path) -> bool {
         return false;
     }
 
-    // Check 3: Start time validation would require sysctl(KERN_PROC) on macOS.
-    // Deferred to Phase 16D where the wrapper script actually writes the marker.
-    // For now, checks 1+2 are sufficient to avoid most PID reuse false positives.
+    // Check 3: Validate start time to catch PID reuse to a different shell process.
+    // The wrapper writes an ISO 8601 timestamp; we compare it against `ps -o lstart=`.
+    if let Some(started_at) = _started_at {
+        if let Ok(marker_time) = chrono::DateTime::parse_from_rfc3339(&started_at) {
+            let marker_time = marker_time.with_timezone(&chrono::Utc);
+            if let Ok(output) = std::process::Command::new("ps")
+                .args(["-p", &marker_pid.to_string(), "-o", "lstart="])
+                .output()
+            {
+                let lstart = String::from_utf8_lossy(&output.stdout);
+                let lstart = lstart.trim();
+                // macOS `ps -o lstart=` format: "Mon Jan  1 00:00:00 2026"
+                if !lstart.is_empty() {
+                    if let Ok(proc_time) =
+                        chrono::NaiveDateTime::parse_from_str(lstart, "%a %b %e %H:%M:%S %Y")
+                    {
+                        let proc_time = proc_time.and_utc();
+                        // Allow 5s of clock skew between marker write and ps output
+                        let diff = (marker_time - proc_time).num_seconds().unsigned_abs();
+                        if diff > 5 {
+                            // PID was reused — the marker's start time doesn't match
+                            let _ = std::fs::remove_file(&marker_path);
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     true
 }
@@ -1667,6 +1696,15 @@ fn run_daemon_uninstall() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Escape a string for safe inclusion in XML text content.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 /// Generate a launchd plist XML string.
 fn generate_plist(
     repo_root: &Path,
@@ -1675,6 +1713,12 @@ fn generate_plist(
     data_dir: &Path,
     path_env: &str,
 ) -> String {
+    let wrapper = xml_escape(&wrapper_path.display().to_string());
+    let repo = xml_escape(&repo_root.display().to_string());
+    let config = xml_escape(&config_path.display().to_string());
+    let data = xml_escape(&data_dir.display().to_string());
+    let path = xml_escape(path_env);
+
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -1690,14 +1734,14 @@ fn generate_plist(
     </array>
 
     <key>WorkingDirectory</key>
-    <string>{repo_root}</string>
+    <string>{repo}</string>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>THRESHOLD_CONFIG</key>
-        <string>{config_path}</string>
+        <string>{config}</string>
         <key>THRESHOLD_DATA_DIR</key>
-        <string>{data_dir}</string>
+        <string>{data}</string>
         <key>PATH</key>
         <string>{path}</string>
     </dict>
@@ -1712,18 +1756,13 @@ fn generate_plist(
     </dict>
 
     <key>StandardOutPath</key>
-    <string>{data_dir}/logs/launchd-stdout.log</string>
+    <string>{data}/logs/launchd-stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>{data_dir}/logs/launchd-stderr.log</string>
+    <string>{data}/logs/launchd-stderr.log</string>
 </dict>
 </plist>
 "#,
         label = LAUNCHD_LABEL,
-        wrapper = wrapper_path.display(),
-        repo_root = repo_root.display(),
-        config_path = config_path.display(),
-        data_dir = data_dir.display(),
-        path = path_env,
     )
 }
 
@@ -2034,6 +2073,34 @@ mod tests {
         assert!(plist_path.exists());
         let read_back = fs::read_to_string(&plist_path).unwrap();
         assert!(read_back.contains("com.threshold.daemon"));
+    }
+
+    #[test]
+    fn xml_escape_handles_special_chars() {
+        assert_eq!(xml_escape("hello"), "hello");
+        assert_eq!(xml_escape("a&b"), "a&amp;b");
+        assert_eq!(xml_escape("a<b>c"), "a&lt;b&gt;c");
+        assert_eq!(xml_escape("a\"b'c"), "a&quot;b&apos;c");
+        assert_eq!(
+            xml_escape("/path/to/Tom & Jerry's <dir>"),
+            "/path/to/Tom &amp; Jerry&apos;s &lt;dir&gt;"
+        );
+    }
+
+    #[test]
+    fn plist_escapes_special_xml_chars() {
+        let plist = generate_plist(
+            Path::new("/opt/Tom & Jerry"),
+            Path::new("/opt/Tom & Jerry/scripts/wrapper.sh"),
+            Path::new("/home/user/.threshold/config.toml"),
+            Path::new("/home/user/.threshold"),
+            "/usr/bin",
+        );
+
+        // Verify the ampersand is escaped in XML
+        assert!(plist.contains("Tom &amp; Jerry"));
+        // And the raw unescaped form does NOT appear
+        assert!(!plist.contains("Tom & Jerry<"));
     }
 
     #[test]

@@ -24,12 +24,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-BINARY="$REPO_ROOT/target/debug/threshold"
+BINARY="$REPO_ROOT/target/release/threshold"
 
 # Initial build if binary doesn't exist (first boot, after cargo clean, etc.)
 if [ ! -f "$BINARY" ]; then
     echo "[wrapper] Binary not found at $BINARY. Building from source..."
-    (cd "$REPO_ROOT" && cargo build -p threshold) || {
+    (cd "$REPO_ROOT" && cargo build --release -p threshold) || {
         echo "[wrapper] Initial build failed. Cannot start daemon. Exiting."
         exit 1
     }
@@ -59,7 +59,7 @@ except: print('false')
 
         if [ "$SKIP_BUILD" != "true" ]; then
             echo "[wrapper] Building from source..."
-            (cd "$REPO_ROOT" && cargo build -p threshold) || {
+            (cd "$REPO_ROOT" && cargo build --release -p threshold) || {
                 echo "[wrapper] Build failed. Starting with existing binary."
             }
         else
