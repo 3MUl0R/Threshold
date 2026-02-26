@@ -44,6 +44,11 @@ pub struct ScheduledTask {
     /// is stored as UTC, correctly handling DST transitions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
+
+    /// If true, the task is automatically deleted after its first successful execution.
+    /// Used for one-time scheduled actions (e.g., reminders, deferred deliveries).
+    #[serde(default)]
+    pub one_shot: bool,
 }
 
 /// Explicit task identity — distinguishes heartbeats from user-created cron jobs.
@@ -107,6 +112,7 @@ impl ScheduledTask {
             created_by_agent: false,
             skip_if_running: false,
             timezone: None,
+            one_shot: false,
         })
     }
 
@@ -141,6 +147,7 @@ impl ScheduledTask {
             created_by_agent: false,
             skip_if_running: false,
             timezone: Some(timezone),
+            one_shot: false,
         })
     }
 
@@ -335,5 +342,39 @@ mod tests {
         assert_eq!(task.kind, TaskKind::Cron); // default
         assert!(!task.skip_if_running); // default
         assert!(!task.created_by_agent); // default
+        assert!(!task.one_shot); // default — backward compat
+    }
+
+    #[test]
+    fn one_shot_task_defaults_to_false() {
+        let task = ScheduledTask::new(
+            "test".into(),
+            "0 0 3 * * * *".into(),
+            ScheduledAction::Script {
+                command: "echo".into(),
+                working_dir: None,
+            },
+        )
+        .unwrap();
+        assert!(!task.one_shot);
+    }
+
+    #[test]
+    fn one_shot_task_serde_round_trip() {
+        let mut task = ScheduledTask::new(
+            "one-time-reminder".into(),
+            "0 0 12 * * * *".into(),
+            ScheduledAction::Script {
+                command: "echo reminder".into(),
+                working_dir: None,
+            },
+        )
+        .unwrap();
+        task.one_shot = true;
+
+        let json = serde_json::to_string(&task).unwrap();
+        let restored: ScheduledTask = serde_json::from_str(&json).unwrap();
+        assert!(restored.one_shot);
+        assert_eq!(restored.name, "one-time-reminder");
     }
 }

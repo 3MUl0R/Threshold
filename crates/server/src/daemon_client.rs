@@ -3,9 +3,6 @@
 //! The daemon exposes a Unix domain socket at `$DATA_DIR/threshold.sock` for
 //! receiving commands from CLI subcommands (e.g., `threshold schedule`,
 //! `threshold daemon status`).
-//!
-//! Some methods are forward-declared for Phase 16C (stop/restart commands).
-#![allow(dead_code)]
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -14,7 +11,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 // Re-export protocol types from the scheduler crate for convenience.
-#[allow(unused_imports)]
 pub use threshold_scheduler::daemon_api::{
     DaemonCommand, DaemonRequest, DaemonResponse, ResponseStatus, PROTOCOL_VERSION,
 };

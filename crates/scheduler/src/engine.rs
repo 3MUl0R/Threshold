@@ -351,10 +351,21 @@ impl Scheduler {
     }
 
     /// Record a completed task's result and persist the update.
+    ///
+    /// If the task is `one_shot` and succeeded, it is automatically removed.
     async fn record_completion(&mut self, task_id: Uuid, result: TaskRunResult) {
         if let Some(task) = self.tasks.iter_mut().find(|t| t.id == task_id) {
+            let is_one_shot = task.one_shot;
+            let success = result.success;
             task.last_run = Some(result.timestamp);
             task.last_result = Some(result);
+
+            if is_one_shot && success {
+                // Remove the task entirely — it was a one-time fire
+                self.tasks.retain(|t| t.id != task_id);
+                tracing::info!(task_id = %task_id, "One-shot task completed, auto-deleted");
+            }
+
             self.persist().await;
         }
     }

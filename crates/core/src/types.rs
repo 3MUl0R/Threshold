@@ -311,6 +311,35 @@ impl Drop for WorkGuard {
     }
 }
 
+/// A follow-on hook that survives daemon restarts. Written to disk before
+/// stopping the daemon, then processed on the next startup via
+/// `ConversationEngine::send_to_conversation()`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestartHook {
+    /// Conversation to resume after restart.
+    pub conversation_id: ConversationId,
+    /// Prompt to inject into the conversation. Drain summary (if any) is
+    /// prepended by the CLI before writing, so this contains the full text.
+    pub prompt: String,
+    /// When the hook was created.
+    pub created_at: DateTime<Utc>,
+    /// Who requested the restart (for audit trail).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_by: Option<String>,
+    /// Drain statistics at the time of restart, if any work was active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_summary: Option<DrainSummary>,
+}
+
+/// Statistics about the drain phase of a stop or restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrainSummary {
+    /// Number of active work items that completed during drain.
+    pub finished: u32,
+    /// Number of active work items aborted (drain timeout expired).
+    pub aborted: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,5 +618,58 @@ mod tests {
         }
         // guard dropped, counter decremented
         assert_eq!(state.active_work(), 0);
+    }
+
+    #[test]
+    fn restart_hook_serde_round_trip() {
+        let hook = RestartHook {
+            conversation_id: ConversationId::new(),
+            prompt: "Continue with the fix".into(),
+            created_at: Utc::now(),
+            requested_by: Some("cli".into()),
+            drain_summary: Some(DrainSummary {
+                finished: 3,
+                aborted: 1,
+            }),
+        };
+        let json = serde_json::to_string(&hook).unwrap();
+        let restored: RestartHook = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.conversation_id, hook.conversation_id);
+        assert_eq!(restored.prompt, "Continue with the fix");
+        assert_eq!(restored.requested_by, Some("cli".into()));
+        let summary = restored.drain_summary.unwrap();
+        assert_eq!(summary.finished, 3);
+        assert_eq!(summary.aborted, 1);
+    }
+
+    #[test]
+    fn restart_hook_serde_without_optional_fields() {
+        let hook = RestartHook {
+            conversation_id: ConversationId::new(),
+            prompt: "Resume work".into(),
+            created_at: Utc::now(),
+            requested_by: None,
+            drain_summary: None,
+        };
+        let json = serde_json::to_string(&hook).unwrap();
+        // Optional fields should be skipped in serialization
+        assert!(!json.contains("requested_by"));
+        assert!(!json.contains("drain_summary"));
+
+        let restored: RestartHook = serde_json::from_str(&json).unwrap();
+        assert!(restored.requested_by.is_none());
+        assert!(restored.drain_summary.is_none());
+    }
+
+    #[test]
+    fn drain_summary_serde_round_trip() {
+        let summary = DrainSummary {
+            finished: 5,
+            aborted: 2,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let restored: DrainSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.finished, 5);
+        assert_eq!(restored.aborted, 2);
     }
 }

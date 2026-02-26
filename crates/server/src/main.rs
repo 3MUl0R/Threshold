@@ -43,6 +43,52 @@ struct DaemonArgs {
     /// Path to the configuration file (overrides THRESHOLD_CONFIG env var)
     #[arg(short, long)]
     config: Option<String>,
+
+    /// Daemon subcommand (default: start)
+    #[command(subcommand)]
+    action: Option<DaemonAction>,
+}
+
+/// Subcommands for `threshold daemon`.
+///
+/// If no subcommand is given, `Start` is the default (backward compat).
+#[derive(clap::Subcommand)]
+enum DaemonAction {
+    /// Start the daemon (default when no subcommand given)
+    Start,
+    /// Show daemon status (PID, uptime, active work, scheduler info)
+    Status {
+        /// Override data directory for locating the daemon socket
+        #[arg(long)]
+        data_dir: Option<String>,
+    },
+    /// Gracefully stop the running daemon
+    Stop {
+        /// Override data directory for locating the daemon socket/PID
+        #[arg(long)]
+        data_dir: Option<String>,
+        /// Maximum seconds to wait for active work to drain (default: 30)
+        #[arg(long, default_value = "30")]
+        drain_timeout: u64,
+    },
+    /// Rebuild and restart the daemon
+    Restart {
+        /// Override data directory for locating the daemon socket/PID
+        #[arg(long)]
+        data_dir: Option<String>,
+        /// Maximum seconds to wait for active work to drain (default: 120)
+        #[arg(long, default_value = "120")]
+        drain_timeout: u64,
+        /// Skip `cargo build` before restart
+        #[arg(long)]
+        skip_build: bool,
+        /// Conversation ID for a follow-on hook after restart
+        #[arg(long)]
+        follow_on_conversation: Option<String>,
+        /// Prompt to inject into the follow-on conversation
+        #[arg(long)]
+        follow_on_prompt: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -50,7 +96,33 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Daemon(args) => run_daemon(args).await,
+        Commands::Daemon(args) => {
+            let action = args.action.unwrap_or(DaemonAction::Start);
+            match action {
+                DaemonAction::Start => run_daemon(args.config).await,
+                DaemonAction::Status { data_dir } => run_daemon_status(data_dir).await,
+                DaemonAction::Stop {
+                    data_dir,
+                    drain_timeout,
+                } => run_daemon_stop(data_dir, drain_timeout).await,
+                DaemonAction::Restart {
+                    data_dir,
+                    drain_timeout,
+                    skip_build,
+                    follow_on_conversation,
+                    follow_on_prompt,
+                } => {
+                    run_daemon_restart(
+                        data_dir,
+                        drain_timeout,
+                        skip_build,
+                        follow_on_conversation,
+                        follow_on_prompt,
+                    )
+                    .await
+                }
+            }
+        }
         Commands::Schedule { command } => schedule::handle_schedule_command(command).await,
         Commands::Gmail(args) => gmail::handle_gmail_command(args).await,
         Commands::Imagegen(args) => imagegen::handle_imagegen_command(args).await,
@@ -61,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
 ///
 /// This contains the full daemon lifecycle extracted from the original main():
 /// config loading, logging, Discord bot, heartbeat, scheduler, and graceful shutdown.
-async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
+async fn run_daemon(config_arg: Option<String>) -> anyhow::Result<()> {
     use std::sync::Arc;
     use threshold_cli_wrapper::ClaudeClient;
     use threshold_conversation::ConversationEngine;
@@ -71,13 +143,13 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
     use tokio_util::sync::CancellationToken;
 
     // 1. Load config (from explicit path or default)
-    let config_path = match &args.config {
+    let config_path = match &config_arg {
         Some(path) => std::path::PathBuf::from(path),
         None => std::env::var("THRESHOLD_CONFIG")
             .map(std::path::PathBuf::from)
             .unwrap_or(ThresholdConfig::default_config_path()?),
     };
-    let config = match &args.config {
+    let config = match &config_arg {
         Some(path) => ThresholdConfig::load_from(std::path::Path::new(path))?,
         None => ThresholdConfig::load()?,
     };
@@ -212,6 +284,9 @@ async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
         .await?,
     );
     tracing::info!("Conversation engine initialized.");
+
+    // 6a. Process restart hooks (follow-on prompts from previous restart)
+    process_restart_hooks(&data_dir, &engine).await;
 
     // 6b. Startup migration warnings
     {
@@ -631,6 +706,641 @@ async fn sigterm_signal() {
 }
 
 // ---------------------------------------------------------------------------
+// Daemon management commands (status, stop, restart)
+// ---------------------------------------------------------------------------
+
+/// Show the status of the running daemon.
+async fn run_daemon_status(data_dir_override: Option<String>) -> anyhow::Result<()> {
+    let data_dir = daemon_client::resolve_data_dir(data_dir_override.as_deref())?;
+
+    // Check PID file first
+    let pid = read_pid_file(&data_dir);
+    match pid {
+        None => {
+            println!("Threshold daemon: not running (no PID file)");
+            return Ok(());
+        }
+        Some(pid) if !is_process_alive(pid) => {
+            println!("Threshold daemon: not running (stale PID file, PID {})", pid);
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // Try to connect and get health
+    let client = daemon_client::DaemonClient::with_data_dir(&data_dir);
+    match client.send_health_check().await {
+        Ok(resp) => {
+            if let Some(data) = &resp.data {
+                let draining = data.get("draining").and_then(|v| v.as_bool()).unwrap_or(false);
+                let status_str = if draining { "Draining" } else { "Running" };
+                let pid = data.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+                let uptime = data.get("uptime_secs").and_then(|v| v.as_u64()).unwrap_or(0);
+                let version = data
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let active_work = data.get("active_work").and_then(|v| v.as_u64()).unwrap_or(0);
+                let scheduler_task_count = data.get("scheduler_task_count");
+                let scheduler_enabled_count = data.get("scheduler_enabled_count");
+
+                println!("Threshold daemon: {}", status_str);
+                println!("  PID:          {}", pid);
+                println!("  Version:      {}", version);
+                println!("  Uptime:       {}", format_uptime(uptime));
+                println!("  Active work:  {} run(s)", active_work);
+
+                match scheduler_task_count {
+                    Some(serde_json::Value::Number(n)) => {
+                        let total = n.as_u64().unwrap_or(0);
+                        let enabled = scheduler_enabled_count
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        println!("  Scheduler:    {} task(s) ({} enabled)", total, enabled);
+                    }
+                    _ => {
+                        println!("  Scheduler:    disabled");
+                    }
+                }
+            } else {
+                println!("Threshold daemon: running (PID {})", pid.unwrap_or(0));
+            }
+        }
+        Err(e) => {
+            let pid = pid.unwrap_or(0);
+            println!(
+                "Threshold daemon: running (PID {}) but socket unreachable: {}",
+                pid, e
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Format seconds into a human-readable uptime string.
+fn format_uptime(secs: u64) -> String {
+    let days = secs / 86400;
+    let hours = (secs % 86400) / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+
+    if days > 0 {
+        format!("{}d {}h {}m {}s", days, hours, minutes, seconds)
+    } else if hours > 0 {
+        format!("{}h {}m {}s", hours, minutes, seconds)
+    } else if minutes > 0 {
+        format!("{}m {}s", minutes, seconds)
+    } else {
+        format!("{}s", seconds)
+    }
+}
+
+/// Gracefully stop the running daemon.
+///
+/// 1. Send Drain command (reject new work)
+/// 2. Poll Health until active_work == 0 or drain_timeout expires
+/// 3. Send SIGTERM
+/// 4. Wait for process exit
+async fn run_daemon_stop(
+    data_dir_override: Option<String>,
+    drain_timeout: u64,
+) -> anyhow::Result<()> {
+    let data_dir = daemon_client::resolve_data_dir(data_dir_override.as_deref())?;
+
+    // Check PID file
+    let pid = read_pid_file(&data_dir)
+        .ok_or_else(|| anyhow::anyhow!("Daemon is not running (no PID file)"))?;
+
+    if !is_process_alive(pid) {
+        // Clean up stale PID file
+        let _ = std::fs::remove_file(data_dir.join("threshold.pid"));
+        anyhow::bail!("Daemon is not running (stale PID file for PID {})", pid);
+    }
+
+    let client = daemon_client::DaemonClient::with_data_dir(&data_dir);
+
+    // Try drain phase (skip if socket is unreachable)
+    let drain_summary = match drain_and_wait(&client, drain_timeout).await {
+        Ok(summary) => Some(summary),
+        Err(e) => {
+            eprintln!(
+                "Warning: Could not drain daemon ({}). Proceeding with SIGTERM.",
+                e
+            );
+            None
+        }
+    };
+
+    // Send SIGTERM
+    send_sigterm(pid)?;
+    println!("SIGTERM sent to PID {}.", pid);
+
+    // Wait for process exit (up to 10s)
+    wait_for_process_exit(pid, 10).await;
+
+    // Print summary
+    if let Some(summary) = drain_summary {
+        println!(
+            "Drain complete: {} finished, {} aborted.",
+            summary.finished, summary.aborted
+        );
+    }
+
+    if !is_process_alive(pid) {
+        println!("Daemon stopped.");
+    } else {
+        println!("Warning: daemon process {} may still be shutting down.", pid);
+    }
+
+    Ok(())
+}
+
+/// Rebuild and restart the daemon.
+///
+/// 1. Build first (fail-fast — never stop a running daemon without a good binary)
+/// 2. Send Drain command
+/// 3. Poll Health until drained or timeout
+/// 4. Write restart hooks (if follow-on specified)
+/// 5. Send SIGTERM
+/// 6. Wait for exit
+/// 7. Start new daemon
+/// 8. Wait for healthy
+async fn run_daemon_restart(
+    data_dir_override: Option<String>,
+    drain_timeout: u64,
+    skip_build: bool,
+    follow_on_conversation: Option<String>,
+    follow_on_prompt: Option<String>,
+) -> anyhow::Result<()> {
+    use threshold_core::{ConversationId, DrainSummary, RestartHook};
+
+    let data_dir = daemon_client::resolve_data_dir(data_dir_override.as_deref())?;
+
+    // Check PID file
+    let pid = read_pid_file(&data_dir)
+        .ok_or_else(|| anyhow::anyhow!("Daemon is not running (no PID file)"))?;
+
+    if !is_process_alive(pid) {
+        let _ = std::fs::remove_file(data_dir.join("threshold.pid"));
+        anyhow::bail!("Daemon is not running (stale PID file for PID {})", pid);
+    }
+
+    // Step 1: Build first (critical safety invariant)
+    if !skip_build {
+        println!("Building...");
+        let repo_root = find_repo_root()?;
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--release", "-p", "threshold-server"])
+            .current_dir(&repo_root)
+            .status()?;
+
+        if !status.success() {
+            anyhow::bail!(
+                "Build failed (exit {}). Restart aborted — daemon is still running.",
+                status.code().unwrap_or(-1)
+            );
+        }
+        println!("Build succeeded.");
+    }
+
+    let client = daemon_client::DaemonClient::with_data_dir(&data_dir);
+
+    // Step 2-3: Drain
+    let drain_summary = match drain_and_wait(&client, drain_timeout).await {
+        Ok(summary) => Some(summary),
+        Err(e) => {
+            eprintln!(
+                "Warning: Could not drain daemon ({}). Proceeding with SIGTERM.",
+                e
+            );
+            None
+        }
+    };
+
+    // Step 4: Write restart hooks (if follow-on specified)
+    let hooks_path = data_dir.join("state").join("restart-hooks.json");
+    if let (Some(conv_id_str), Some(prompt)) = (&follow_on_conversation, &follow_on_prompt) {
+        let conv_id: uuid::Uuid = conv_id_str.parse().map_err(|e| {
+            anyhow::anyhow!("Invalid conversation ID '{}': {}", conv_id_str, e)
+        })?;
+
+        // Prepend drain summary to the prompt
+        let full_prompt = if let Some(summary) = &drain_summary {
+            format!(
+                "[Restart drain summary: {} task(s) finished, {} aborted]\n\n{}",
+                summary.finished, summary.aborted, prompt
+            )
+        } else {
+            prompt.clone()
+        };
+
+        let hook = RestartHook {
+            conversation_id: ConversationId(conv_id),
+            prompt: full_prompt,
+            created_at: chrono::Utc::now(),
+            requested_by: Some("cli".into()),
+            drain_summary: drain_summary.as_ref().map(|s| DrainSummary {
+                finished: s.finished,
+                aborted: s.aborted,
+            }),
+        };
+
+        if let Err(e) = write_hooks_atomic(&hooks_path, &[hook]) {
+            // Rollback: undrain and clean up
+            eprintln!("Error writing restart hooks: {}. Rolling back.", e);
+            rollback_on_failure(&client, &hooks_path, &data_dir).await;
+            anyhow::bail!("Restart aborted: failed to write hooks");
+        }
+    }
+
+    // Step 5: Write restart-pending for supervised mode
+    let supervised = detect_supervised(&data_dir);
+    let restart_pending_path = data_dir.join("state").join("restart-pending.json");
+    if supervised {
+        let pending = serde_json::json!({
+            "skip_build": skip_build,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        });
+        if let Err(e) = write_json_atomic(&restart_pending_path, &pending) {
+            eprintln!("Error writing restart-pending: {}. Rolling back.", e);
+            rollback_on_failure(&client, &hooks_path, &data_dir).await;
+            let _ = std::fs::remove_file(&restart_pending_path);
+            anyhow::bail!("Restart aborted: failed to write restart-pending");
+        }
+    }
+
+    // Step 6: Send SIGTERM
+    if let Err(e) = send_sigterm(pid) {
+        eprintln!("Error sending SIGTERM: {}. Rolling back.", e);
+        rollback_on_failure(&client, &hooks_path, &data_dir).await;
+        if supervised {
+            let _ = std::fs::remove_file(&restart_pending_path);
+        }
+        anyhow::bail!("Restart aborted: failed to send SIGTERM");
+    }
+    println!("SIGTERM sent to PID {}.", pid);
+
+    // Step 7: Wait for exit
+    wait_for_process_exit(pid, 10).await;
+
+    if let Some(summary) = &drain_summary {
+        println!(
+            "Drain complete: {} finished, {} aborted.",
+            summary.finished, summary.aborted
+        );
+    }
+
+    if supervised {
+        // In supervised mode, the wrapper handles restart
+        println!("Supervised mode: wrapper will restart the daemon.");
+        return Ok(());
+    }
+
+    // Step 8: Standalone restart — start new daemon
+    println!("Starting new daemon...");
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("daemon").arg("start");
+    if let Ok(config_path) = std::env::var("THRESHOLD_CONFIG") {
+        cmd.args(["--config", &config_path]);
+    }
+    // Spawn detached
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd.spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to start new daemon: {}", e))?;
+
+    // Step 9: Wait for healthy
+    println!("Waiting for daemon to become healthy...");
+    match wait_for_healthy(&client, 30).await {
+        Ok(()) => println!("Daemon restarted successfully."),
+        Err(e) => eprintln!("Warning: health check failed after restart: {}", e),
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Restart/stop helper functions
+// ---------------------------------------------------------------------------
+
+/// A snapshot of drain progress.
+struct DrainProgress {
+    finished: u32,
+    aborted: u32,
+}
+
+/// Send Drain and poll Health until `active_work == 0` or timeout expires.
+async fn drain_and_wait(
+    client: &daemon_client::DaemonClient,
+    timeout_secs: u64,
+) -> anyhow::Result<DrainProgress> {
+    // Send drain command
+    let drain_resp = client.send_drain().await?;
+    let initial_work = drain_resp
+        .data
+        .as_ref()
+        .and_then(|d| d.get("active_work"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+
+    if initial_work == 0 {
+        return Ok(DrainProgress {
+            finished: 0,
+            aborted: 0,
+        });
+    }
+
+    println!(
+        "Draining... ({} active run(s), timeout {}s)",
+        initial_work, timeout_secs
+    );
+
+    let deadline = tokio::time::Instant::now()
+        + tokio::time::Duration::from_secs(timeout_secs);
+
+    let mut last_work = initial_work;
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+        if tokio::time::Instant::now() >= deadline {
+            let aborted = last_work;
+            let finished = initial_work.saturating_sub(aborted);
+            eprintln!(
+                "Drain timeout expired with {} active run(s) remaining.",
+                aborted
+            );
+            return Ok(DrainProgress { finished, aborted });
+        }
+
+        match client.send_health_check().await {
+            Ok(resp) => {
+                let work = resp
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("active_work"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
+
+                if work == 0 {
+                    return Ok(DrainProgress {
+                        finished: initial_work,
+                        aborted: 0,
+                    });
+                }
+
+                if work != last_work {
+                    println!("  {} active run(s) remaining...", work);
+                    last_work = work;
+                }
+            }
+            Err(_) => {
+                // Socket may have gone away — treat as drained
+                return Ok(DrainProgress {
+                    finished: initial_work,
+                    aborted: 0,
+                });
+            }
+        }
+    }
+}
+
+/// Send SIGTERM to a process.
+fn send_sigterm(pid: u32) -> anyhow::Result<()> {
+    // SAFETY: sending SIGTERM to a known PID.
+    let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        anyhow::bail!("Failed to send SIGTERM to PID {}: {}", pid, err);
+    }
+    Ok(())
+}
+
+/// Wait for a process to exit, polling every 500ms up to `max_secs`.
+async fn wait_for_process_exit(pid: u32, max_secs: u64) {
+    let deadline = tokio::time::Instant::now()
+        + tokio::time::Duration::from_secs(max_secs);
+
+    while tokio::time::Instant::now() < deadline {
+        if !is_process_alive(pid) {
+            return;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    }
+}
+
+/// Wait for the daemon to become healthy, polling every second.
+async fn wait_for_healthy(
+    client: &daemon_client::DaemonClient,
+    max_secs: u64,
+) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now()
+        + tokio::time::Duration::from_secs(max_secs);
+
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+        match client.send_health_check().await {
+            Ok(resp) if resp.status == daemon_client::ResponseStatus::Ok => {
+                return Ok(());
+            }
+            _ => continue,
+        }
+    }
+
+    anyhow::bail!("Daemon did not become healthy within {}s", max_secs)
+}
+
+/// Find the repository root by walking up from the current exe to find Cargo.toml.
+fn find_repo_root() -> anyhow::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    let mut dir = exe.parent().map(|p| p.to_path_buf());
+
+    // Walk up from the executable location
+    while let Some(d) = dir {
+        if d.join("Cargo.toml").exists() && d.join("crates").is_dir() {
+            return Ok(d);
+        }
+        dir = d.parent().map(|p| p.to_path_buf());
+    }
+
+    // Fallback: try current working directory
+    let cwd = std::env::current_dir()?;
+    let mut dir = Some(cwd);
+    while let Some(d) = dir {
+        if d.join("Cargo.toml").exists() && d.join("crates").is_dir() {
+            return Ok(d);
+        }
+        dir = d.parent().map(|p| p.to_path_buf());
+    }
+
+    anyhow::bail!(
+        "Cannot find repository root (no Cargo.toml with crates/ directory found). \
+         Use --skip-build or run from within the repository."
+    )
+}
+
+/// Write restart hooks to disk atomically (write-then-rename).
+fn write_hooks_atomic(
+    path: &Path,
+    hooks: &[threshold_core::RestartHook],
+) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp_path = path.with_extension("json.tmp");
+    let json = serde_json::to_string_pretty(hooks)?;
+    std::fs::write(&tmp_path, json)?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+/// Write JSON data to disk atomically (write-then-rename).
+fn write_json_atomic(path: &Path, data: &serde_json::Value) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp_path = path.with_extension("json.tmp");
+    let json = serde_json::to_string_pretty(data)?;
+    std::fs::write(&tmp_path, json)?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+/// Detect if the daemon is running under the supervised wrapper script.
+///
+/// Checks for a `$DATA_DIR/state/supervised` marker file containing the current
+/// daemon's PID and a start timestamp that hasn't gone stale.
+fn detect_supervised(data_dir: &Path) -> bool {
+    let marker_path = data_dir.join("state").join("supervised");
+    let content = match std::fs::read_to_string(&marker_path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    // Parse "PID START_TIME" format
+    let parts: Vec<&str> = content.trim().split_whitespace().collect();
+    if parts.len() < 2 {
+        let _ = std::fs::remove_file(&marker_path);
+        return false;
+    }
+
+    let marker_pid: u32 = match parts[0].parse() {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = std::fs::remove_file(&marker_path);
+            return false;
+        }
+    };
+
+    // Check if the marker PID matches the running daemon
+    if !is_process_alive(marker_pid) {
+        let _ = std::fs::remove_file(&marker_path);
+        return false;
+    }
+
+    // Check if the PID is actually a threshold process (handles PID reuse)
+    if !is_threshold_process(marker_pid) {
+        let _ = std::fs::remove_file(&marker_path);
+        return false;
+    }
+
+    true
+}
+
+/// Roll back a failed restart: send Undrain and clean up control files.
+async fn rollback_on_failure(
+    client: &daemon_client::DaemonClient,
+    hooks_path: &Path,
+    data_dir: &Path,
+) {
+    // Try to undrain
+    if let Err(e) = client.send_undrain().await {
+        eprintln!("Warning: failed to undrain daemon: {}", e);
+    }
+
+    // Clean up hooks file
+    let _ = std::fs::remove_file(hooks_path);
+
+    // Clean up restart-pending
+    let _ = std::fs::remove_file(data_dir.join("state").join("restart-pending.json"));
+}
+
+/// Process follow-on restart hooks on daemon startup.
+///
+/// Reads `$DATA_DIR/state/restart-hooks.json`, sends each hook's prompt to its
+/// conversation via `send_to_conversation()`, and removes the hooks file.
+/// Failed hooks are preserved in a rewritten hooks file.
+async fn process_restart_hooks(
+    data_dir: &Path,
+    engine: &std::sync::Arc<threshold_conversation::ConversationEngine>,
+) {
+    let hooks_path = data_dir.join("state").join("restart-hooks.json");
+    let content = match std::fs::read_to_string(&hooks_path) {
+        Ok(c) => c,
+        Err(_) => return, // No hooks file — nothing to do
+    };
+
+    let hooks: Vec<threshold_core::RestartHook> = match serde_json::from_str(&content) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!("Failed to parse restart-hooks.json: {}", e);
+            return;
+        }
+    };
+
+    if hooks.is_empty() {
+        let _ = std::fs::remove_file(&hooks_path);
+        return;
+    }
+
+    tracing::info!("Processing {} restart hook(s)...", hooks.len());
+
+    let mut failed_hooks = Vec::new();
+
+    for hook in &hooks {
+        tracing::info!(
+            conversation_id = %hook.conversation_id.0,
+            "Delivering restart hook"
+        );
+
+        match engine
+            .send_to_conversation(&hook.conversation_id, &hook.prompt)
+            .await
+        {
+            Ok(_) => {
+                tracing::info!(
+                    conversation_id = %hook.conversation_id.0,
+                    "Restart hook delivered successfully"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    conversation_id = %hook.conversation_id.0,
+                    error = %e,
+                    "Failed to deliver restart hook"
+                );
+                failed_hooks.push(hook.clone());
+            }
+        }
+    }
+
+    if failed_hooks.is_empty() {
+        let _ = std::fs::remove_file(&hooks_path);
+    } else {
+        tracing::warn!(
+            "{} restart hook(s) failed, preserving in hooks file",
+            failed_hooks.len()
+        );
+        if let Err(e) = write_hooks_atomic(&hooks_path, &failed_hooks) {
+            tracing::error!("Failed to rewrite hooks file: {}", e);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -710,5 +1420,115 @@ mod tests {
     #[test]
     fn is_threshold_process_for_nonexistent() {
         assert!(!is_threshold_process(99999999));
+    }
+
+    // ---- Phase 16C tests ----
+
+    #[test]
+    fn format_uptime_seconds() {
+        assert_eq!(format_uptime(42), "42s");
+    }
+
+    #[test]
+    fn format_uptime_minutes() {
+        assert_eq!(format_uptime(125), "2m 5s");
+    }
+
+    #[test]
+    fn format_uptime_hours() {
+        assert_eq!(format_uptime(3661), "1h 1m 1s");
+    }
+
+    #[test]
+    fn format_uptime_days() {
+        assert_eq!(format_uptime(90061), "1d 1h 1m 1s");
+    }
+
+    #[test]
+    fn write_hooks_atomic_round_trip() {
+        use threshold_core::{ConversationId, RestartHook};
+
+        let tmp = TempDir::new().unwrap();
+        let hooks_path = tmp.path().join("state").join("restart-hooks.json");
+
+        let hooks = vec![RestartHook {
+            conversation_id: ConversationId::new(),
+            prompt: "Test prompt".into(),
+            created_at: chrono::Utc::now(),
+            requested_by: Some("test".into()),
+            drain_summary: None,
+        }];
+
+        write_hooks_atomic(&hooks_path, &hooks).unwrap();
+
+        let content = fs::read_to_string(&hooks_path).unwrap();
+        let restored: Vec<RestartHook> = serde_json::from_str(&content).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].prompt, "Test prompt");
+        assert_eq!(restored[0].conversation_id, hooks[0].conversation_id);
+    }
+
+    #[test]
+    fn write_hooks_atomic_creates_parent_dirs() {
+        let tmp = TempDir::new().unwrap();
+        let hooks_path = tmp
+            .path()
+            .join("deeply")
+            .join("nested")
+            .join("restart-hooks.json");
+
+        let hooks = vec![];
+        write_hooks_atomic(&hooks_path, &hooks).unwrap();
+        assert!(hooks_path.exists());
+    }
+
+    #[test]
+    fn write_json_atomic_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("state").join("test.json");
+
+        let data = serde_json::json!({"key": "value", "count": 42});
+        write_json_atomic(&path, &data).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        let restored: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(restored["key"], "value");
+        assert_eq!(restored["count"], 42);
+    }
+
+    #[test]
+    fn detect_supervised_returns_false_without_marker() {
+        let tmp = TempDir::new().unwrap();
+        assert!(!detect_supervised(tmp.path()));
+    }
+
+    #[test]
+    fn detect_supervised_returns_false_for_dead_pid() {
+        let tmp = TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        // Write marker with non-existent PID
+        fs::write(
+            state_dir.join("supervised"),
+            "99999999 2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        assert!(!detect_supervised(tmp.path()));
+        // Marker should be cleaned up
+        assert!(!state_dir.join("supervised").exists());
+    }
+
+    #[test]
+    fn detect_supervised_returns_false_for_invalid_marker() {
+        let tmp = TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(state_dir.join("supervised"), "garbage").unwrap();
+        assert!(!detect_supervised(tmp.path()));
+    }
+
+    #[test]
+    fn send_sigterm_to_nonexistent_fails() {
+        assert!(send_sigterm(99999999).is_err());
     }
 }
