@@ -53,7 +53,7 @@ terminal ──→ threshold daemon ──→ [Discord, Scheduler, Web, Conversa
 Agent (in conversation):
   "I've fixed the bug. Let me restart to pick up the changes."
   ──→ Runs: threshold daemon restart --follow-on-conversation <id> \
-             --follow-on-prompt "Restart complete. Verifying changes."
+             --follow-on-prompt "Restart complete. Verify the changes took effect."
 
 threshold daemon restart (CLI process, outside the daemon):
   ├── 1. Read PID from $DATA_DIR/threshold.pid
@@ -634,48 +634,55 @@ The `daemon` subcommand gains an `action` enum:
 enum DaemonAction {
     /// Start the daemon (default if no action specified)
     Start {
+        /// Path to threshold config file
         #[arg(short, long)]
         config: Option<String>,
     },
-    /// Stop the running daemon
+    /// Stop the running daemon gracefully via SIGTERM
     Stop {
         /// Data directory (default: $THRESHOLD_DATA_DIR or ~/.threshold)
         #[arg(long)]
         data_dir: Option<String>,
     },
-    /// Restart the daemon (stop, optional rebuild, start)
+    /// Rebuild from source, then restart the daemon. Build runs BEFORE
+    /// shutdown — if it fails, the running daemon is untouched. Use
+    /// --follow-on-conversation and --follow-on-prompt to resume an
+    /// agent conversation after restart.
     Restart {
         /// Data directory (default: $THRESHOLD_DATA_DIR or ~/.threshold)
         #[arg(long)]
         data_dir: Option<String>,
-        /// Skip cargo build (use existing binary)
+        /// Skip cargo build (restart with existing binary)
         #[arg(long)]
         skip_build: bool,
-        /// Conversation ID for follow-on prompt after restart
-        #[arg(long)]
+        /// Conversation ID to receive the follow-on prompt after restart
+        #[arg(long, requires = "follow_on_prompt")]
         follow_on_conversation: Option<String>,
-        /// Follow-on prompt to inject after restart
-        #[arg(long)]
+        /// Prompt to inject into the conversation after restart (e.g.,
+        /// "Restart complete. Verify the fix took effect.")
+        #[arg(long, requires = "follow_on_conversation")]
         follow_on_prompt: Option<String>,
     },
-    /// Show daemon status and health
+    /// Show daemon status: PID, uptime, version, scheduler task counts
     Status {
         /// Data directory (default: $THRESHOLD_DATA_DIR or ~/.threshold)
         #[arg(long)]
         data_dir: Option<String>,
     },
-    /// Install as launchd service (macOS)
+    /// Install as a macOS launchd service for auto-start on boot
     Install {
         /// Data directory (default: $THRESHOLD_DATA_DIR or ~/.threshold)
         #[arg(long)]
         data_dir: Option<String>,
     },
-    /// Remove launchd service
+    /// Remove the launchd service (daemon will no longer auto-start)
     Uninstall,
 }
 ```
 
 All management actions (`stop`, `restart`, `status`, `install`) accept `--data-dir` for non-default data directory locations. The data dir is resolved in order: `--data-dir` flag → `THRESHOLD_DATA_DIR` env var → `~/.threshold` default. The PID file and socket path are derived from the data dir.
+
+**Help flags:** Clap auto-generates `-h` and `--help` for every subcommand. This is the primary discovery mechanism for agents — they don't need to memorize the CLI interface. An agent can run `threshold --help` to see all top-level commands, `threshold daemon --help` to see all daemon actions, and `threshold daemon restart --help` to see restart-specific flags. The `/// doc comments` on the `DaemonAction` variants and `#[arg(...)]` fields become the help text, so they should be written as clear, concise descriptions suitable for both human and agent consumption.
 
 **Backward compatibility:** To avoid breaking existing `threshold daemon --config <path>` invocations, `Start` is the default subcommand. If no action is given, it behaves as `threshold daemon start`.
 
@@ -690,7 +697,7 @@ Agent (in a Claude CLI conversation):
   1. Makes code changes (edit files, run tests)
   2. Runs: threshold daemon restart \
        --follow-on-conversation <this-conversation-id> \
-       --follow-on-prompt "Restart complete. Verifying the fix took effect."
+       --follow-on-prompt "Restart complete. Verify the fix took effect."
 
   Standalone mode:
     3. The CLI builds first — if build fails, returns error and daemon stays running
@@ -706,7 +713,7 @@ Agent (in a Claude CLI conversation):
 After restart (both modes):
   - New daemon processes the follow-on hook
   - Agent's conversation receives the follow-on prompt
-  - Agent continues: "Good, restart succeeded. Let me verify..."
+  - Agent picks up: "Restart confirmed. Running tests to verify the fix..."
 ```
 
 The conversation ID is available to the agent via its conversation context. The `memory.md` file for each conversation is at `$DATA_DIR/conversations/{conversation_id}/memory.md`, so the agent can look up or infer its own conversation ID.
@@ -830,7 +837,7 @@ Manual testing sequence:
 7. Wrapper test: run `scripts/threshold-wrapper.sh`, trigger restart via `threshold daemon restart`, verify wrapper rebuilds and restarts
 8. Wrapper stop: run `threshold daemon stop` under wrapper, verify wrapper exits (stop sentinel)
 9. Reboot test: restart machine, verify daemon starts automatically
-10. Agent restart: in a conversation, agent runs `threshold daemon restart --follow-on-conversation <id> --follow-on-prompt "Verifying..."` — verify daemon restarts and conversation resumes
+10. Agent restart: in a conversation, agent runs `threshold daemon restart --follow-on-conversation <id> --follow-on-prompt "Restart complete. Verify the fix took effect."` — verify daemon restarts and conversation resumes
 11. Uninstall: `threshold daemon uninstall` — verify plist removed
 
 ---
