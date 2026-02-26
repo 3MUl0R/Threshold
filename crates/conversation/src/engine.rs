@@ -2786,6 +2786,61 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn backfill_repairs_sentinel_primary_on_startup() {
+        let dir = tempdir().unwrap();
+
+        // Step 1: Create engine, register a real portal, then manually set
+        // primary to a sentinel portal (simulating legacy state).
+        let (conversation_id, real_portal_id) = {
+            let (engine, _rx) = make_engine_with_dir(dir.path()).await;
+
+            let real_portal_id = engine
+                .register_portal(PortalType::Discord {
+                    guild_id: 1,
+                    channel_id: 100,
+                })
+                .await
+                .unwrap();
+
+            let conversations = engine.list_conversations().await;
+            let general = conversations
+                .iter()
+                .find(|c| c.mode == ConversationMode::General)
+                .unwrap();
+            let conv_id = general.id;
+
+            // Register a sentinel portal and set it as primary
+            let sentinel_portal_id = engine.register_portal(PortalType::default()).await.unwrap();
+            engine
+                .set_primary_portal(conv_id, sentinel_portal_id)
+                .await
+                .unwrap();
+
+            // Verify sentinel is now primary
+            let conversations = engine.list_conversations().await;
+            let general = conversations.iter().find(|c| c.id == conv_id).unwrap();
+            assert_eq!(general.primary_portal, Some(sentinel_portal_id));
+
+            engine.save_state().await.unwrap();
+            (conv_id, real_portal_id)
+        };
+
+        // Step 2: Create a new engine — backfill should replace sentinel primary
+        let (engine2, _rx) = make_engine_with_dir(dir.path()).await;
+
+        let conversations = engine2.list_conversations().await;
+        let general = conversations
+            .iter()
+            .find(|c| c.id == conversation_id)
+            .unwrap();
+        assert_eq!(
+            general.primary_portal,
+            Some(real_portal_id),
+            "backfill should replace sentinel primary with real portal"
+        );
+    }
+
     // --- Phase 15B tests ---
 
     #[test]
