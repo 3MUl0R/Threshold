@@ -1111,12 +1111,20 @@ impl ConversationEngine {
             }
         } // portals lock dropped
 
-        {
+        let changed = {
             let mut conversations = self.conversations.write().await;
             if let Some(conv) = conversations.get_mut(&conversation_id) {
                 conv.primary_portal = Some(portal_id);
+                true
+            } else {
+                false
             }
-            conversations.save().await?;
+        }; // conversations lock dropped before .await
+
+        if changed {
+            if let Err(e) = self.save_conversations().await {
+                tracing::warn!("Failed to persist primary portal assignment: {}", e);
+            }
         }
         Ok(())
     }
@@ -1425,8 +1433,34 @@ impl ConversationEngine {
         let _work_guard = self.daemon_state.as_ref().map(WorkGuard::acquire);
 
         let run_id = RunId::new();
+
+        // Validate portal_id: if provided, verify the portal exists and is
+        // attached to this conversation. Otherwise events will be silently
+        // dropped (no listener matches the DeliveryFilter::Portal target).
         let delivery_target = match portal_id {
-            Some(pid) => DeliveryFilter::Portal(pid),
+            Some(pid) => {
+                let portals = self.portals.read().await;
+                match portals.get(&pid) {
+                    Some(portal) if portal.conversation_id == *conversation_id => {
+                        DeliveryFilter::Portal(pid)
+                    }
+                    Some(_) => {
+                        tracing::warn!(
+                            portal_id = %pid.0,
+                            conversation_id = %conversation_id.0,
+                            "Portal not attached to conversation, falling back to PrimaryOnly"
+                        );
+                        DeliveryFilter::PrimaryOnly
+                    }
+                    None => {
+                        tracing::warn!(
+                            portal_id = %pid.0,
+                            "Portal not found, falling back to PrimaryOnly"
+                        );
+                        DeliveryFilter::PrimaryOnly
+                    }
+                }
+            }
             None => DeliveryFilter::PrimaryOnly,
         };
 

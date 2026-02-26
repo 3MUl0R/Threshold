@@ -114,6 +114,18 @@ pub enum PortalType {
     // Phone { number: String },
 }
 
+impl Default for PortalType {
+    /// Default portal type for backward compatibility with pre-Milestone-15
+    /// portal state that lacked `portal_type`. Uses zeroed Discord IDs as a
+    /// sentinel — these portals will be re-created with real IDs on next connect.
+    fn default() -> Self {
+        PortalType::Discord {
+            guild_id: 0,
+            channel_id: 0,
+        }
+    }
+}
+
 impl PortalType {
     /// Human-readable platform name for display and tagging.
     pub fn platform_name(&self) -> &'static str {
@@ -126,6 +138,9 @@ impl PortalType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Portal {
     pub id: PortalId,
+    /// Type of portal (Discord, Web, etc.). Defaults to `PortalType::default()`
+    /// for backward compatibility with pre-Milestone-15 portal state files.
+    #[serde(default)]
     pub portal_type: PortalType,
     pub conversation_id: ConversationId,
     pub connected_at: DateTime<Utc>,
@@ -463,6 +478,25 @@ mod tests {
         let restored: Portal = serde_json::from_str(&json).unwrap();
         assert_eq!(portal.id, restored.id);
         assert_eq!(portal.conversation_id, restored.conversation_id);
+    }
+
+    #[test]
+    fn portal_serde_backward_compat_missing_portal_type() {
+        // Pre-Milestone-15 portal JSON without portal_type field.
+        // Must deserialize successfully using the Default impl.
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "conversation_id": "00000000-0000-0000-0000-000000000002",
+            "connected_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let portal: Portal = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            portal.portal_type,
+            PortalType::Discord {
+                guild_id: 0,
+                channel_id: 0
+            }
+        ));
     }
 
     #[test]
