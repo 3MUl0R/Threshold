@@ -145,6 +145,7 @@ mod integration_tests {
                 None,
                 false,
                 0,
+                None,
             )
             .await
             .unwrap(),
@@ -166,6 +167,7 @@ mod integration_tests {
             cancel: cancel.clone(),
             start_time: chrono::Utc::now(),
             templates,
+            daemon_state: None,
         };
 
         let app = routes::build_router(state);

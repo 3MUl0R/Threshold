@@ -47,6 +47,21 @@ async fn handle_message(
         return Ok(());
     }
 
+    // 2b. Drain check: reject new work if daemon is shutting down
+    if let Some(ds) = &data.daemon_state {
+        if ds.is_draining() {
+            let _ = msg
+                .channel_id
+                .say(
+                    &ctx.http,
+                    "Threshold is restarting. Your message will not be processed \
+                     — please retry in a moment.",
+                )
+                .await;
+            return Ok(());
+        }
+    }
+
     // 3. Find or create portal for this channel
     let portal_id = resolve_or_create_portal(
         &data.engine,

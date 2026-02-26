@@ -62,6 +62,7 @@ async fn save_config(
     headers: axum::http::HeaderMap,
     axum::Form(form): axum::Form<ConfigForm>,
 ) -> Result<Response, WebError> {
+    crate::helpers::check_not_draining(&state)?;
     validate_csrf(&headers, &form._csrf)?;
 
     // Parse the TOML to validate it
@@ -202,6 +203,7 @@ async fn set_credential(
     headers: axum::http::HeaderMap,
     axum::Form(form): axum::Form<CredentialForm>,
 ) -> Result<Response, WebError> {
+    crate::helpers::check_not_draining(&state)?;
     validate_csrf(&headers, &form._csrf)?;
 
     // Validate the key: alphanumeric, dashes, dots, @ (for Gmail inbox-specific keys)
@@ -248,6 +250,7 @@ async fn delete_credential(
     headers: axum::http::HeaderMap,
     axum::Form(form): axum::Form<CsrfOnlyForm>,
 ) -> Result<Response, WebError> {
+    crate::helpers::check_not_draining(&state)?;
     validate_csrf(&headers, &form._csrf)?;
 
     // Validate key format

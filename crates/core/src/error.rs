@@ -83,6 +83,12 @@ pub enum ThresholdError {
 
     #[error("Task aborted")]
     Aborted,
+
+    #[error("Daemon already running (PID {pid})")]
+    DaemonAlreadyRunning { pid: u32 },
+
+    #[error("Daemon is draining — not accepting new work")]
+    DaemonDraining,
 }
 
 pub type Result<T> = std::result::Result<T, ThresholdError>;
@@ -188,5 +194,13 @@ mod tests {
             message: "Invalid cron expression".into(),
         };
         assert!(err.to_string().contains("Invalid cron expression"));
+    }
+
+    #[test]
+    fn daemon_already_running_displays_pid() {
+        let err = ThresholdError::DaemonAlreadyRunning { pid: 12345 };
+        let msg = err.to_string();
+        assert!(msg.contains("12345"));
+        assert!(msg.contains("already running"));
     }
 }

@@ -8,7 +8,7 @@ use crate::security::is_authorized;
 use std::sync::Arc;
 use threshold_conversation::ConversationEngine;
 use threshold_core::config::DiscordConfig;
-use threshold_core::{Result, ThresholdError};
+use threshold_core::{DaemonState, Result, ThresholdError};
 use threshold_scheduler::SchedulerHandle;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -19,6 +19,7 @@ pub struct BotData {
     pub config: DiscordConfig,
     pub outbound: Arc<DiscordOutbound>,
     pub scheduler: Option<SchedulerHandle>,
+    pub daemon_state: Option<Arc<DaemonState>>,
 }
 
 pub type Context<'a> = poise::Context<'a, BotData, ThresholdError>;
@@ -33,6 +34,7 @@ pub async fn build_and_start(
     token: &str,
     cancel: CancellationToken,
     scheduler: Option<SchedulerHandle>,
+    daemon_state: Option<Arc<DaemonState>>,
 ) -> Result<Arc<DiscordOutbound>> {
     // Shared slot for outbound handle - populated by setup closure
     let outbound_slot: Arc<RwLock<Option<Arc<DiscordOutbound>>>> = Arc::new(RwLock::new(None));
@@ -93,6 +95,7 @@ pub async fn build_and_start(
                     config,
                     outbound,
                     scheduler,
+                    daemon_state,
                 })
             })
         })

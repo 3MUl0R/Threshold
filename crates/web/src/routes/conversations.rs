@@ -242,6 +242,9 @@ async fn delete(
     headers: axum::http::HeaderMap,
     axum::Form(form): axum::Form<DeleteForm>,
 ) -> Result<Response, WebError> {
+    // Drain check
+    crate::helpers::check_not_draining(&state)?;
+
     // Validate CSRF
     let cookie_header = headers
         .get(header::COOKIE)

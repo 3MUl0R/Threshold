@@ -219,6 +219,88 @@ pub struct Message {
     pub timestamp: DateTime<Utc>,
 }
 
+// ──── Daemon State ────
+
+/// Static health configuration, set at daemon startup and never changing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthConfig {
+    pub pid: u32,
+    pub started_at: DateTime<Utc>,
+    pub version: String,
+}
+
+/// Shared daemon state for drain management and active work tracking.
+///
+/// Uses atomics for lock-free reads from health checks and drain checks.
+/// An `Arc<DaemonState>` is created at daemon startup and passed to all subsystems.
+#[derive(Debug)]
+pub struct DaemonState {
+    /// True when the daemon is preparing to shut down.
+    draining: std::sync::atomic::AtomicBool,
+    /// Number of active work items (conversations, script tasks, etc.).
+    active_work: std::sync::atomic::AtomicU32,
+}
+
+impl DaemonState {
+    pub fn new() -> Self {
+        Self {
+            draining: std::sync::atomic::AtomicBool::new(false),
+            active_work: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set_draining(&self, value: bool) {
+        self.draining
+            .store(value, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn active_work(&self) -> u32 {
+        self.active_work
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn increment_work(&self) -> u32 {
+        self.active_work
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1
+    }
+
+    pub fn decrement_work(&self) -> u32 {
+        let prev = self
+            .active_work
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |n| Some(n.saturating_sub(1)),
+            )
+            .unwrap(); // fetch_update with Some always succeeds
+        debug_assert!(prev > 0, "active_work underflow: double-decrement bug");
+        prev.saturating_sub(1)
+    }
+}
+
+impl Default for DaemonState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// RAII guard that decrements `DaemonState.active_work` on drop.
+///
+/// Guarantees the counter is decremented on all exit paths — success, error,
+/// panic, and cancellation.
+pub struct WorkGuard(pub std::sync::Arc<DaemonState>);
+
+impl Drop for WorkGuard {
+    fn drop(&mut self) {
+        self.0.decrement_work();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,5 +517,68 @@ mod tests {
         assert_eq!(agent.name, restored.name);
         assert_eq!(agent.tool_profile, restored.tool_profile);
         assert_eq!(agent.system_prompt, restored.system_prompt);
+    }
+
+    #[test]
+    fn health_config_serde_round_trip() {
+        let config = HealthConfig {
+            pid: 12345,
+            started_at: Utc::now(),
+            version: "0.1.0".into(),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: HealthConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.pid, 12345);
+        assert_eq!(restored.version, "0.1.0");
+    }
+
+    #[test]
+    fn daemon_state_default_values() {
+        let state = DaemonState::new();
+        assert!(!state.is_draining());
+        assert_eq!(state.active_work(), 0);
+    }
+
+    #[test]
+    fn daemon_state_draining_toggle() {
+        let state = DaemonState::new();
+        state.set_draining(true);
+        assert!(state.is_draining());
+        state.set_draining(false);
+        assert!(!state.is_draining());
+    }
+
+    #[test]
+    fn daemon_state_active_work_increment_decrement() {
+        let state = DaemonState::new();
+        assert_eq!(state.increment_work(), 1);
+        assert_eq!(state.increment_work(), 2);
+        assert_eq!(state.active_work(), 2);
+        assert_eq!(state.decrement_work(), 1);
+        assert_eq!(state.decrement_work(), 0);
+        assert_eq!(state.active_work(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "active_work underflow")]
+    fn daemon_state_decrement_saturates_at_zero() {
+        let state = DaemonState::new();
+        // In debug builds, the debug_assert fires on underflow.
+        // The value still saturates (won't wrap to u32::MAX) via saturating_sub.
+        state.decrement_work();
+    }
+
+    #[test]
+    fn work_guard_decrements_on_drop() {
+        let state = std::sync::Arc::new(DaemonState::new());
+        state.increment_work();
+        assert_eq!(state.active_work(), 1);
+        {
+            let _guard = WorkGuard(state.clone());
+            // active_work still 1 while guard is alive
+            assert_eq!(state.active_work(), 1);
+        }
+        // guard dropped, counter decremented
+        assert_eq!(state.active_work(), 0);
     }
 }

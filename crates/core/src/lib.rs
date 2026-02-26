@@ -14,7 +14,7 @@ pub use logging::init_logging;
 pub use paths::resolve_path;
 pub use secrets::{SecretBackend, SecretStore};
 pub use types::{
-    AgentConfig, CliProvider, Conversation, ConversationId, ConversationMode, Message, MessageRole,
-    Portal, PortalId, PortalType, ResultSender, RunId, ScheduledAction, ToolPermissionMode,
-    ToolProfile,
+    AgentConfig, CliProvider, Conversation, ConversationId, ConversationMode, DaemonState,
+    HealthConfig, Message, MessageRole, Portal, PortalId, PortalType, ResultSender, RunId,
+    ScheduledAction, ToolPermissionMode, ToolProfile, WorkGuard,
 };

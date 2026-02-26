@@ -122,6 +122,7 @@ async fn toggle(
     headers: axum::http::HeaderMap,
     axum::Form(form): axum::Form<CsrfForm>,
 ) -> Result<Response, WebError> {
+    crate::helpers::check_not_draining(&state)?;
     validate_csrf(&headers, &form._csrf)?;
 
     let handle = state
@@ -169,6 +170,7 @@ async fn delete(
     headers: axum::http::HeaderMap,
     axum::Form(form): axum::Form<CsrfForm>,
 ) -> Result<Response, WebError> {
+    crate::helpers::check_not_draining(&state)?;
     validate_csrf(&headers, &form._csrf)?;
 
     let handle = state

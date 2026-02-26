@@ -10,6 +10,7 @@ pub enum WebError {
     Internal(String),
     BadRequest(String),
     SchedulerNotRunning,
+    DaemonDraining,
     CsrfMismatch,
 }
 
@@ -20,6 +21,9 @@ impl std::fmt::Display for WebError {
             WebError::Internal(msg) => write!(f, "Internal error: {msg}"),
             WebError::BadRequest(msg) => write!(f, "Bad request: {msg}"),
             WebError::SchedulerNotRunning => write!(f, "Scheduler is not running"),
+            WebError::DaemonDraining => {
+                write!(f, "Threshold is restarting — please try again shortly")
+            }
             WebError::CsrfMismatch => write!(f, "Invalid CSRF token"),
         }
     }
@@ -34,6 +38,10 @@ impl IntoResponse for WebError {
             WebError::SchedulerNotRunning => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Scheduler is not running".into(),
+            ),
+            WebError::DaemonDraining => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Threshold is restarting — please try again shortly".into(),
             ),
             WebError::CsrfMismatch => (StatusCode::FORBIDDEN, "Invalid CSRF token".into()),
         };

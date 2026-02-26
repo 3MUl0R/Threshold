@@ -16,7 +16,9 @@ use uuid::Uuid;
 
 use threshold_cli_wrapper::ClaudeClient;
 use threshold_conversation::ConversationEngine;
-use threshold_core::{ActiveConversations, ResultSender, ScheduledAction, ThresholdError};
+use threshold_core::{
+    ActiveConversations, DaemonState, ResultSender, ScheduledAction, ThresholdError,
+};
 
 use crate::execution;
 use crate::store;
@@ -126,6 +128,8 @@ pub struct Scheduler {
     completion_rx: mpsc::UnboundedReceiver<(Uuid, TaskRunResult)>,
     completion_tx: mpsc::UnboundedSender<(Uuid, TaskRunResult)>,
     cancel: CancellationToken,
+    /// Shared daemon state for drain checks and active work tracking.
+    daemon_state: Option<Arc<DaemonState>>,
 }
 
 impl Scheduler {
@@ -142,6 +146,7 @@ impl Scheduler {
         result_sender: Option<Arc<dyn ResultSender>>,
         active_conversations: Arc<ActiveConversations>,
         cancel: CancellationToken,
+        daemon_state: Option<Arc<DaemonState>>,
     ) -> (Self, SchedulerHandle) {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (completion_tx, completion_rx) = mpsc::unbounded_channel();
@@ -173,6 +178,7 @@ impl Scheduler {
             completion_rx,
             completion_tx,
             cancel,
+            daemon_state,
         };
 
         let handle = SchedulerHandle { command_tx };
@@ -355,6 +361,13 @@ impl Scheduler {
 
     /// Check for due tasks and spawn them with bounded concurrency.
     async fn check_and_run(&mut self) {
+        // Skip firing tasks if daemon is draining
+        if let Some(ds) = &self.daemon_state {
+            if ds.is_draining() {
+                return;
+            }
+        }
+
         let now = Utc::now();
 
         let due_task_ids: Vec<Uuid> = self
@@ -423,6 +436,7 @@ impl Scheduler {
             let engine = self.engine.clone();
             let result_sender = self.result_sender.clone();
             let completion_tx = self.completion_tx.clone();
+            let daemon_state = self.daemon_state.clone();
             tokio::spawn(async move {
                 let _permit = match semaphore.acquire().await {
                     Ok(permit) => permit,
@@ -430,6 +444,21 @@ impl Scheduler {
                 };
 
                 running_tasks.write().await.insert(task_snapshot.id);
+
+                // Track active work for non-ResumeConversation tasks.
+                // ResumeConversation goes through engine.send_to_conversation() which
+                // has its own WorkGuard — no double-counting.
+                let _work_guard = if !matches!(
+                    task_snapshot.action,
+                    ScheduledAction::ResumeConversation { .. }
+                ) {
+                    daemon_state.as_ref().map(|ds| {
+                        ds.increment_work();
+                        threshold_core::WorkGuard(ds.clone())
+                    })
+                } else {
+                    None
+                };
 
                 // For ResumeConversation tasks, mark the conversation as active
                 let conversation_id = if let ScheduledAction::ResumeConversation {
@@ -548,7 +577,7 @@ mod tests {
             web: None,
         };
         let engine = Arc::new(
-            ConversationEngine::new(&config, claude.clone(), None, None, None, false, 0)
+            ConversationEngine::new(&config, claude.clone(), None, None, None, false, 0, None)
                 .await
                 .unwrap(),
         );
@@ -559,6 +588,7 @@ mod tests {
             None,
             Arc::new(ActiveConversations::new()),
             cancel,
+            None,
         )
         .await
     }

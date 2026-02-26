@@ -6,7 +6,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use threshold_conversation::ConversationEngine;
 use threshold_core::config::ThresholdConfig;
-use threshold_core::SecretStore;
+use threshold_core::{DaemonState, SecretStore};
 use threshold_scheduler::SchedulerHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -22,4 +22,5 @@ pub struct AppState {
     pub cancel: CancellationToken,
     pub start_time: DateTime<Utc>,
     pub templates: Arc<minijinja::Environment<'static>>,
+    pub daemon_state: Option<Arc<DaemonState>>,
 }

@@ -71,7 +71,7 @@ async fn main() {
     );
 
     let engine = Arc::new(
-        threshold_conversation::ConversationEngine::new(&config, claude, None, None, None, false, 0)
+        threshold_conversation::ConversationEngine::new(&config, claude, None, None, None, false, 0, None)
             .await
             .unwrap(),
     );
@@ -95,6 +95,7 @@ async fn main() {
         cancel: cancel.clone(),
         start_time: chrono::Utc::now(),
         templates: tpl,
+        daemon_state: None,
     };
 
     let app = routes::build_router(state);

@@ -15,7 +15,7 @@ use threshold_cli_wrapper::response::Usage;
 use threshold_core::config::{AgentConfigToml, ThresholdConfig};
 use threshold_core::{
     ActiveConversations, AgentConfig, CliProvider, Conversation, ConversationId, ConversationMode,
-    PortalId, PortalType, Result, RunId, ThresholdError, ToolProfile,
+    DaemonState, PortalId, PortalType, Result, RunId, ThresholdError, ToolProfile, WorkGuard,
 };
 use tokio::sync::{RwLock, broadcast};
 
@@ -103,6 +103,8 @@ pub struct ConversationEngine {
     ack_enabled: bool,
     /// Interval in seconds for live status updates (0 = disabled).
     status_interval_secs: u64,
+    /// Shared daemon state for drain checks and active work tracking.
+    daemon_state: Option<Arc<DaemonState>>,
 }
 
 impl ConversationEngine {
@@ -121,6 +123,7 @@ impl ConversationEngine {
         haiku: Option<Arc<HaikuClient>>,
         ack_enabled: bool,
         status_interval_secs: u64,
+        daemon_state: Option<Arc<DaemonState>>,
     ) -> Result<Self> {
         // Resolve data directory from config
         let data_dir = config.data_dir()?;
@@ -160,6 +163,7 @@ impl ConversationEngine {
             haiku,
             ack_enabled,
             status_interval_secs,
+            daemon_state,
         })
     }
 
@@ -290,6 +294,19 @@ impl ConversationEngine {
     /// tracking in future phases.
     pub async fn handle_message(&self, portal_id: &PortalId, content: &str) -> Result<()> {
         use threshold_cli_wrapper::stream::StreamEvent;
+
+        // Drain check: reject new work if daemon is shutting down
+        if let Some(ds) = &self.daemon_state {
+            if ds.is_draining() {
+                return Err(ThresholdError::DaemonDraining);
+            }
+        }
+
+        // Track active work via RAII guard (decrements on all exit paths)
+        let _work_guard = self.daemon_state.as_ref().map(|ds| {
+            ds.increment_work();
+            WorkGuard(ds.clone())
+        });
 
         let run_id = RunId::new();
 
@@ -1096,6 +1113,19 @@ impl ConversationEngine {
     ) -> Result<String> {
         use threshold_cli_wrapper::stream::StreamEvent;
 
+        // Drain check: reject new work if daemon is shutting down
+        if let Some(ds) = &self.daemon_state {
+            if ds.is_draining() {
+                return Err(ThresholdError::DaemonDraining);
+            }
+        }
+
+        // Track active work via RAII guard (decrements on all exit paths)
+        let _work_guard = self.daemon_state.as_ref().map(|ds| {
+            ds.increment_work();
+            WorkGuard(ds.clone())
+        });
+
         let run_id = RunId::new();
 
         // 1. Look up conversation
@@ -1636,7 +1666,7 @@ mod tests {
             .unwrap(),
         );
 
-        let engine = ConversationEngine::new(&config, claude, None, None, None, false, 0).await.unwrap();
+        let engine = ConversationEngine::new(&config, claude, None, None, None, false, 0, None).await.unwrap();
 
         let agent = engine.resolve_agent_for_mode(&ConversationMode::Coding {
             project: "test".to_string(),
@@ -1668,7 +1698,7 @@ mod tests {
             .unwrap(),
         );
 
-        let engine = ConversationEngine::new(&config, claude, None, None, None, false, 0).await.unwrap();
+        let engine = ConversationEngine::new(&config, claude, None, None, None, false, 0, None).await.unwrap();
 
         let agent = engine.resolve_agent_for_mode(&ConversationMode::General);
 
@@ -1861,7 +1891,7 @@ mod tests {
             scheduler: None,
             web: None,
         };
-        let engine = Arc::new(ConversationEngine::new(&config, claude, None, None, None, false, 0).await.unwrap());
+        let engine = Arc::new(ConversationEngine::new(&config, claude, None, None, None, false, 0, None).await.unwrap());
         let rx = engine.subscribe();
         (engine, rx)
     }
