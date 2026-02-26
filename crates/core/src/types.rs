@@ -133,6 +133,18 @@ impl PortalType {
             PortalType::Discord { .. } => "Discord",
         }
     }
+
+    /// Check if this is a sentinel portal from backward-compatible deserialization.
+    /// Sentinel portals have zeroed IDs and should not be assigned as primary.
+    pub fn is_sentinel(&self) -> bool {
+        matches!(
+            self,
+            PortalType::Discord {
+                guild_id: 0,
+                channel_id: 0,
+            }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

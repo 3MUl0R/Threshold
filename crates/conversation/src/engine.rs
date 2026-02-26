@@ -1063,7 +1063,7 @@ impl ConversationEngine {
             portals
                 .get_portals_for_conversation(&conversation_id)
                 .iter()
-                .filter(|p| p.id != detached_portal)
+                .filter(|p| p.id != detached_portal && !p.portal_type.is_sentinel())
                 .min_by_key(|p| p.connected_at)
                 .map(|p| p.id)
         }; // portals lock dropped
@@ -1122,9 +1122,7 @@ impl ConversationEngine {
         }; // conversations lock dropped before .await
 
         if changed {
-            if let Err(e) = self.save_conversations().await {
-                tracing::warn!("Failed to persist primary portal assignment: {}", e);
-            }
+            self.save_conversations().await?;
         }
         Ok(())
     }
@@ -1194,6 +1192,7 @@ impl ConversationEngine {
                     portals
                         .get_portals_for_conversation(&conv.id)
                         .iter()
+                        .filter(|p| !p.portal_type.is_sentinel())
                         .min_by_key(|p| p.connected_at)
                         .map(|p| (conv.id, p.id))
                 })
