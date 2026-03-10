@@ -10,7 +10,7 @@ Threshold is a conversation-centric Rust daemon. Interfaces (Discord, web today;
 cargo build --release                          # Build release binary
 cargo test --workspace                         # Run workspace tests
 cargo test -p threshold-<crate> --lib          # Run a single crate's library tests
-./target/release/threshold daemon              # Start daemon (current stable entrypoint)
+./target/release/threshold daemon start         # Start the daemon
 ./target/release/threshold daemon --help       # Check daemon command surface on this branch
 cargo fmt --all && cargo clippy --workspace    # Format and lint
 ```
@@ -25,7 +25,7 @@ crates/
 ├── discord/        Discord bot via poise/serenity (depends: core, conversation, scheduler)
 ├── gmail/          Gmail OAuth + API client (depends: core)
 ├── imagegen/       Image generation API client (depends: core)
-├── scheduler/      Cron scheduler + daemon API over Unix socket (depends: core)
+├── scheduler/      Cron scheduler + daemon API over Unix socket (depends: core, cli-wrapper, conversation)
 ├── tools/          Tool prompt builder (depends: core)
 ├── web/            Web dashboard: axum + minijinja + htmx + Pico CSS
 └── server/         Main daemon binary — composition/wiring layer
