@@ -40,6 +40,9 @@ pub async fn build_and_start(
     let outbound_slot: Arc<RwLock<Option<Arc<DiscordOutbound>>>> = Arc::new(RwLock::new(None));
     let outbound_slot_setup = outbound_slot.clone();
 
+    // Clone engine before the setup closure captures it — needed for portal restoration
+    let engine_for_restore = engine.clone();
+
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
             commands: vec![
@@ -142,6 +145,16 @@ pub async fn build_and_start(
     })
     .await
     .map_err(|_| ThresholdError::External("Timeout waiting for Discord bot setup".to_string()))?;
+
+    // Restore portal listeners for all existing portals loaded from disk.
+    // This ensures scheduled tasks and engine-initiated events can reach
+    // Discord channels immediately, without waiting for a user message.
+    crate::handler::restore_portal_listeners(
+        outbound.http().clone(),
+        engine_for_restore,
+        outbound.clone(),
+    )
+    .await;
 
     Ok(outbound)
 }

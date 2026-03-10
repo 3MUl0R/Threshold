@@ -48,6 +48,9 @@ impl CliProcess {
             env_clear: vec![
                 "ANTHROPIC_API_KEY".to_string(),
                 "ANTHROPIC_API_KEY_OLD".to_string(),
+                // Prevent "cannot be launched inside another Claude Code
+                // session" when the daemon itself was started from Claude Code.
+                "CLAUDECODE".to_string(),
             ],
         }
     }
@@ -642,6 +645,35 @@ mod tests {
         // If the fix works, the reader task kills the child and returns.
         // If it doesn't, this test would hang (caught by the 10s timeout).
         tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    #[test]
+    fn env_clear_includes_claudecode() {
+        // CLAUDECODE must be stripped so child Claude CLI processes don't
+        // refuse to start when the daemon was launched from Claude Code.
+        let process = CliProcess::new("test");
+        assert!(
+            process.env_clear.contains(&"CLAUDECODE".to_string()),
+            "env_clear must include CLAUDECODE"
+        );
+    }
+
+    #[tokio::test]
+    async fn claudecode_env_not_inherited_by_child() {
+        // Set CLAUDECODE in our process, then verify the child doesn't see it.
+        // SAFETY: single-threaded test setup.
+        unsafe { std::env::set_var("CLAUDECODE", "1") };
+
+        let process = CliProcess::new("env");
+        let result = process.run(&[], None, None).await.unwrap();
+
+        // Restore
+        unsafe { std::env::remove_var("CLAUDECODE") };
+
+        assert!(
+            !result.stdout.contains("CLAUDECODE="),
+            "child process should not inherit CLAUDECODE"
+        );
     }
 
     #[test]

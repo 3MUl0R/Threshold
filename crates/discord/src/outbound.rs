@@ -13,6 +13,11 @@ impl DiscordOutbound {
         Self { http }
     }
 
+    /// Access the underlying HTTP client.
+    pub fn http(&self) -> &Arc<serenity::all::Http> {
+        &self.http
+    }
+
     /// Send a text message to a channel.
     pub async fn send_to_channel(&self, channel_id: u64, content: &str) -> Result<()> {
         let channel = serenity::all::ChannelId::new(channel_id);

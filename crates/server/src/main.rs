@@ -219,6 +219,18 @@ async fn run_daemon(config_arg: Option<String>) -> anyhow::Result<()> {
 
     tracing::info!("Threshold starting...");
 
+    // Sanitize inherited environment: remove variables that would cause
+    // spawned Claude CLI subprocesses to fail.  The most common case is
+    // CLAUDECODE — set when the daemon is launched from Claude Code — which
+    // makes the CLI refuse to start ("cannot launch inside another session").
+    for key in &["CLAUDECODE"] {
+        if std::env::var_os(key).is_some() {
+            // SAFETY: called on the main thread before spawning async tasks.
+            unsafe { std::env::remove_var(key) };
+            tracing::info!(key, "Removed inherited environment variable");
+        }
+    }
+
     // 3. PID file: check for existing daemon, then write our PID
     let data_dir = config.data_dir()?;
     check_existing_daemon(&data_dir)?;
@@ -1122,6 +1134,10 @@ async fn run_daemon_restart(
     }
 
     // Step 8: Standalone restart — start new daemon
+    //
+    // The restart CLI may be running inside an agent session (Claude Code)
+    // which sets environment variables like CLAUDECODE.  The new daemon must
+    // start with a clean environment — as if the user launched it directly.
     println!("Starting new daemon...");
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
@@ -1129,10 +1145,29 @@ async fn run_daemon_restart(
     if let Ok(config_path) = std::env::var("THRESHOLD_CONFIG") {
         cmd.args(["--config", &config_path]);
     }
-    // Spawn detached
+
+    // Strip environment variables that would break spawned Claude CLI sessions
+    cmd.env_remove("CLAUDECODE");
+
+    // Detach from caller's process tree so the daemon survives even if the
+    // CLI process (or its parent agent) is killed.
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid() is async-signal-safe and creates a new session,
+        // fully detaching the daemon from the caller's process group.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+
     cmd.spawn()
         .map_err(|e| anyhow::anyhow!("Failed to start new daemon: {}", e))?;
 
@@ -2102,6 +2137,27 @@ mod tests {
         assert!(plist.contains("Tom &amp; Jerry"));
         // And the raw unescaped form does NOT appear
         assert!(!plist.contains("Tom & Jerry<"));
+    }
+
+    #[test]
+    fn restart_spawn_strips_claudecode_env() {
+        // Verify that std::process::Command::env_remove actually prevents
+        // a child from inheriting the variable — same mechanism used in
+        // run_daemon_restart().
+        unsafe { std::env::set_var("CLAUDECODE", "1") };
+
+        let output = std::process::Command::new("env")
+            .env_remove("CLAUDECODE")
+            .output()
+            .unwrap();
+
+        unsafe { std::env::remove_var("CLAUDECODE") };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("CLAUDECODE="),
+            "env_remove must prevent CLAUDECODE inheritance"
+        );
     }
 
     #[test]

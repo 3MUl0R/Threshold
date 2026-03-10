@@ -115,6 +115,12 @@ pub enum ScheduleCommands {
         /// Portal ID to target for output delivery (default: primary portal)
         #[arg(long)]
         portal_id: Option<String>,
+        /// Deliver results to a Discord channel (channel ID)
+        #[arg(long)]
+        discord_channel: Option<u64>,
+        /// Deliver results as a Discord DM (user ID)
+        #[arg(long)]
+        discord_dm: Option<u64>,
         /// Output format
         #[arg(short = 'f', long, value_enum, default_value_t = OutputFormat::default())]
         format: OutputFormat,
@@ -231,6 +237,8 @@ pub async fn handle_schedule_command(command: ScheduleCommands) -> anyhow::Resul
             prompt,
             timezone,
             portal_id,
+            discord_channel,
+            discord_dm,
             ..
         } => {
             let conv_id = ConversationId(
@@ -254,6 +262,7 @@ pub async fn handle_schedule_command(command: ScheduleCommands) -> anyhow::Resul
                 },
                 timezone.clone(),
             )?;
+            task.delivery = resolve_delivery(*discord_channel, *discord_dm);
             // Mark as conversation-attached so deliver_result() skips
             // duplicate delivery — output goes through the portal system.
             task.conversation_id = Some(conv_id);

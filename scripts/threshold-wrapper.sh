@@ -16,6 +16,11 @@ STATE_DIR="$DATA_DIR/state"
 
 mkdir -p "$STATE_DIR"
 
+# Sanitize inherited environment — the wrapper may have been launched from a
+# Claude Code session.  CLAUDECODE makes spawned Claude CLI subprocesses fail
+# with "cannot be launched inside another Claude Code session".
+unset CLAUDECODE 2>/dev/null || true
+
 # Write supervised marker with wrapper PID and start time so CLI can verify liveness
 echo "{\"wrapper_pid\": $$, \"started_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > "$STATE_DIR/supervised"
 

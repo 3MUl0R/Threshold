@@ -17,6 +17,41 @@ lazy_static::lazy_static! {
     static ref PORTAL_LISTENERS: PortalListeners = Arc::new(RwLock::new(HashMap::new()));
 }
 
+/// Restore portal listeners for all existing Discord portals loaded from disk.
+///
+/// Called once at startup (after the Discord bot is ready) so that scheduled
+/// tasks and other engine-initiated events can reach Discord channels even if
+/// no user has sent a message in that channel since the daemon started.
+pub async fn restore_portal_listeners(
+    http: Arc<serenity::all::Http>,
+    engine: Arc<threshold_conversation::ConversationEngine>,
+    outbound: Arc<crate::outbound::DiscordOutbound>,
+) {
+    let portals = engine.list_portals().await;
+    let mut restored = 0u32;
+
+    for info in &portals {
+        // Only restore Discord portal listeners (other platform types will need
+        // their own restore logic when added).
+        #[allow(irrefutable_let_patterns)]
+        if let threshold_core::PortalType::Discord { channel_id, .. } = &info.portal_type {
+            ensure_portal_listener(
+                info.portal_id,
+                serenity::all::ChannelId::new(*channel_id),
+                http.clone(),
+                engine.clone(),
+                outbound.clone(),
+            )
+            .await;
+            restored += 1;
+        }
+    }
+
+    if restored > 0 {
+        tracing::info!(count = restored, "Restored portal listeners for existing portals");
+    }
+}
+
 /// Event handler for Discord events
 pub async fn event_handler(
     ctx: &serenity::all::Context,
