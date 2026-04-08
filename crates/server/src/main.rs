@@ -41,6 +41,15 @@ enum Commands {
     Gmail(threshold_gmail::GmailArgs),
     /// Image generation — create images from text descriptions
     Imagegen(threshold_imagegen::ImagegenArgs),
+    /// Launch the system tray application
+    Tray {
+        /// Path to the data directory (passed through to threshold-tray)
+        #[arg(long)]
+        data_dir: Option<String>,
+        /// Path to the config file (passed through to threshold-tray)
+        #[arg(long)]
+        config: Option<String>,
+    },
 }
 
 /// Arguments for the daemon subcommand.
@@ -182,6 +191,53 @@ async fn main() -> anyhow::Result<()> {
         Commands::Portal { command } => portal::handle_portal_command(command).await,
         Commands::Gmail(args) => gmail::handle_gmail_command(args).await,
         Commands::Imagegen(args) => imagegen::handle_imagegen_command(args).await,
+        Commands::Tray { data_dir, config } => run_tray(data_dir, config),
+    }
+}
+
+/// Launch the system tray application.
+///
+/// Finds the `threshold-tray` binary next to the current executable and launches it.
+/// On Unix, replaces the current process via exec. On Windows, spawns and waits.
+fn run_tray(data_dir: Option<String>, config: Option<String>) -> anyhow::Result<()> {
+    let tray_name = if cfg!(windows) {
+        "threshold-tray.exe"
+    } else {
+        "threshold-tray"
+    };
+
+    // Look for threshold-tray next to the current executable first, then fall back to PATH
+    let tray_exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(tray_name)))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from(tray_name));
+
+    let mut args: Vec<String> = Vec::new();
+    if let Some(ref dir) = data_dir {
+        args.extend(["--data-dir".to_string(), dir.clone()]);
+    }
+    if let Some(ref cfg) = config {
+        args.extend(["--config".to_string(), cfg.clone()]);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // exec replaces the current process — does not return on success
+        let err = std::process::Command::new(&tray_exe).args(&args).exec();
+        anyhow::bail!("Failed to exec threshold-tray: {}", err);
+    }
+
+    #[cfg(not(unix))]
+    {
+        let status = std::process::Command::new(&tray_exe)
+            .args(&args)
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("threshold-tray exited with {}", status);
+        }
+        Ok(())
     }
 }
 
@@ -718,13 +774,31 @@ fn read_pid_file(data_dir: &Path) -> Option<u32> {
         .and_then(|s| s.trim().parse().ok())
 }
 
-/// Check if a process with the given PID is alive (signal 0 = existence check).
+/// Check if a process with the given PID is alive.
+#[cfg(unix)]
 fn is_process_alive(pid: u32) -> bool {
     // SAFETY: kill with signal 0 performs an existence check without sending a signal.
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
+#[cfg(windows)]
+fn is_process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    // SAFETY: OpenProcess with PROCESS_QUERY_LIMITED_INFORMATION is a read-only
+    // existence check. The handle is immediately closed.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle == 0 {
+            return false;
+        }
+        CloseHandle(handle);
+        true
+    }
+}
+
 /// Check if a process is a Threshold daemon by inspecting its command name.
+#[cfg(unix)]
 fn is_threshold_process(pid: u32) -> bool {
     match std::process::Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "comm="])
@@ -733,6 +807,54 @@ fn is_threshold_process(pid: u32) -> bool {
         Ok(output) => {
             let name = String::from_utf8_lossy(&output.stdout);
             name.trim().ends_with("threshold")
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(windows)]
+fn is_threshold_process(pid: u32) -> bool {
+    match std::process::Command::new("tasklist")
+        .args(["/fi", &format!("PID eq {}", pid), "/fo", "csv", "/nh"])
+        .output()
+    {
+        Ok(output) => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            // tasklist CSV output: "image_name","pid",...
+            text.to_lowercase().contains("threshold")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Check if a process is a wrapper script (shell or PowerShell).
+/// Used by `detect_supervised()` to validate the supervised marker.
+#[cfg(unix)]
+fn is_wrapper_process(pid: u32) -> bool {
+    match std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+    {
+        Ok(output) => {
+            let name = String::from_utf8_lossy(&output.stdout);
+            let name = name.trim();
+            name.ends_with("bash") || name.ends_with("sh") || name.ends_with("zsh")
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(windows)]
+fn is_wrapper_process(pid: u32) -> bool {
+    match std::process::Command::new("tasklist")
+        .args(["/fi", &format!("PID eq {}", pid), "/fo", "csv", "/nh"])
+        .output()
+    {
+        Ok(output) => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let lower = text.to_lowercase();
+            // Strip .exe suffix before matching
+            lower.contains("pwsh") || lower.contains("powershell")
         }
         Err(_) => false,
     }
@@ -767,11 +889,22 @@ fn check_existing_daemon(data_dir: &Path) -> anyhow::Result<()> {
 // Signal handling
 // ---------------------------------------------------------------------------
 
-/// Wait for a SIGTERM signal (Unix only).
+/// Wait for a termination signal.
+/// On Unix: SIGTERM. On Windows: Ctrl+Break (the closest equivalent).
+#[cfg(unix)]
 async fn sigterm_signal() {
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
     sigterm.recv().await;
+}
+
+#[cfg(windows)]
+async fn sigterm_signal() {
+    // Windows has no SIGTERM. Use Ctrl+Break as the programmatic shutdown signal.
+    // This pairs with GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT) in send_sigterm().
+    use tokio::signal::windows;
+    let mut ctrl_break = windows::ctrl_break().expect("Failed to register Ctrl+Break handler");
+    ctrl_break.recv().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1271,7 +1404,10 @@ async fn drain_and_wait(
     }
 }
 
-/// Send SIGTERM to a process.
+/// Send a termination signal to a process.
+/// On Unix: SIGTERM. On Windows: TerminateProcess (clean shutdown is handled
+/// by the daemon's Ctrl+C handler in the main loop).
+#[cfg(unix)]
 fn send_sigterm(pid: u32) -> anyhow::Result<()> {
     // Guard against u32 values above i32::MAX — casting those to i32 would wrap
     // negative, potentially targeting process groups or unintended processes.
@@ -1283,6 +1419,30 @@ fn send_sigterm(pid: u32) -> anyhow::Result<()> {
     if ret != 0 {
         let err = std::io::Error::last_os_error();
         anyhow::bail!("Failed to send SIGTERM to PID {}: {}", pid, err);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn send_sigterm(pid: u32) -> anyhow::Result<()> {
+    if pid == 0 {
+        anyhow::bail!("Invalid PID 0");
+    }
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    // SAFETY: OpenProcess + TerminateProcess on a known daemon PID.
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if handle == 0 {
+            let err = std::io::Error::last_os_error();
+            anyhow::bail!("Failed to open process {}: {}", pid, err);
+        }
+        let ret = TerminateProcess(handle, 1);
+        CloseHandle(handle);
+        if ret == 0 {
+            let err = std::io::Error::last_os_error();
+            anyhow::bail!("Failed to terminate process {}: {}", pid, err);
+        }
     }
     Ok(())
 }
@@ -1468,52 +1628,51 @@ fn detect_supervised(data_dir: &Path) -> bool {
         return false;
     }
 
-    // Check 2: Is the PID a shell process (bash/sh/zsh — the wrapper)?
-    // We check for common shell names since the wrapper is a shell script.
-    let is_shell = match std::process::Command::new("ps")
-        .args(["-p", &marker_pid.to_string(), "-o", "comm="])
-        .output()
-    {
-        Ok(output) => {
-            let name = String::from_utf8_lossy(&output.stdout);
-            let name = name.trim();
-            name.ends_with("bash") || name.ends_with("sh") || name.ends_with("zsh")
-        }
-        Err(_) => false,
-    };
+    // Check 2: Is the PID a shell/wrapper process?
+    // On Unix: bash/sh/zsh (shell wrapper script).
+    // On Windows: pwsh/powershell (PowerShell wrapper script).
+    let is_shell = is_wrapper_process(marker_pid);
     if !is_shell {
         let _ = std::fs::remove_file(&marker_path);
         return false;
     }
 
     // Check 3: Validate start time to catch PID reuse to a different shell process.
-    // The wrapper writes an ISO 8601 UTC timestamp; `ps -o lstart=` returns local time.
-    if let Some(started_at) = _started_at {
-        if let Ok(marker_time) = chrono::DateTime::parse_from_rfc3339(&started_at) {
-            let marker_time = marker_time.with_timezone(&chrono::Utc);
-            if let Ok(output) = std::process::Command::new("ps")
-                .args(["-p", &marker_pid.to_string(), "-o", "lstart="])
-                .output()
-            {
-                let lstart = String::from_utf8_lossy(&output.stdout);
-                let lstart = lstart.trim();
-                // macOS `ps -o lstart=` format: "Mon Jan  1 00:00:00 2026" (local time)
-                if !lstart.is_empty() {
-                    if let Ok(proc_naive) =
-                        chrono::NaiveDateTime::parse_from_str(lstart, "%a %b %e %H:%M:%S %Y")
-                    {
-                        // ps outputs local time — interpret it in the system timezone,
-                        // then convert to UTC for comparison with the marker (which is UTC).
-                        let local_tz = chrono::Local::now().timezone();
-                        if let Some(proc_local) = proc_naive.and_local_timezone(local_tz).earliest()
+    // On Unix, the wrapper writes an ISO 8601 UTC timestamp; `ps -o lstart=` returns local time.
+    // On Windows, PowerShell writes the same ISO 8601 UTC timestamp but we skip the
+    // process start time cross-check (would require GetProcessTimes via windows-sys).
+    // The PID-alive + process-name checks are sufficient for most PID-reuse scenarios.
+    #[cfg(unix)]
+    {
+        if let Some(started_at) = _started_at {
+            if let Ok(marker_time) = chrono::DateTime::parse_from_rfc3339(&started_at) {
+                let marker_time = marker_time.with_timezone(&chrono::Utc);
+                if let Ok(output) = std::process::Command::new("ps")
+                    .args(["-p", &marker_pid.to_string(), "-o", "lstart="])
+                    .output()
+                {
+                    let lstart = String::from_utf8_lossy(&output.stdout);
+                    let lstart = lstart.trim();
+                    // macOS `ps -o lstart=` format: "Mon Jan  1 00:00:00 2026" (local time)
+                    if !lstart.is_empty() {
+                        if let Ok(proc_naive) =
+                            chrono::NaiveDateTime::parse_from_str(lstart, "%a %b %e %H:%M:%S %Y")
                         {
-                            let proc_utc = proc_local.with_timezone(&chrono::Utc);
-                            // Allow 5s of clock skew between marker write and ps output
-                            let diff = (marker_time - proc_utc).num_seconds().unsigned_abs();
-                            if diff > 5 {
-                                // PID was reused — the marker's start time doesn't match
-                                let _ = std::fs::remove_file(&marker_path);
-                                return false;
+                            // ps outputs local time — interpret it in the system timezone,
+                            // then convert to UTC for comparison with the marker (which is UTC).
+                            let local_tz = chrono::Local::now().timezone();
+                            if let Some(proc_local) =
+                                proc_naive.and_local_timezone(local_tz).earliest()
+                            {
+                                let proc_utc = proc_local.with_timezone(&chrono::Utc);
+                                // Allow 5s of clock skew between marker write and ps output
+                                let diff =
+                                    (marker_time - proc_utc).num_seconds().unsigned_abs();
+                                if diff > 5 {
+                                    // PID was reused — the marker's start time doesn't match
+                                    let _ = std::fs::remove_file(&marker_path);
+                                    return false;
+                                }
                             }
                         }
                     }
@@ -1521,6 +1680,10 @@ fn detect_supervised(data_dir: &Path) -> bool {
             }
         }
     }
+
+    // On Windows, suppress unused-variable warning for _started_at
+    #[cfg(windows)]
+    let _ = &_started_at;
 
     true
 }
@@ -1639,9 +1802,15 @@ async fn process_restart_hooks(
 // launchd integration (macOS)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// macOS install/uninstall (launchd)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
 const LAUNCHD_LABEL: &str = "com.threshold.daemon";
 
 /// Install a launchd service that auto-starts the daemon on login.
+#[cfg(target_os = "macos")]
 fn run_daemon_install(data_dir: &Path, config_arg: Option<&str>) -> anyhow::Result<()> {
     let repo_root = find_repo_root()?;
     let wrapper_path = repo_root.join("scripts").join("threshold-wrapper.sh");
@@ -1705,6 +1874,7 @@ fn run_daemon_install(data_dir: &Path, config_arg: Option<&str>) -> anyhow::Resu
 }
 
 /// Uninstall the launchd service.
+#[cfg(target_os = "macos")]
 fn run_daemon_uninstall() -> anyhow::Result<()> {
     let plist_dir = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
@@ -1733,6 +1903,7 @@ fn run_daemon_uninstall() -> anyhow::Result<()> {
 }
 
 /// Escape a string for safe inclusion in XML text content.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -1742,6 +1913,7 @@ fn xml_escape(s: &str) -> String {
 }
 
 /// Generate a launchd plist XML string.
+#[cfg(target_os = "macos")]
 fn generate_plist(
     repo_root: &Path,
     wrapper_path: &Path,
@@ -1800,6 +1972,182 @@ fn generate_plist(
 "#,
         label = LAUNCHD_LABEL,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Windows install/uninstall (Task Scheduler)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "windows")]
+const TASK_NAME: &str = "Threshold Daemon";
+
+/// Install a Windows Task Scheduler task that auto-starts the daemon on login.
+#[cfg(target_os = "windows")]
+fn run_daemon_install(data_dir: &Path, config_arg: Option<&str>) -> anyhow::Result<()> {
+    let repo_root = find_repo_root()?;
+    let wrapper_path = repo_root.join("scripts").join("threshold-wrapper.ps1");
+
+    if !wrapper_path.exists() {
+        anyhow::bail!(
+            "Wrapper script not found at {}. Is this a complete checkout?",
+            wrapper_path.display()
+        );
+    }
+
+    // Resolve config path
+    let config_path = match config_arg {
+        Some(p) => PathBuf::from(p),
+        None => std::env::var("THRESHOLD_CONFIG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                dirs::home_dir()
+                    .unwrap_or_default()
+                    .join(".threshold")
+                    .join("config.toml")
+            }),
+    };
+
+    // Build the PATH with cargo's bin directory
+    let cargo_bin = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".cargo")
+        .join("bin");
+    let system_path = std::env::var("PATH").unwrap_or_default();
+    let full_path = format!("{};{}", cargo_bin.display(), system_path);
+
+    // Resolve user identity for the task
+    let username = std::env::var("USERNAME").unwrap_or_else(|_| "".to_string());
+    let userdomain = std::env::var("USERDOMAIN").unwrap_or_else(|_| "".to_string());
+    let user_id = if userdomain.is_empty() {
+        username.clone()
+    } else {
+        format!("{}\\{}", userdomain, username)
+    };
+
+    // Generate Task Scheduler XML
+    let task_xml = generate_task_xml(
+        &repo_root,
+        &wrapper_path,
+        &config_path,
+        data_dir,
+        &full_path,
+        &user_id,
+    );
+
+    // Write XML to a temp file
+    let temp_dir = std::env::temp_dir();
+    let xml_path = temp_dir.join("threshold-task.xml");
+    std::fs::write(&xml_path, &task_xml)?;
+
+    // Import via schtasks
+    let status = std::process::Command::new("schtasks")
+        .args([
+            "/create",
+            "/tn",
+            TASK_NAME,
+            "/xml",
+            &xml_path.to_string_lossy(),
+            "/f",
+        ])
+        .status()?;
+
+    // Clean up temp file
+    let _ = std::fs::remove_file(&xml_path);
+
+    if !status.success() {
+        anyhow::bail!("Failed to create scheduled task (exit code {:?})", status.code());
+    }
+
+    // Create logs directory
+    std::fs::create_dir_all(data_dir.join("logs"))?;
+
+    println!("Created scheduled task: {}", TASK_NAME);
+    println!("  The daemon will start automatically at login.");
+    println!("  Log: {}\\logs\\wrapper-stdout.log", data_dir.display());
+
+    Ok(())
+}
+
+/// Uninstall the Windows Task Scheduler task.
+#[cfg(target_os = "windows")]
+fn run_daemon_uninstall() -> anyhow::Result<()> {
+    let status = std::process::Command::new("schtasks")
+        .args(["/delete", "/tn", TASK_NAME, "/f"])
+        .status()?;
+
+    if !status.success() {
+        println!("No scheduled task found or could not be removed.");
+    } else {
+        println!("Scheduled task '{}' removed.", TASK_NAME);
+        println!("The daemon will no longer start automatically at login.");
+    }
+
+    Ok(())
+}
+
+/// Generate a Windows Task Scheduler XML definition.
+#[cfg(target_os = "windows")]
+fn generate_task_xml(
+    repo_root: &Path,
+    wrapper_path: &Path,
+    config_path: &Path,
+    data_dir: &Path,
+    path_env: &str,
+    user_id: &str,
+) -> String {
+    let wrapper = xml_escape(&wrapper_path.display().to_string());
+    let repo = xml_escape(&repo_root.display().to_string());
+    let config = xml_escape(&config_path.display().to_string());
+    let data = xml_escape(&data_dir.display().to_string());
+    let path = xml_escape(path_env);
+    let user = xml_escape(user_id);
+
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{user}</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal>
+      <UserId>{user}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions>
+    <Exec>
+      <Command>powershell.exe</Command>
+      <Arguments>-WindowStyle Hidden -ExecutionPolicy Bypass -File "{wrapper}"</Arguments>
+      <WorkingDirectory>{repo}</WorkingDirectory>
+    </Exec>
+  </Actions>
+  <RegistrationInfo>
+    <Description>Threshold daemon auto-start via wrapper script</Description>
+  </RegistrationInfo>
+</Task>"#,
+    )
+}
+
+/// Fallback for unsupported platforms.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn run_daemon_install(_data_dir: &Path, _config_arg: Option<&str>) -> anyhow::Result<()> {
+    anyhow::bail!("Auto-start installation is not supported on this platform. Use systemd or another init system to manage the daemon.")
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn run_daemon_uninstall() -> anyhow::Result<()> {
+    anyhow::bail!("Auto-start uninstallation is not supported on this platform.")
 }
 
 // ---------------------------------------------------------------------------

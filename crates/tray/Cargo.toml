@@ -1,0 +1,23 @@
+[package]
+name = "threshold-tray"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "threshold-tray"
+path = "src/main.rs"
+
+[dependencies]
+tray-icon = "0.19"
+muda = "0.15"
+tao = { version = "0.32", default-features = false }
+tokio = { version = "1", features = ["rt", "net", "time", "process", "sync", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+open = "5"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
